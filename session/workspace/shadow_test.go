@@ -312,6 +312,124 @@ func TestShadowRepairsPartialRepositoryInitialization(t *testing.T) {
 	require.NoError(t, ws.Cleanup())
 }
 
+func TestShadowRejectsLinkedOrExternalGitMetadata(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "git-metadata")
+	require.NoError(t, err)
+	data := ws.Serialize()
+
+	outside := t.TempDir()
+	require.NoError(t, runGitOnly(outside, "init"))
+	require.NoError(t, os.RemoveAll(filepath.Join(data.Shadow.RepoPath, ".git")))
+	require.NoError(t, os.Symlink(filepath.Join(outside, ".git"), filepath.Join(data.Shadow.RepoPath, ".git")))
+	_, err = RestoreShadow(data)
+	require.ErrorContains(t, err, "git metadata")
+
+	require.NoError(t, os.Remove(filepath.Join(data.Shadow.RepoPath, ".git")))
+	require.NoError(t, os.WriteFile(filepath.Join(data.Shadow.RepoPath, ".git"), []byte("gitdir: "+filepath.Join(outside, ".git")+"\n"), 0o600))
+	_, err = RestoreShadow(data)
+	require.ErrorContains(t, err, "git metadata")
+}
+
+func TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "restore-ownership")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	data := ws.Serialize()
+	require.NoError(t, ws.Remove())
+
+	paused, err := RestoreShadow(data)
+	require.NoError(t, err)
+	require.Equal(t, data, paused.Serialize())
+
+	require.NoError(t, os.MkdirAll(data.Shadow.WorktreePath, 0o700))
+	require.NoError(t, runGitOnly(data.Shadow.WorktreePath, "init"))
+	_, err = RestoreShadow(data)
+	require.ErrorContains(t, err, "worktree identity")
+	require.NoError(t, os.RemoveAll(data.Shadow.WorktreePath))
+	require.NoError(t, ws.Cleanup())
+}
+
+func TestImportSnapshotRejectsModeAndSymlinkMutations(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	t.Run("regular mode", func(t *testing.T) {
+		source := t.TempDir()
+		path := filepath.Join(source, "script")
+		require.NoError(t, os.WriteFile(path, []byte("same"), 0o644))
+		snapshot, err := Scan(source, Policy{})
+		require.NoError(t, err)
+		require.NoError(t, os.Chmod(path, 0o755))
+		repo := filepath.Join(t.TempDir(), "repo")
+		require.NoError(t, os.Mkdir(repo, 0o755))
+		require.NoError(t, runGitOnly(repo, "init"))
+		_, err = importSnapshot(repo, source, snapshot)
+		require.ErrorContains(t, err, "mode changed")
+	})
+
+	t.Run("symlink target and type", func(t *testing.T) {
+		for _, mutation := range []string{"target", "type"} {
+			t.Run(mutation, func(t *testing.T) {
+				source := t.TempDir()
+				path := filepath.Join(source, "link")
+				require.NoError(t, os.Symlink("before", path))
+				snapshot, err := Scan(source, Policy{})
+				require.NoError(t, err)
+				require.NoError(t, os.Remove(path))
+				if mutation == "target" {
+					require.NoError(t, os.Symlink("after", path))
+				} else {
+					require.NoError(t, os.WriteFile(path, []byte("before"), 0o644))
+				}
+				repo := filepath.Join(t.TempDir(), "repo")
+				require.NoError(t, os.Mkdir(repo, 0o755))
+				require.NoError(t, runGitOnly(repo, "init"))
+				_, err = importSnapshot(repo, source, snapshot)
+				require.Error(t, err)
+			})
+		}
+	})
+}
+
+func TestShadowInitializesExactRepoWithoutModifyingEnclosingConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	require.NoError(t, runGitOnly(home, "init"))
+	require.NoError(t, runGitOnly(home, "config", "--local", "user.name", "Enclosing Owner"))
+	require.NoError(t, runGitOnly(home, "config", "--local", "user.email", "enclosing@example.com"))
+
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	canonical, err := filepath.EvalSymlinks(source)
+	require.NoError(t, err)
+	id := shadowProjectID(canonical)
+	root, err := shadowRoot()
+	require.NoError(t, err)
+	project := filepath.Join(root, id)
+	repo := filepath.Join(project, "repo")
+	require.NoError(t, os.MkdirAll(repo, 0o700))
+	metadata, err := json.Marshal(shadowProjectMetadata{Version: CurrentVersion, ProjectID: id, SourcePath: canonical})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(project, "metadata.json"), metadata, 0o600))
+
+	ws, _, err := NewShadow(source, "nested-init")
+	require.NoError(t, err)
+	name, err := runGit(home, nil, "config", "--local", "--get", "user.name")
+	require.NoError(t, err)
+	require.Equal(t, "Enclosing Owner", strings.TrimSpace(name))
+	shadowName, err := runGit(repo, nil, "config", "--local", "--get", "user.name")
+	require.NoError(t, err)
+	require.Equal(t, "Claude Squad", strings.TrimSpace(shadowName))
+	require.DirExists(t, filepath.Join(repo, ".git"))
+	require.NoError(t, ws.Setup())
+	require.NoError(t, ws.Cleanup())
+}
+
 func copyShadowData(data *ShadowData) *ShadowData {
 	copy := *data
 	return &copy

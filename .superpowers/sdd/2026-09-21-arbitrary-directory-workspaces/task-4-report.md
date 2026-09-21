@@ -212,3 +212,101 @@ ok  claude-squad/session/workspace  17.963s
 ok  claude-squad/ui  8.740s
 ?   claude-squad/ui/overlay  [no test files]
 ```
+
+## Fix Round 2
+
+### Changes
+
+- Require `.git` to be a real, contained directory whose exact Git dir and common dir are the intended shadow repository metadata before configuration or lifecycle operations; reject symlinked and external gitdirs.
+- Restore only existing worktrees that belong to the exact shadow repository and persisted session branch, while continuing to accept legitimately absent paused worktrees.
+- Revalidate every snapshot entry during import: regular-file type, permission mode, file identity, and content hash; symlink type and exact target; and contained, non-symlink ancestors.
+- Detect an uninitialized shadow repository by inspecting its exact `.git` path rather than repository discovery, initialize that exact path, and validate identity before writing repository-local configuration.
+- Added focused regressions for linked/external Git metadata, unrelated versus absent restored worktrees, regular mode and symlink target/type mutation, and initialization nested beneath an enclosing repository without modifying enclosing config.
+
+### TDD failure evidence
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test ./session/workspace -run 'TestShadowRejectsLinkedOrExternalGitMetadata|TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree|TestImportSnapshotRejectsModeAndSymlinkMutations|TestShadowInitializesExactRepoWithoutModifyingEnclosingConfig' -count=1 -v
+```
+
+```text
+--- FAIL: TestShadowRejectsLinkedOrExternalGitMetadata (0.61s)
+    Error "shadow repository identity is invalid" does not contain "git metadata"
+--- FAIL: TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree (1.70s)
+    An error is expected but got nil.
+--- FAIL: TestImportSnapshotRejectsModeAndSymlinkMutations (0.64s)
+    regular_mode: An error is expected but got nil.
+    target: An error is expected but got nil.
+    type: An error is expected but got nil.
+--- FAIL: TestShadowInitializesExactRepoWithoutModifyingEnclosingConfig (0.40s)
+    Received unexpected error: shadow repository identity is invalid
+FAIL
+```
+
+### Exact verification
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test ./session/workspace -run 'TestShadow|TestImportSnapshot' -count=1 -v
+```
+
+```text
+=== RUN   TestShadowLayoutStableIdentityAndCanonicalSource
+--- PASS: TestShadowLayoutStableIdentityAndCanonicalSource (1.64s)
+=== RUN   TestShadowSessionsHaveFreshIndependentBaselines
+--- PASS: TestShadowSessionsHaveFreshIndependentBaselines (3.16s)
+=== RUN   TestShadowSharedLinksAndLifecycle
+--- PASS: TestShadowSharedLinksAndLifecycle (3.82s)
+=== RUN   TestShadowRejectsMetadataCollisionAndUnsafeRestore
+--- PASS: TestShadowRejectsMetadataCollisionAndUnsafeRestore (0.00s)
+=== RUN   TestShadowRejectsBaselineInjectionAndWrongIdentity
+--- PASS: TestShadowRejectsBaselineInjectionAndWrongIdentity (1.60s)
+=== RUN   TestShadowRejectsSymlinkedInternalPaths
+--- PASS: TestShadowRejectsSymlinkedInternalPaths (1.00s)
+=== RUN   TestShadowSetupPrunesStaleRegistrationAndCleanupPreservesLiveBranch
+--- PASS: TestShadowSetupPrunesStaleRegistrationAndCleanupPreservesLiveBranch (1.97s)
+=== RUN   TestImportSnapshotRejectsMutationAndSymlinkSwap
+--- PASS: TestImportSnapshotRejectsMutationAndSymlinkSwap (0.05s)
+=== RUN   TestShadowRejectsSharedSourceAncestorSymlinkSwap
+--- PASS: TestShadowRejectsSharedSourceAncestorSymlinkSwap (1.22s)
+=== RUN   TestShadowRepairsPartialRepositoryInitialization
+--- PASS: TestShadowRepairsPartialRepositoryInitialization (1.57s)
+=== RUN   TestShadowRejectsLinkedOrExternalGitMetadata
+--- PASS: TestShadowRejectsLinkedOrExternalGitMetadata (0.66s)
+=== RUN   TestImportSnapshotRejectsModeAndSymlinkMutations
+--- PASS: TestImportSnapshotRejectsModeAndSymlinkMutations (0.19s)
+=== RUN   TestShadowInitializesExactRepoWithoutModifyingEnclosingConfig
+--- PASS: TestShadowInitializesExactRepoWithoutModifyingEnclosingConfig (2.01s)
+PASS
+ok  claude-squad/session/workspace  19.328s
+```
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test -count=1 ./...
+```
+
+```text
+ok  claude-squad  0.760s
+ok  claude-squad/app  10.367s
+?   claude-squad/cmd  [no test files]
+?   claude-squad/cmd/cmd_test  [no test files]
+ok  claude-squad/config  6.289s
+?   claude-squad/daemon  [no test files]
+?   claude-squad/keys  [no test files]
+?   claude-squad/log  [no test files]
+ok  claude-squad/session  6.355s
+ok  claude-squad/session/git  3.781s
+ok  claude-squad/session/tmux  1.904s
+ok  claude-squad/session/workspace  25.495s
+ok  claude-squad/ui  9.689s
+?   claude-squad/ui/overlay  [no test files]
+```
+
+```text
+git diff --check
+```
+
+No output (passed).
+
+### Concerns
+
+- Filesystem identity checks are fail-closed and substantially narrow race windows, but Go's portable path APIs cannot provide a single atomic openat-style transaction across every path component and Git subprocess invocation.
