@@ -204,6 +204,24 @@ func TestApplyPreservesPredictableSiblingCollision(t *testing.T) {
 	require.Equal(t, "unplanned", mustReadFile(t, collision))
 }
 
+func TestApplyRejectsPostBackupCreateTargetDirectory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "base", "base", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "created", "agent", 0o644)
+	applyAfterBackupHook = func(string) {
+		require.NoError(t, os.Mkdir(filepath.Join(source, "created"), 0o755))
+	}
+	t.Cleanup(func() { applyAfterBackupHook = nil })
+
+	_, err := workspace.Apply()
+	var conflict *ConflictError
+	require.ErrorAs(t, err, &conflict)
+	require.Equal(t, []string{"created"}, conflict.Paths)
+	require.DirExists(t, filepath.Join(source, "created"))
+}
+
 func TestApplyRejectsPostBackupSourceAndAncestorChanges(t *testing.T) {
 	tests := map[string]func(*testing.T, string){
 		"source": func(t *testing.T, source string) {
@@ -254,6 +272,25 @@ func TestApplyRollbackRemovesCreatedParents(t *testing.T) {
 	require.NoDirExists(t, filepath.Join(source, "new"))
 }
 
+func TestApplyDirectoryToFileRollbackRestoresTree(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "kind/child", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	require.NoError(t, os.RemoveAll(filepath.Join(workspace.WorkDir(), "kind")))
+	writeApplyFile(t, workspace.WorkDir(), "kind", "after", 0o644)
+	writeApplyFile(t, workspace.WorkDir(), "zz-fail", "fail", 0o644)
+	before := mustSnapshot(t, source)
+	original := applyFS
+	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "zz-fail")}
+	t.Cleanup(func() { applyFS = original })
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "injected apply failure")
+	require.Equal(t, before, mustSnapshot(t, source))
+	require.Equal(t, "before", mustReadFile(t, filepath.Join(source, "kind", "child")))
+}
+
 func TestApplyDirectoryToFileAndFileToTree(t *testing.T) {
 	tests := []struct{ name, sourcePath, worktreePath string }{
 		{name: "directory-to-file", sourcePath: "kind/child", worktreePath: "kind"},
@@ -275,10 +312,16 @@ func TestApplyDirectoryToFileAndFileToTree(t *testing.T) {
 	}
 }
 
-type cleanupFailOps struct{ fileOps }
+type cleanupFailOps struct {
+	fileOps
+	removeManifest bool
+}
 
 func (f cleanupFailOps) RemoveAll(path string) error {
 	if filepath.Base(filepath.Dir(path)) == "transactions" || filepath.Base(path) != "transactions" {
+		if f.removeManifest {
+			_ = f.fileOps.Remove(filepath.Join(path, "manifest.json"))
+		}
 		return errors.New("injected cleanup failure")
 	}
 	return f.fileOps.RemoveAll(path)
@@ -300,6 +343,25 @@ func TestApplyReportsCommittedCleanupFailure(t *testing.T) {
 	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
 	require.NoError(t, globErr)
 	require.NotEmpty(t, matches)
+}
+
+func TestApplyCleanupFailureRemainsDiscoverableAfterManifestDeletion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	original := applyFS
+	applyFS = cleanupFailOps{fileOps: original, removeManifest: true}
+	t.Cleanup(func() { applyFS = original })
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "cleanup committed transaction")
+	transactions, findErr := FindIncompleteTransactions(filepath.Dir(workspace.data.RepoPath))
+	require.NoError(t, findErr)
+	require.Len(t, transactions, 1)
+	require.Equal(t, transactionCommitted, transactions[0].State)
+	require.Equal(t, workspace.data.SessionID, transactions[0].SessionID)
 }
 
 func TestIncompleteTransactionDiscoveryDoesNotDelete(t *testing.T) {

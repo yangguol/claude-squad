@@ -57,14 +57,15 @@ const (
 )
 
 type transactionEntry struct {
-	Path      string      `json:"path"`
-	Operation string      `json:"operation"`
-	Type      EntryType   `json:"type,omitempty"`
-	Mode      os.FileMode `json:"mode,omitempty"`
-	Payload   string      `json:"payload,omitempty"`
-	Target    string      `json:"target,omitempty"`
-	Backup    string      `json:"backup,omitempty"`
-	Expected  *Entry      `json:"expected,omitempty"`
+	Path              string      `json:"path"`
+	Operation         string      `json:"operation"`
+	Type              EntryType   `json:"type,omitempty"`
+	Mode              os.FileMode `json:"mode,omitempty"`
+	Payload           string      `json:"payload,omitempty"`
+	Target            string      `json:"target,omitempty"`
+	Backup            string      `json:"backup,omitempty"`
+	Expected          *Entry      `json:"expected,omitempty"`
+	ReplacesDirectory bool        `json:"replaces_directory,omitempty"`
 }
 
 // Transaction describes durable recovery metadata for an apply operation.
@@ -154,10 +155,30 @@ func (w *shadowWorkspace) Apply() (*ApplyResult, error) {
 	}
 	w.data.LastAppliedTree = plan.MergedTree
 	w.data.LastAppliedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if err := applyFS.RemoveAll(plan.TransactionDir); err != nil {
-		return nil, fmt.Errorf("cleanup committed transaction %q: %w", plan.TransactionDir, err)
+	if err := cleanupCommittedTransaction(transaction); err != nil {
+		return nil, err
 	}
 	return &ApplyResult{Changed: plan.ChangedPaths()}, nil
+}
+
+func cleanupCommittedTransaction(transaction Transaction) error {
+	marker := transaction.Directory + ".cleanup.json"
+	markerTransaction := transaction
+	markerTransaction.Directory = ""
+	contents, err := json.MarshalIndent(markerTransaction, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode committed cleanup marker: %w", err)
+	}
+	if err := writeExclusiveFile(marker, contents, 0o600); err != nil {
+		return fmt.Errorf("write committed cleanup marker: %w", err)
+	}
+	if err := applyFS.RemoveAll(transaction.Directory); err != nil {
+		return fmt.Errorf("cleanup committed transaction %q: %w", transaction.Directory, err)
+	}
+	if err := applyFS.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove committed cleanup marker %q: %w", marker, err)
+	}
+	return nil
 }
 
 func (w *shadowWorkspace) prepareTransaction(plan applyPlan) (Transaction, error) {
@@ -203,6 +224,8 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan) (Transaction, error
 		if expected, exists := plan.OursSnapshot.Entries[name]; exists {
 			item.Backup = filepath.ToSlash(filepath.Join("backup", name))
 			item.Expected = &expected
+		} else if item.Operation != "delete" && planReplacesDirectory(plan, name) {
+			item.ReplacesDirectory = true
 		}
 		transaction.Entries = append(transaction.Entries, item)
 	}
@@ -422,7 +445,7 @@ func (w *shadowWorkspace) revalidateTransactionEntry(transaction Transaction, it
 	}
 	if item.Backup == "" {
 		if exists {
-			if actual.Type == EntryType("directory") && item.Operation != "delete" {
+			if item.ReplacesDirectory && actual.Type == EntryType("directory") {
 				return nil
 			}
 			return &ConflictError{Paths: []string{item.Path}}
@@ -581,6 +604,7 @@ func (w *shadowWorkspace) createMissingParents(parent string) ([]string, error) 
 
 func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied []int, createdDirs []string) error {
 	var rollbackErr error
+	var removedReplacementAncestors []string
 	for position := len(applied) - 1; position >= 0; position-- {
 		item := transaction.Entries[applied[position]]
 		target := filepath.Join(w.data.SourcePath, filepath.FromSlash(item.Path))
@@ -588,13 +612,16 @@ func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied 
 			rollbackErr = errors.Join(rollbackErr, err)
 			continue
 		}
-		if err := w.revalidateAppliedEntry(*transaction, item); err != nil {
+		if err := w.revalidateAppliedEntry(*transaction, item, removedReplacementAncestors); err != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("refuse to overwrite post-apply change at %q: %w", item.Path, err))
 			continue
 		}
 		if err := applyFS.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
 			rollbackErr = errors.Join(rollbackErr, err)
 			continue
+		}
+		if item.ReplacesDirectory {
+			removedReplacementAncestors = append(removedReplacementAncestors, item.Path)
 		}
 		if item.Backup == "" {
 			continue
@@ -657,8 +684,11 @@ func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied 
 	return rollbackErr
 }
 
-func (w *shadowWorkspace) revalidateAppliedEntry(transaction Transaction, item transactionEntry) error {
+func (w *shadowWorkspace) revalidateAppliedEntry(transaction Transaction, item transactionEntry, removedReplacementAncestors []string) error {
 	actual, exists, err := snapshotOne(w.data.SourcePath, item.Path)
+	if errors.Is(err, syscall.ENOTDIR) && pathBelowAny(item.Path, removedReplacementAncestors) {
+		exists, err = false, nil
+	}
 	if err != nil {
 		return err
 	}
@@ -686,6 +716,15 @@ func (w *shadowWorkspace) revalidateAppliedEntry(transaction Transaction, item t
 	return nil
 }
 
+func pathBelowAny(name string, ancestors []string) bool {
+	for _, ancestor := range ancestors {
+		if strings.HasPrefix(name, ancestor+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *shadowWorkspace) createRollbackParents(parent string) error {
 	_, err := w.createMissingParents(parent)
 	return err
@@ -704,8 +743,28 @@ func FindIncompleteTransactions(root string) ([]Transaction, error) {
 	if err != nil {
 		return nil, err
 	}
-	var result []Transaction
+	byDirectory := make(map[string]Transaction)
 	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasSuffix(entry.Name(), ".cleanup.json") {
+			marker := filepath.Join(transactionRoot, entry.Name())
+			if err := ensureRealContainedPath(transactionRoot, marker, false, "transaction cleanup marker"); err != nil {
+				return nil, err
+			}
+			contents, err := os.ReadFile(marker)
+			if err != nil {
+				return nil, err
+			}
+			var transaction Transaction
+			if err := json.Unmarshal(contents, &transaction); err != nil {
+				return nil, fmt.Errorf("decode transaction cleanup marker %q: %w", entry.Name(), err)
+			}
+			transaction.Directory = strings.TrimSuffix(marker, ".cleanup.json")
+			if transaction.State != transactionCommitted {
+				return nil, fmt.Errorf("transaction cleanup marker %q has non-committed state %q", entry.Name(), transaction.State)
+			}
+			byDirectory[transaction.Directory] = transaction
+			continue
+		}
 		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			continue
 		}
@@ -726,8 +785,12 @@ func FindIncompleteTransactions(root string) ([]Transaction, error) {
 		}
 		transaction.Directory = directory
 		if transaction.State == transactionPrepared || transaction.State == transactionApplying {
-			result = append(result, transaction)
+			byDirectory[transaction.Directory] = transaction
 		}
+	}
+	result := make([]Transaction, 0, len(byDirectory))
+	for _, transaction := range byDirectory {
+		result = append(result, transaction)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Directory < result[j].Directory })
 	return result, nil

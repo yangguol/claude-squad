@@ -111,3 +111,53 @@ PASS with no output.
 
 - As before, filesystem durability is atomic at rename boundaries but does not fsync files or directories against machine-level power loss.
 - The remaining unavoidable OS race is between the final userspace revalidation syscall and the immediately following mutation syscall; deterministic hooks verify that all changes introduced before final revalidation are rejected without overwrite.
+
+## Fix Round 2
+
+### Status
+
+Resolved the three remaining findings. Planned creates now reject every occupied target unless the transaction manifest explicitly records a planned directory replacement. Directory-to-file rollback treats `ENOTDIR` as absence only for descendants of a replacement ancestor already removed by that same rollback, restoring the original tree without weakening unrelated path validation. Committed cleanup now writes an exclusive sibling cleanup marker before `RemoveAll`, removes it only after complete cleanup, and startup discovery reports the marker even if partial deletion removed the transaction manifest.
+
+### TDD red evidence
+
+Each regression failed before its implementation fix:
+
+- `go test ./session/workspace -run '^TestApplyRejectsPostBackupCreateTargetDirectory$' -count=1 -v` — FAIL because an empty directory occupying a no-backup create target was accepted.
+- `go test ./session/workspace -run '^TestApplyDirectoryToFileRollbackRestoresTree$' -count=1 -v` — FAIL because rollback descendant validation encountered the removed replacement ancestor and did not restore the directory tree.
+- `go test ./session/workspace -run '^TestApplyCleanupFailureRemainsDiscoverableAfterManifestDeletion$' -count=1 -v` — FAIL because partial cleanup removed `manifest.json`, leaving no discoverable transaction.
+
+### Final covering tests
+
+`go test ./session/workspace -run '^(TestApplyRejectsPostBackupCreateTargetDirectory|TestApplyDirectoryToFileRollbackRestoresTree|TestApplyCleanupFailureRemainsDiscoverableAfterManifestDeletion|TestCommittedCleanupFailureReportedOnRestore)$' -count=1 -v`
+
+PASS (`ok claude-squad/session/workspace 11.300s`).
+
+### Final focused transactional suite
+
+`go test ./session/workspace -run 'TestApplyTransaction|TestApplyRollback|TestIncompleteTransaction|TestApplyPreservesPredictableSiblingCollision|TestApplyRejectsPostBackup|TestApplyDirectoryToFile|TestApplyReportsCommittedCleanupFailure|TestApplyCleanupFailure|TestCommittedCleanupFailure' -count=1 -v`
+
+PASS (`ok claude-squad/session/workspace 52.367s`).
+
+### Final uncached full suite
+
+`go test -count=1 ./...`
+
+PASS. All repository packages passed; `session/workspace` completed in 118.995s.
+
+### Final static patch check
+
+`git diff --check`
+
+PASS with no output.
+
+### Files
+
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/apply.go`
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/apply_test.go`
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/shadow_test.go`
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/.superpowers/sdd/2026-09-21-arbitrary-directory-workspaces/task-7-report.md`
+
+### Concerns
+
+- Filesystem durability remains atomic at rename boundaries but does not fsync files or directories against machine-level power loss.
+- The unavoidable OS race between final userspace validation and mutation remains; all deterministically injectable pre-mutation races are covered and fail closed.

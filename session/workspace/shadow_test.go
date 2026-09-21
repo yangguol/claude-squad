@@ -345,6 +345,24 @@ func TestIncompleteTransactionReportedOnRestoreAndPreserved(t *testing.T) {
 	require.FileExists(t, filepath.Join(directory, "manifest.json"))
 }
 
+func TestCommittedCleanupFailureReportedOnRestore(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "safe", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	data := workspace.Serialize()
+	directory := filepath.Join(filepath.Dir(data.Shadow.RepoPath), "transactions", data.Shadow.SessionID+"-cleanup")
+	transaction := Transaction{Directory: directory, Version: 1, SessionID: data.Shadow.SessionID, SourcePath: source, State: transactionCommitted}
+	contents, err := json.MarshalIndent(transaction, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(directory), 0o700))
+	require.NoError(t, os.WriteFile(directory+".cleanup.json", contents, 0o600))
+
+	_, err = RestoreShadow(data)
+	require.ErrorContains(t, err, "incomplete apply transactions")
+	require.FileExists(t, directory+".cleanup.json")
+}
+
 func TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := t.TempDir()
