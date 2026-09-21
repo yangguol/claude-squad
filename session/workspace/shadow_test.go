@@ -37,8 +37,10 @@ func TestShadowLayoutStableIdentityAndCanonicalSource(t *testing.T) {
 	require.Equal(t, canonical, data.SourcePath)
 	require.Equal(t, "session/"+data.SessionID, branch)
 	require.Equal(t, branch, data.BranchName)
-	require.Equal(t, filepath.Join(home, ".claude-squad", "shadow-projects", wantID, "repo"), data.RepoPath)
-	require.Equal(t, filepath.Join(home, ".claude-squad", "shadow-projects", wantID, "worktrees", data.SessionID), data.WorktreePath)
+	canonicalHome, err := filepath.EvalSymlinks(home)
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(canonicalHome, ".claude-squad", "shadow-projects", wantID, "repo"), data.RepoPath)
+	require.Equal(t, filepath.Join(canonicalHome, ".claude-squad", "shadow-projects", wantID, "worktrees", data.SessionID), data.WorktreePath)
 	require.NotContains(t, data.WorktreePath, "unsafe")
 	require.NotEmpty(t, data.BaselineCommit)
 	_, err = os.Lstat(filepath.Join(source, ".git"))
@@ -154,7 +156,9 @@ func TestShadowRejectsMetadataCollisionAndUnsafeRestore(t *testing.T) {
 	require.NoError(t, err)
 	sum := sha256.Sum256([]byte(canonical))
 	id := hex.EncodeToString(sum[:])
-	project := filepath.Join(home, ".claude-squad", "shadow-projects", id)
+	canonicalHome, err := filepath.EvalSymlinks(home)
+	require.NoError(t, err)
+	project := filepath.Join(canonicalHome, ".claude-squad", "shadow-projects", id)
 	require.NoError(t, os.MkdirAll(project, 0o755))
 	bad, err := json.Marshal(shadowProjectMetadata{Version: CurrentVersion, ProjectID: id, SourcePath: t.TempDir()})
 	require.NoError(t, err)
@@ -171,6 +175,151 @@ func TestShadowRejectsMetadataCollisionAndUnsafeRestore(t *testing.T) {
 	}}
 	_, err = RestoreShadow(data)
 	require.ErrorContains(t, err, "worktree path")
+}
+
+func TestShadowRejectsBaselineInjectionAndWrongIdentity(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "identity")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	t.Cleanup(func() { _ = ws.Cleanup() })
+	data := ws.Serialize()
+
+	injected := data
+	injected.Shadow = copyShadowData(data.Shadow)
+	injected.Shadow.BaselineCommit = "--output=/tmp/injected"
+	_, err = RestoreShadow(injected)
+	require.ErrorContains(t, err, "baseline commit is invalid")
+
+	wrongBaseline := data
+	wrongBaseline.Shadow = copyShadowData(data.Shadow)
+	wrongBaseline.Shadow.BaselineCommit = strings.Repeat("f", 40)
+	_, err = RestoreShadow(wrongBaseline)
+	require.ErrorContains(t, err, "baseline does not resolve to a commit")
+
+	other := t.TempDir()
+	require.NoError(t, runGitOnly(other, "init"))
+	wrongRepo := data
+	wrongRepo.Shadow = copyShadowData(data.Shadow)
+	require.NoError(t, os.RemoveAll(data.Shadow.RepoPath))
+	require.NoError(t, os.Rename(other, data.Shadow.RepoPath))
+	_, err = RestoreShadow(wrongRepo)
+	require.Error(t, err)
+}
+
+func TestShadowRejectsSymlinkedInternalPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "symlinks")
+	require.NoError(t, err)
+	data := ws.Serialize().Shadow
+	outside := t.TempDir()
+	require.NoError(t, os.RemoveAll(filepath.Dir(data.WorktreePath)))
+	require.NoError(t, os.Symlink(outside, filepath.Dir(data.WorktreePath)))
+	require.ErrorContains(t, ws.Setup(), "symlink")
+	require.NoDirExists(t, filepath.Join(outside, data.SessionID))
+
+	require.NoError(t, os.Remove(filepath.Dir(data.WorktreePath)))
+	require.NoError(t, os.Mkdir(filepath.Dir(data.WorktreePath), 0o700))
+	require.NoError(t, os.RemoveAll(data.RepoPath))
+	require.NoError(t, os.Symlink(outside, data.RepoPath))
+	_, err = RestoreShadow(ws.Serialize())
+	require.ErrorContains(t, err, "symlink")
+}
+
+func TestShadowSetupPrunesStaleRegistrationAndCleanupPreservesLiveBranch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "cleanup")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	data := ws.Serialize().Shadow
+	require.NoError(t, os.RemoveAll(data.WorktreePath))
+	require.NoError(t, ws.Setup())
+	require.DirExists(t, data.WorktreePath)
+
+	outside := t.TempDir()
+	require.NoError(t, os.RemoveAll(data.WorktreePath))
+	require.NoError(t, os.Symlink(outside, data.WorktreePath))
+	require.Error(t, ws.Cleanup())
+	_, err = runGit(data.RepoPath, nil, "show-ref", "--verify", "refs/heads/"+data.BranchName)
+	require.NoError(t, err, "cleanup must retain the branch when worktree removal is unsafe")
+}
+
+func TestImportSnapshotRejectsMutationAndSymlinkSwap(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	path := filepath.Join(source, "file")
+	require.NoError(t, os.WriteFile(path, []byte("before"), 0o644))
+	snapshot, err := Scan(source, Policy{})
+	require.NoError(t, err)
+	repo := filepath.Join(t.TempDir(), "repo")
+	require.NoError(t, os.Mkdir(repo, 0o755))
+	require.NoError(t, runGitOnly(repo, "init"))
+	require.NoError(t, os.WriteFile(path, []byte("after"), 0o644))
+	_, err = importSnapshot(repo, source, snapshot)
+	require.ErrorContains(t, err, "changed after scan")
+
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "outside"), path))
+	_, err = importSnapshot(repo, source, snapshot)
+	require.Error(t, err)
+}
+
+func TestShadowRejectsSharedSourceAncestorSymlinkSwap(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(source, "deps", "pkg"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, ".claude-squad-ignore"), []byte("[shared]\ndeps/pkg/\n"), 0o644))
+	ws, _, err := NewShadow(source, "shared-swap")
+	require.NoError(t, err)
+	outside := t.TempDir()
+	require.NoError(t, os.RemoveAll(filepath.Join(source, "deps")))
+	require.NoError(t, os.Symlink(outside, filepath.Join(source, "deps")))
+	require.ErrorContains(t, ws.Setup(), "shared")
+	require.NoFileExists(t, filepath.Join(ws.WorkDir(), "deps", "pkg"))
+}
+
+func TestShadowRepairsPartialRepositoryInitialization(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	canonical, err := filepath.EvalSymlinks(source)
+	require.NoError(t, err)
+	id := shadowProjectID(canonical)
+	root, err := shadowRoot()
+	require.NoError(t, err)
+	project := filepath.Join(root, id)
+	repo := filepath.Join(project, "repo")
+	require.NoError(t, os.MkdirAll(repo, 0o700))
+	metadata, err := json.Marshal(shadowProjectMetadata{Version: CurrentVersion, ProjectID: id, SourcePath: canonical})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(project, "metadata.json"), metadata, 0o600))
+	require.NoError(t, runGitOnly(repo, "init"))
+
+	ws, _, err := NewShadow(source, "repair")
+	require.NoError(t, err)
+	data := ws.Serialize().Shadow
+	name, err := runGit(data.RepoPath, nil, "config", "--local", "--get", "user.name")
+	require.NoError(t, err)
+	require.Equal(t, "Claude Squad", strings.TrimSpace(name))
+	require.NoError(t, ws.Setup())
+	require.NoError(t, ws.Cleanup())
+}
+
+func copyShadowData(data *ShadowData) *ShadowData {
+	copy := *data
+	return &copy
+}
+
+func runGitOnly(dir string, args ...string) error {
+	_, err := runGit(dir, nil, args...)
+	return err
 }
 
 func mustReadFile(t *testing.T, name string) string {

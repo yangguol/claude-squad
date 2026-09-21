@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,8 +40,14 @@ func NewShadow(source, sessionName string) (Workspace, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, "", fmt.Errorf("create shadow root: %w", err)
+	}
 	projectPath := filepath.Join(root, projectID)
 	repoPath := filepath.Join(projectPath, "repo")
+	if err := ensureRealContainedPath(root, projectPath, true, "project path"); err != nil {
+		return nil, "", err
+	}
 	if err := ensureShadowProject(projectPath, repoPath, shadowProjectMetadata{
 		Version: CurrentVersion, ProjectID: projectID, SourcePath: canonical,
 	}); err != nil {
@@ -96,11 +103,7 @@ func RestoreShadow(data Data) (Workspace, error) {
 	if err := validateShadowData(stored); err != nil {
 		return nil, err
 	}
-	metadata, err := readProjectMetadata(filepath.Dir(stored.RepoPath))
-	if err != nil {
-		return nil, err
-	}
-	if err := validateProjectMetadata(metadata, stored.ProjectID, stored.SourcePath); err != nil {
+	if err := validateShadowIdentity(stored, false); err != nil {
 		return nil, err
 	}
 	return &shadowWorkspace{data: stored}, nil
@@ -120,6 +123,9 @@ func (w *shadowWorkspace) Setup() error {
 	if err := validateShadowData(w.data); err != nil {
 		return err
 	}
+	if err := validateShadowIdentity(w.data, false); err != nil {
+		return err
+	}
 	valid, err := w.IsValid()
 	if err != nil {
 		return err
@@ -127,11 +133,22 @@ func (w *shadowWorkspace) Setup() error {
 	if valid {
 		return nil
 	}
+	if err := ensureRealContainedPath(filepath.Dir(w.data.RepoPath), filepath.Dir(w.data.WorktreePath), true, "worktrees path"); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(w.data.WorktreePath), 0o700); err != nil {
 		return fmt.Errorf("create shadow worktree directory: %w", err)
 	}
-	_ = os.RemoveAll(w.data.WorktreePath)
-	if _, err := runGit(w.data.RepoPath, nil, "worktree", "add", w.data.WorktreePath, w.data.BranchName); err != nil {
+	if err := ensureRealContainedPath(filepath.Dir(w.data.RepoPath), filepath.Dir(w.data.WorktreePath), false, "worktrees path"); err != nil {
+		return err
+	}
+	if err := removeContainedPath(filepath.Dir(w.data.RepoPath), w.data.WorktreePath); err != nil {
+		return err
+	}
+	if _, err := runGit(w.data.RepoPath, nil, "worktree", "prune"); err != nil {
+		return fmt.Errorf("prune stale shadow worktrees: %w", err)
+	}
+	if _, err := runGit(w.data.RepoPath, nil, "worktree", "add", "--", w.data.WorktreePath, w.data.BranchName); err != nil {
 		return fmt.Errorf("create shadow worktree: %w", err)
 	}
 	if err := w.createSharedLinks(); err != nil {
@@ -147,18 +164,32 @@ func (w *shadowWorkspace) IsValid() (bool, error) {
 	if err := validateShadowData(w.data); err != nil {
 		return false, err
 	}
-	info, err := os.Stat(w.data.WorktreePath)
+	if err := validateShadowIdentity(w.data, false); err != nil {
+		return false, err
+	}
+	info, err := os.Lstat(w.data.WorktreePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("stat shadow worktree: %w", err)
 	}
-	if !info.IsDir() {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return false, nil
 	}
-	_, err = runGit(w.data.WorktreePath, nil, "rev-parse", "--is-inside-work-tree")
-	return err == nil, nil
+	if err := ensureRealContainedPath(filepath.Dir(w.data.RepoPath), w.data.WorktreePath, false, "worktree path"); err != nil {
+		return false, err
+	}
+	commonDir, err := runGit(w.data.WorktreePath, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil || filepath.Clean(strings.TrimSpace(commonDir)) != filepath.Join(w.data.RepoPath, ".git") {
+		return false, nil
+	}
+	branch, err := runGit(w.data.WorktreePath, nil, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil || strings.TrimSpace(branch) != "refs/heads/"+w.data.BranchName {
+		return false, nil
+	}
+	mergeBase, err := runGit(w.data.RepoPath, nil, "merge-base", "--is-ancestor", w.data.BaselineCommit, "refs/heads/"+w.data.BranchName)
+	return err == nil && strings.TrimSpace(mergeBase) == "", nil
 }
 
 func (w *shadowWorkspace) IsDirty() (bool, error) {
@@ -247,37 +278,58 @@ func (w *shadowWorkspace) Remove() error {
 	if err := validateShadowData(w.data); err != nil {
 		return err
 	}
-	if _, err := os.Lstat(w.data.WorktreePath); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
+	if err := validateShadowIdentity(w.data, false); err != nil {
+		return err
+	}
+	if err := ensureRealContainedPath(filepath.Dir(w.data.RepoPath), w.data.WorktreePath, true, "worktree path"); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(w.data.WorktreePath); err == nil {
+		if _, err := runGit(w.data.RepoPath, nil, "worktree", "remove", "--force", "--", w.data.WorktreePath); err != nil {
+			return fmt.Errorf("remove shadow worktree: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat shadow worktree: %w", err)
 	}
-	if _, err := runGit(w.data.RepoPath, nil, "worktree", "remove", "--force", w.data.WorktreePath); err != nil {
-		return fmt.Errorf("remove shadow worktree: %w", err)
+	if err := w.Prune(); err != nil {
+		return err
+	}
+	registered, err := w.worktreeRegistered()
+	if err != nil {
+		return err
+	}
+	if registered {
+		return errors.New("shadow worktree remains registered after removal")
 	}
 	return nil
 }
 
 func (w *shadowWorkspace) Prune() error {
+	if err := validateShadowData(w.data); err != nil {
+		return err
+	}
+	if err := ensureRealContainedPath(filepath.Dir(w.data.RepoPath), w.data.RepoPath, false, "repository path"); err != nil {
+		return err
+	}
 	_, err := runGit(w.data.RepoPath, nil, "worktree", "prune")
 	return err
 }
 
 func (w *shadowWorkspace) Cleanup() error {
-	if err := validateShadowData(w.data); err != nil {
+	if err := w.Remove(); err != nil {
 		return err
 	}
-	var errs []error
-	if err := w.Remove(); err != nil {
-		errs = append(errs, err)
+	checkedOut, err := w.branchRegistered()
+	if err != nil {
+		return err
+	}
+	if checkedOut {
+		return errors.New("shadow branch remains checked out after worktree removal")
 	}
 	if _, err := runGit(w.data.RepoPath, nil, "update-ref", "-d", "refs/heads/"+w.data.BranchName); err != nil {
-		errs = append(errs, fmt.Errorf("delete shadow branch: %w", err))
+		return fmt.Errorf("delete shadow branch: %w", err)
 	}
-	if err := w.Prune(); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 func (w *shadowWorkspace) Serialize() Data {
@@ -290,6 +342,9 @@ func (w *shadowWorkspace) Serialize() Data {
 func (w *shadowWorkspace) createSharedLinks() error {
 	for _, relative := range w.data.SharedLinks {
 		source := filepath.Join(w.data.SourcePath, filepath.FromSlash(relative))
+		if err := ensureRealContainedPath(w.data.SourcePath, source, false, "shared source path"); err != nil {
+			return fmt.Errorf("validate shared directory %q: %w", relative, err)
+		}
 		info, err := os.Lstat(source)
 		if err != nil {
 			return fmt.Errorf("validate shared directory %q: %w", relative, err)
@@ -369,21 +424,31 @@ func ensureShadowProject(projectPath, repoPath string, expected shadowProjectMet
 	if err := validateProjectMetadata(metadata, expected.ProjectID, expected.SourcePath); err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(repoPath, ".git")); errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(repoPath, 0o700); err != nil {
-			return fmt.Errorf("create shadow repository: %w", err)
+	if err := ensureRealContainedPath(projectPath, repoPath, true, "repository path"); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(repoPath, 0o700); err != nil {
+		return fmt.Errorf("create shadow repository: %w", err)
+	}
+	if err := ensureRealContainedPath(projectPath, repoPath, false, "repository path"); err != nil {
+		return err
+	}
+	if _, err := runGit(repoPath, nil, "rev-parse", "--git-dir"); err != nil {
+		if _, initErr := runGit(repoPath, nil, "init"); initErr != nil {
+			return fmt.Errorf("initialize shadow repository: %w", initErr)
 		}
-		if _, err := runGit(repoPath, nil, "init"); err != nil {
-			return fmt.Errorf("initialize shadow repository: %w", err)
+	}
+	for key, value := range map[string]string{"user.name": "Claude Squad", "user.email": "claude-squad@local"} {
+		current, err := runGit(repoPath, nil, "config", "--local", "--get", key)
+		if err != nil || strings.TrimSpace(current) != value {
+			if _, err := runGit(repoPath, nil, "config", "--local", key, value); err != nil {
+				return fmt.Errorf("configure shadow repository %s: %w", key, err)
+			}
 		}
-		if _, err := runGit(repoPath, nil, "config", "user.name", "Claude Squad"); err != nil {
-			return err
-		}
-		if _, err := runGit(repoPath, nil, "config", "user.email", "claude-squad@local"); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return fmt.Errorf("validate shadow repository: %w", err)
+	}
+	gitDir, err := runGit(repoPath, nil, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil || filepath.Clean(strings.TrimSpace(gitDir)) != filepath.Join(repoPath, ".git") {
+		return errors.New("shadow repository identity is invalid")
 	}
 	return nil
 }
@@ -408,7 +473,32 @@ func importSnapshot(repoPath, source string, snapshot Snapshot) (string, error) 
 		mode := "100644"
 		switch entry.Type {
 		case EntryRegular:
-			contents, err = os.ReadFile(filepath.Join(source, filepath.FromSlash(relative)))
+			path := filepath.Join(source, filepath.FromSlash(relative))
+			if err := ensureRealContainedPath(source, path, false, "snapshot source path"); err != nil {
+				return "", fmt.Errorf("import %q: %w", relative, err)
+			}
+			info, statErr := os.Lstat(path)
+			if statErr != nil || !info.Mode().IsRegular() {
+				return "", fmt.Errorf("import %q: source is no longer a regular file", relative)
+			}
+			file, openErr := os.Open(path)
+			if openErr != nil {
+				return "", fmt.Errorf("import %q: %w", relative, openErr)
+			}
+			openedInfo, statErr := file.Stat()
+			if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+				_ = file.Close()
+				return "", fmt.Errorf("import %q: source changed while opening", relative)
+			}
+			contents, err = io.ReadAll(file)
+			closeErr := file.Close()
+			if err != nil || closeErr != nil {
+				return "", fmt.Errorf("import %q: %w", relative, errors.Join(err, closeErr))
+			}
+			sum := sha256.Sum256(contents)
+			if hex.EncodeToString(sum[:]) != entry.ContentHash {
+				return "", fmt.Errorf("import %q: source content changed after scan", relative)
+			}
 			if entry.Mode&0o111 != 0 {
 				mode = "100755"
 			}
@@ -492,7 +582,15 @@ func shadowRoot() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get config directory: %w", err)
 	}
-	return filepath.Join(configDir, shadowProjectsDirectory), nil
+	root := filepath.Join(configDir, shadowProjectsDirectory)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("create shadow root: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve shadow root: %w", err)
+	}
+	return resolved, nil
 }
 
 func readProjectMetadata(projectPath string) (shadowProjectMetadata, error) {
@@ -545,6 +643,12 @@ func validateShadowData(data ShadowData) error {
 	if data.BranchName != "session/"+data.SessionID {
 		return errors.New("shadow workspace branch name does not match session ID")
 	}
+	if len(data.BaselineCommit) != 40 {
+		return errors.New("shadow workspace baseline commit is invalid")
+	}
+	if _, err := hex.DecodeString(data.BaselineCommit); err != nil {
+		return errors.New("shadow workspace baseline commit is invalid")
+	}
 	root, err := shadowRoot()
 	if err != nil {
 		return err
@@ -562,6 +666,73 @@ func validateShadowData(data ShadowData) error {
 	return validateContained(root, data.WorktreePath, "worktree path")
 }
 
+func validateShadowIdentity(data ShadowData, requireWorktree bool) error {
+	projectPath := filepath.Dir(data.RepoPath)
+	if err := ensureRealContainedPath(filepath.Dir(projectPath), projectPath, false, "project path"); err != nil {
+		return err
+	}
+	metadata, err := readProjectMetadata(projectPath)
+	if err != nil {
+		return err
+	}
+	if err := validateProjectMetadata(metadata, data.ProjectID, data.SourcePath); err != nil {
+		return err
+	}
+	if err := ensureRealContainedPath(projectPath, data.RepoPath, false, "repository path"); err != nil {
+		return err
+	}
+	gitDir, err := runGit(data.RepoPath, nil, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil || filepath.Clean(strings.TrimSpace(gitDir)) != filepath.Join(data.RepoPath, ".git") {
+		return errors.New("shadow repository identity is invalid")
+	}
+	objectType, err := runGit(data.RepoPath, nil, "cat-file", "-t", data.BaselineCommit)
+	if err != nil || strings.TrimSpace(objectType) != "commit" {
+		return errors.New("shadow baseline does not resolve to a commit")
+	}
+	branchCommit, err := runGit(data.RepoPath, nil, "rev-parse", "--verify", "refs/heads/"+data.BranchName+"^{commit}")
+	if err != nil {
+		return errors.New("shadow branch does not resolve to a commit")
+	}
+	if _, err := runGit(data.RepoPath, nil, "merge-base", "--is-ancestor", data.BaselineCommit, strings.TrimSpace(branchCommit)); err != nil {
+		return errors.New("shadow baseline is not an ancestor of its branch")
+	}
+	if requireWorktree {
+		valid, err := (&shadowWorkspace{data: data}).IsValid()
+		if err != nil || !valid {
+			return errors.New("shadow worktree identity is invalid")
+		}
+	}
+	return nil
+}
+
+func (w *shadowWorkspace) worktreeRegistered() (bool, error) {
+	output, err := runGit(w.data.RepoPath, nil, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	want := filepath.Clean(w.data.WorktreePath)
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "worktree ") && filepath.Clean(strings.TrimPrefix(line, "worktree ")) == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (w *shadowWorkspace) branchRegistered() (bool, error) {
+	output, err := runGit(w.data.RepoPath, nil, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	want := "branch refs/heads/" + w.data.BranchName
+	for _, line := range strings.Split(output, "\n") {
+		if line == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func validateContained(root, target, label string) error {
 	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(target))
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
@@ -571,7 +742,18 @@ func validateContained(root, target, label string) error {
 }
 
 func ensureNoSymlinkParents(root, parent string) error {
-	relative, err := filepath.Rel(root, parent)
+	return ensureRealContainedPath(root, parent, true, "path")
+}
+
+func ensureRealContainedPath(root, target string, allowMissing bool, label string) error {
+	if err := validateContained(root, target, label); err != nil && filepath.Clean(root) != filepath.Clean(target) {
+		return err
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("shadow %s root is not a real directory", label)
+	}
+	relative, err := filepath.Rel(root, target)
 	if err != nil {
 		return err
 	}
@@ -581,16 +763,42 @@ func ensureNoSymlinkParents(root, parent string) error {
 			continue
 		}
 		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
-		if errors.Is(err, os.ErrNotExist) {
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, os.ErrNotExist) && allowMissing {
 			continue
 		}
-		if err != nil {
-			return err
+		if statErr != nil {
+			return fmt.Errorf("inspect shadow %s: %w", label, statErr)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("shared link parent %q is a symlink", current)
+			return fmt.Errorf("shadow %s %q is a symlink", label, current)
 		}
+		if current != target && !info.IsDir() {
+			return fmt.Errorf("shadow %s ancestor %q is not a directory", label, current)
+		}
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if errors.Is(err, os.ErrNotExist) && allowMissing {
+		resolvedTarget = target
+	} else if err != nil {
+		return err
+	}
+	if filepath.Clean(resolvedRoot) == filepath.Clean(resolvedTarget) {
+		return nil
+	}
+	return validateContained(resolvedRoot, resolvedTarget, label)
+}
+
+func removeContainedPath(root, target string) error {
+	if err := ensureRealContainedPath(root, target, true, "worktree path"); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return fmt.Errorf("remove shadow worktree path: %w", err)
 	}
 	return nil
 }

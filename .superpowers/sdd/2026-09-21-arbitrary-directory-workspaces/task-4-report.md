@@ -108,3 +108,107 @@ ok  	claude-squad/ui	9.227s
 ## Commit
 
 `33c0c2d feat: create shadow git workspaces`
+
+## Fix Round 1
+
+### Changes
+
+- Validate persisted baseline values as full hexadecimal object IDs before Git use, require them to resolve to commits, and verify the baseline/branch ancestry relationship.
+- Canonicalize and revalidate internal project, repository, and worktree paths without symlink ancestors before creation, removal, pruning, or other destructive Git operations.
+- Make cleanup remove and prune the worktree before deleting its branch; branch deletion is skipped whenever worktree removal is unsafe, fails, or remains registered.
+- Verify restore/session identity through metadata, real repository identity, baseline object type, branch history, and exact worktree repository/branch ownership.
+- Revalidate snapshot regular files at import time using containment, lstat/open identity, type, and SHA-256 checks; reject mutation and symlink swaps.
+- Revalidate shared source paths and every ancestor at link creation time.
+- Validate and repair local repository identity and required user configuration on every project reuse, including partial initialization recovery.
+- Added focused regressions for option injection, internal symlink escapes, stale registration and failed-removal safety, wrong identity, import races, shared ancestor swaps, and partial initialization.
+
+### Exact verification
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test ./session/workspace -run 'TestShadow|TestImportSnapshot' -count=1 -v
+```
+
+```text
+=== RUN   TestShadowLayoutStableIdentityAndCanonicalSource
+--- PASS: TestShadowLayoutStableIdentityAndCanonicalSource (1.41s)
+=== RUN   TestShadowSessionsHaveFreshIndependentBaselines
+--- PASS: TestShadowSessionsHaveFreshIndependentBaselines (2.45s)
+=== RUN   TestShadowSharedLinksAndLifecycle
+--- PASS: TestShadowSharedLinksAndLifecycle (2.92s)
+=== RUN   TestShadowRejectsMetadataCollisionAndUnsafeRestore
+--- PASS: TestShadowRejectsMetadataCollisionAndUnsafeRestore (0.00s)
+=== RUN   TestShadowRejectsBaselineInjectionAndWrongIdentity
+--- PASS: TestShadowRejectsBaselineInjectionAndWrongIdentity (1.40s)
+=== RUN   TestShadowRejectsSymlinkedInternalPaths
+--- PASS: TestShadowRejectsSymlinkedInternalPaths (0.79s)
+=== RUN   TestShadowSetupPrunesStaleRegistrationAndCleanupPreservesLiveBranch
+--- PASS: TestShadowSetupPrunesStaleRegistrationAndCleanupPreservesLiveBranch (1.54s)
+=== RUN   TestImportSnapshotRejectsMutationAndSymlinkSwap
+--- PASS: TestImportSnapshotRejectsMutationAndSymlinkSwap (0.06s)
+=== RUN   TestShadowRejectsSharedSourceAncestorSymlinkSwap
+--- PASS: TestShadowRejectsSharedSourceAncestorSymlinkSwap (0.99s)
+=== RUN   TestShadowRepairsPartialRepositoryInitialization
+--- PASS: TestShadowRepairsPartialRepositoryInitialization (1.30s)
+PASS
+ok  claude-squad/session/workspace  13.597s
+```
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test -count=1 ./...
+```
+
+```text
+ok  claude-squad  0.602s
+ok  claude-squad/app  9.814s
+?   claude-squad/cmd  [no test files]
+?   claude-squad/cmd/cmd_test  [no test files]
+ok  claude-squad/config  6.174s
+?   claude-squad/daemon  [no test files]
+?   claude-squad/keys  [no test files]
+?   claude-squad/log  [no test files]
+ok  claude-squad/session  6.042s
+ok  claude-squad/session/git  2.873s
+ok  claude-squad/session/tmux  1.327s
+ok  claude-squad/session/workspace  18.314s
+ok  claude-squad/ui  9.425s
+?   claude-squad/ui/overlay  [no test files]
+```
+
+```text
+git diff --check
+```
+
+No output (passed).
+
+### Self-review
+
+- All persisted data is structurally validated before Git invocation; baseline values cannot begin with an option and must identify an existing commit.
+- Filesystem checks are repeated immediately before sensitive operations and reject symlink components rather than trusting lexical containment.
+- Cleanup is fail-closed: a failed or still-live worktree prevents branch deletion.
+- Restore no longer accepts an unrelated Git repository/worktree at the expected pathname.
+- Snapshot imports consume only the opened regular file whose identity was checked and whose bytes still match the scan hash.
+- Source contents remain immutable; no Apply or project garbage collection behavior was added.
+
+Final post-review verification:
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go fmt ./session/workspace && PATH=/Users/yangguoliang/.local/bin:$PATH go test ./session/workspace -run 'TestShadow|TestImportSnapshot' -count=1 && PATH=/Users/yangguoliang/.local/bin:$PATH go test -count=1 ./... && git -C "/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces" diff --check
+```
+
+```text
+ok  claude-squad/session/workspace  15.375s
+ok  claude-squad  0.683s
+ok  claude-squad/app  9.683s
+?   claude-squad/cmd  [no test files]
+?   claude-squad/cmd/cmd_test  [no test files]
+ok  claude-squad/config  5.442s
+?   claude-squad/daemon  [no test files]
+?   claude-squad/keys  [no test files]
+?   claude-squad/log  [no test files]
+ok  claude-squad/session  6.268s
+ok  claude-squad/session/git  2.963s
+ok  claude-squad/session/tmux  1.640s
+ok  claude-squad/session/workspace  17.963s
+ok  claude-squad/ui  8.740s
+?   claude-squad/ui/overlay  [no test files]
+```
