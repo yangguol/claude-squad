@@ -509,6 +509,152 @@ func TestShadowInitializesExactRepoWithoutModifyingEnclosingConfig(t *testing.T)
 	require.NoError(t, ws.Cleanup())
 }
 
+func TestCleanupShadowProjectsRemovesOnlyValidatedUnreferencedProjects(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root, err := shadowRoot()
+	require.NoError(t, err)
+
+	source := t.TempDir()
+	canonicalSource, err := filepath.EvalSymlinks(source)
+	require.NoError(t, err)
+	projectID := shadowProjectID(canonicalSource)
+	project := filepath.Join(root, projectID)
+	require.NoError(t, writeShadowProjectMetadataForTest(project, shadowProjectMetadata{
+		Version: CurrentVersion, ProjectID: projectID, SourcePath: canonicalSource,
+	}))
+	require.NoError(t, os.WriteFile(filepath.Join(project, "owned"), []byte("remove"), 0o600))
+
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "keep"), []byte("safe"), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, strings.Repeat("a", 64))))
+
+	maliciousID := strings.Repeat("b", 64)
+	maliciousProject := filepath.Join(root, maliciousID)
+	require.NoError(t, writeShadowProjectMetadataForTest(maliciousProject, shadowProjectMetadata{
+		Version: CurrentVersion, ProjectID: maliciousID, SourcePath: outside,
+	}))
+
+	err = CleanupShadowProjects()
+	require.Error(t, err)
+	require.ErrorContains(t, err, strings.Repeat("a", 64))
+	require.ErrorContains(t, err, maliciousID)
+	require.NoDirExists(t, project)
+	require.DirExists(t, maliciousProject)
+	require.FileExists(t, filepath.Join(outside, "keep"))
+	require.DirExists(t, canonicalSource)
+}
+
+func TestCleanupShadowProjectsKeepsStoredReferencesAndRejectsMalformedPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "stored")
+	require.NoError(t, err)
+	data := ws.Serialize()
+	project := filepath.Dir(data.Shadow.RepoPath)
+
+	state := map[string]any{
+		"instances": []any{map[string]any{
+			"title":     "stored",
+			"workspace": data,
+		}},
+	}
+	contents, err := json.Marshal(state)
+	require.NoError(t, err)
+	configDirectory := filepath.Join(home, ".claude-squad")
+	require.NoError(t, os.WriteFile(filepath.Join(configDirectory, "state.json"), contents, 0o600))
+
+	require.NoError(t, CleanupShadowProjects())
+	require.DirExists(t, project)
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	malformed := data
+	malformed.Shadow = copyShadowData(data.Shadow)
+	malformed.Shadow.RepoPath = outside
+	state["instances"] = []any{map[string]any{"title": "bad", "workspace": malformed}}
+	contents, err = json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(configDirectory, "state.json"), contents, 0o600))
+
+	err = CleanupShadowProjects()
+	require.ErrorContains(t, err, "repository path")
+	require.DirExists(t, project)
+}
+
+func TestCleanupShadowProjectsMalformedStateFailsClosedButReportsProjects(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root, err := shadowRoot()
+	require.NoError(t, err)
+	source := t.TempDir()
+	canonicalSource, err := filepath.EvalSymlinks(source)
+	require.NoError(t, err)
+	projectID := shadowProjectID(canonicalSource)
+	project := filepath.Join(root, projectID)
+	require.NoError(t, writeShadowProjectMetadataForTest(project, shadowProjectMetadata{
+		Version: CurrentVersion, ProjectID: projectID, SourcePath: canonicalSource,
+	}))
+	malformed := filepath.Join(root, "malformed")
+	require.NoError(t, os.Mkdir(malformed, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".claude-squad", "state.json"), []byte("{"), 0o600))
+
+	err = CleanupShadowProjects()
+	require.ErrorContains(t, err, "decode persisted session state")
+	require.ErrorContains(t, err, malformed)
+	require.DirExists(t, project)
+	require.DirExists(t, malformed)
+}
+
+func TestCleanupShadowProjectsKeepsActiveSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "active")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	data := ws.Serialize().Shadow
+	t.Cleanup(func() { _ = ws.Cleanup() })
+
+	require.NoError(t, CleanupShadowProjects())
+	require.DirExists(t, filepath.Dir(data.RepoPath))
+	require.DirExists(t, data.WorktreePath)
+}
+
+func TestCleanupShadowProjectsReportsAndPreservesIncompleteTransactions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "transaction")
+	require.NoError(t, err)
+	data := ws.Serialize().Shadow
+	project := filepath.Dir(data.RepoPath)
+	transactionDirectory := filepath.Join(project, "transactions", data.SessionID+"-incomplete")
+	require.NoError(t, os.MkdirAll(transactionDirectory, 0o700))
+	require.NoError(t, writeTransactionManifest(Transaction{
+		Directory: transactionDirectory, Version: 1, SessionID: data.SessionID,
+		SourcePath: source, State: transactionApplying,
+	}))
+
+	err = CleanupShadowProjects()
+	require.ErrorContains(t, err, "incomplete apply transactions")
+	require.DirExists(t, project)
+	require.FileExists(t, filepath.Join(transactionDirectory, "manifest.json"))
+	require.FileExists(t, filepath.Join(source, "file"))
+}
+
+func writeShadowProjectMetadataForTest(project string, metadata shadowProjectMetadata) error {
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		return err
+	}
+	contents, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(project, "metadata.json"), contents, 0o600)
+}
+
 func copyShadowData(data *ShadowData) *ShadowData {
 	copy := *data
 	return &copy

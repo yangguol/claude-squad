@@ -624,6 +624,234 @@ func newSessionID() (string, error) {
 	return hex.EncodeToString(value), nil
 }
 
+// CleanupShadowProjects removes validated shadow projects that are not referenced
+// by persisted sessions. Invalid projects and incomplete apply transactions are
+// preserved and reported so reset cannot silently discard recoverable state.
+func CleanupShadowProjects() error {
+	root, err := shadowRoot()
+	if err != nil {
+		return err
+	}
+	referenced, referenceErr := storedShadowProjectReferences(root)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("read shadow project root: %w", err)
+	}
+
+	var errs []error
+	if referenceErr != nil {
+		errs = append(errs, referenceErr)
+	}
+	for _, entry := range entries {
+		projectPath := filepath.Join(root, entry.Name())
+		if err := validateShadowProjectCandidate(root, projectPath, entry); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		metadata, err := readProjectMetadata(projectPath)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("validate shadow project %q: %w", entry.Name(), err))
+			continue
+		}
+		if err := validateCleanupMetadata(metadata, entry.Name()); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		incomplete, err := FindIncompleteTransactions(projectPath)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("inspect shadow project %q transactions: %w", entry.Name(), err))
+			continue
+		}
+		if len(incomplete) != 0 {
+			directories := make([]string, len(incomplete))
+			for index := range incomplete {
+				directories[index] = incomplete[index].Directory
+			}
+			errs = append(errs, fmt.Errorf("shadow project %q has incomplete apply transactions: %s", entry.Name(), strings.Join(directories, ", ")))
+			continue
+		}
+		if referenceErr != nil || referenced[entry.Name()] {
+			continue
+		}
+		active, err := shadowProjectHasActiveSessions(projectPath)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("inspect shadow project %q active sessions: %w", entry.Name(), err))
+			continue
+		}
+		if active {
+			continue
+		}
+		if err := removeShadowProject(root, projectPath); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func storedShadowProjectReferences(root string) (map[string]bool, error) {
+	references := make(map[string]bool)
+	configDir := filepath.Dir(root)
+	info, err := os.Lstat(configDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("shadow config directory is not a real directory")
+	}
+	resolvedConfigDir, err := filepath.EvalSymlinks(configDir)
+	if err != nil || filepath.Clean(resolvedConfigDir) != filepath.Clean(configDir) {
+		return nil, errors.New("shadow config directory identity is invalid")
+	}
+	statePath := filepath.Join(configDir, config.StateFileName)
+	info, err = os.Lstat(statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return references, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect persisted session state: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("persisted session state is not a regular file")
+	}
+	contents, err := os.ReadFile(statePath)
+	if err != nil {
+		return nil, fmt.Errorf("read persisted session state: %w", err)
+	}
+	var state struct {
+		Instances []struct {
+			Title     string `json:"title"`
+			Workspace *Data  `json:"workspace"`
+		} `json:"instances"`
+	}
+	if err := json.Unmarshal(contents, &state); err != nil {
+		return nil, fmt.Errorf("decode persisted session state: %w", err)
+	}
+	var errs []error
+	for _, instance := range state.Instances {
+		if instance.Workspace == nil || instance.Workspace.Mode != ModeDirectory || instance.Workspace.Shadow == nil {
+			continue
+		}
+		data := *instance.Workspace.Shadow
+		if len(data.ProjectID) == 64 {
+			references[data.ProjectID] = true
+		}
+		if err := validateStoredShadowReference(root, data); err != nil {
+			errs = append(errs, fmt.Errorf("reject persisted shadow workspace %q: %w", instance.Title, err))
+		}
+	}
+	if len(errs) != 0 {
+		return nil, errors.Join(errs...)
+	}
+	return references, nil
+}
+
+func validateStoredShadowReference(root string, data ShadowData) error {
+	if err := validateShadowData(data); err != nil {
+		return err
+	}
+	projectPath := filepath.Join(root, data.ProjectID)
+	info, err := os.Lstat(projectPath)
+	if err != nil {
+		return fmt.Errorf("inspect persisted project path: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("persisted project path is not a real directory")
+	}
+	if err := ensureRealContainedPath(root, projectPath, false, "persisted project path"); err != nil {
+		return err
+	}
+	metadata, err := readProjectMetadata(projectPath)
+	if err != nil {
+		return fmt.Errorf("read persisted project metadata: %w", err)
+	}
+	if err := validateProjectMetadata(metadata, data.ProjectID, data.SourcePath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func shadowProjectHasActiveSessions(projectPath string) (bool, error) {
+	repoPath := filepath.Join(projectPath, "repo")
+	info, err := os.Lstat(repoPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("shadow repository path is not a real directory")
+	}
+	if err := ensureRealContainedPath(projectPath, repoPath, false, "repository path"); err != nil {
+		return false, err
+	}
+	if err := validateGitMetadata(repoPath); err != nil {
+		return false, err
+	}
+	output, err := runGit(repoPath, nil, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	canonicalRepo, err := filepath.EvalSymlinks(repoPath)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		path := strings.TrimPrefix(line, "worktree ")
+		canonicalPath, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return false, fmt.Errorf("resolve registered shadow worktree %q: %w", path, err)
+		}
+		if filepath.Clean(canonicalPath) == filepath.Clean(canonicalRepo) {
+			continue
+		}
+		if err := ensureRealContainedPath(projectPath, canonicalPath, false, "registered worktree path"); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func validateShadowProjectCandidate(root, projectPath string, entry os.DirEntry) error {
+	if len(entry.Name()) != 64 {
+		return fmt.Errorf("reject shadow project path %q: invalid project ID", projectPath)
+	}
+	if _, err := hex.DecodeString(entry.Name()); err != nil {
+		return fmt.Errorf("reject shadow project path %q: invalid project ID", projectPath)
+	}
+	info, err := os.Lstat(projectPath)
+	if err != nil {
+		return fmt.Errorf("inspect shadow project path %q: %w", projectPath, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || entry.Type()&os.ModeSymlink != 0 {
+		return fmt.Errorf("reject shadow project path %q: not a real directory", projectPath)
+	}
+	if err := ensureRealContainedPath(root, projectPath, false, "project path"); err != nil {
+		return fmt.Errorf("reject shadow project path %q: %w", projectPath, err)
+	}
+	return nil
+}
+
+func validateCleanupMetadata(metadata shadowProjectMetadata, projectID string) error {
+	if metadata.Version != CurrentVersion || metadata.ProjectID != projectID ||
+		!filepath.IsAbs(metadata.SourcePath) || filepath.Clean(metadata.SourcePath) != metadata.SourcePath ||
+		shadowProjectID(metadata.SourcePath) != projectID {
+		return fmt.Errorf("reject shadow project %q: malformed metadata", projectID)
+	}
+	return nil
+}
+
+func removeShadowProject(root, projectPath string) error {
+	if err := ensureRealContainedPath(root, projectPath, false, "project path"); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(projectPath); err != nil {
+		return fmt.Errorf("remove shadow project %q: %w", projectPath, err)
+	}
+	return nil
+}
+
 func shadowRoot() (string, error) {
 	configDir, err := config.GetConfigDir()
 	if err != nil {

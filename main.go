@@ -9,6 +9,7 @@ import (
 	"claude-squad/session"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
+	"claude-squad/session/workspace"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -87,28 +88,13 @@ var (
 			if err != nil {
 				return fmt.Errorf("failed to initialize storage: %w", err)
 			}
-			if err := storage.DeleteAllInstances(); err != nil {
-				return fmt.Errorf("failed to reset storage: %w", err)
-			}
-			fmt.Println("Storage has been reset successfully")
-
-			if err := tmux.CleanupSessions(cmd2.MakeExecutor()); err != nil {
-				return fmt.Errorf("failed to cleanup tmux sessions: %w", err)
-			}
-			fmt.Println("Tmux sessions have been cleaned up")
-
-			if err := git.CleanupWorktrees(); err != nil {
-				return fmt.Errorf("failed to cleanup worktrees: %w", err)
-			}
-			fmt.Println("Worktrees have been cleaned up")
-
-			// Kill any daemon that's running.
-			if err := daemon.StopDaemon(); err != nil {
-				return err
-			}
-			fmt.Println("daemon has been stopped")
-
-			return nil
+			return resetAll(
+				storage.DeleteAllInstances,
+				func() error { return tmux.CleanupSessions(cmd2.MakeExecutor()) },
+				git.CleanupWorktrees,
+				workspace.CleanupShadowProjects,
+				daemon.StopDaemon,
+			)
 		},
 	}
 
@@ -142,6 +128,27 @@ var (
 		},
 	}
 )
+
+func resetAll(deleteStorage, cleanupTmux, cleanupWorktrees, cleanupShadowProjects, stopDaemon func() error) error {
+	steps := []struct {
+		run     func() error
+		failure string
+		success string
+	}{
+		{deleteStorage, "failed to reset storage", "Storage has been reset successfully"},
+		{cleanupTmux, "failed to cleanup tmux sessions", "Tmux sessions have been cleaned up"},
+		{cleanupWorktrees, "failed to cleanup worktrees", "Worktrees have been cleaned up"},
+		{cleanupShadowProjects, "failed to cleanup shadow projects", "Shadow projects have been cleaned up"},
+		{stopDaemon, "failed to stop daemon", "daemon has been stopped"},
+	}
+	for _, step := range steps {
+		if err := step.run(); err != nil {
+			return fmt.Errorf("%s: %w", step.failure, err)
+		}
+		fmt.Println(step.success)
+	}
+	return nil
+}
 
 func validateWorkingDirectory(path string) error {
 	info, err := os.Stat(path)
