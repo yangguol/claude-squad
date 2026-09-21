@@ -91,6 +91,8 @@ type fakeWorkspace struct {
 	events        *[]string
 	setupErr      error
 	cleanupErr    error
+	removeErr     error
+	pruneErr      error
 	setupCalls    int
 	cleanupCalls  int
 	commitCalls   int
@@ -118,8 +120,8 @@ func (w *fakeWorkspace) DiffNumstat() *git.DiffStats            { return w.diff 
 func (w *fakeWorkspace) CommitChanges(string) error             { w.commitCalls++; w.record("commit"); return nil }
 func (w *fakeWorkspace) PushChanges(string, bool) error         { return nil }
 func (w *fakeWorkspace) Apply() (*workspace.ApplyResult, error) { return &workspace.ApplyResult{}, nil }
-func (w *fakeWorkspace) Remove() error                          { w.removeCalls++; w.record("remove"); return nil }
-func (w *fakeWorkspace) Prune() error                           { w.pruneCalls++; w.record("prune"); return nil }
+func (w *fakeWorkspace) Remove() error                          { w.removeCalls++; w.record("remove"); return w.removeErr }
+func (w *fakeWorkspace) Prune() error                           { w.pruneCalls++; w.record("prune"); return w.pruneErr }
 func (w *fakeWorkspace) Cleanup() error                         { w.cleanupCalls++; w.record("cleanup"); return w.cleanupErr }
 func (w *fakeWorkspace) Serialize() workspace.Data              { return w.serializeData }
 
@@ -199,6 +201,22 @@ func TestResumePreservesPreexistingValidWorkspaceWhenTmuxStartFails(t *testing.T
 	require.Equal(t, Paused, instance.Status)
 	require.Zero(t, ws.setupCalls)
 	require.Zero(t, ws.cleanupCalls, "resume must not clean a workspace it did not acquire")
+}
+
+func TestPreparePauseReportsPausedWhenRemoveSucceededButPruneFailed(t *testing.T) {
+	ws := &fakeWorkspace{mode: workspace.ModeGit, workDir: t.TempDir(), valid: true, pruneErr: fmt.Errorf("prune failed")}
+	instance, err := NewInstance(InstanceOptions{Title: "pause-prune", Path: t.TempDir(), Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Running
+	instance.tmuxSession = tmux.NewTmuxSessionWithDeps(instance.Title, "", &nullPtyFactory{t: t}, cmd_test.MockCmdExec{})
+
+	paused, err := instance.PreparePause()
+	require.True(t, paused, "removed workspace means the session is physically paused")
+	require.ErrorContains(t, err, "failed to prune workspace")
+	require.Equal(t, Running, instance.Status, "PreparePause leaves synchronous status mutation to its caller")
+	require.Equal(t, 1, ws.removeCalls)
+	require.Equal(t, 1, ws.pruneCalls)
 }
 
 func TestPauseStopsWhenWorkspaceValidationFails(t *testing.T) {

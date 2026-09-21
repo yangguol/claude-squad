@@ -117,11 +117,12 @@ type home struct {
 	// pendingActions prevents concurrent destructive operations against one instance.
 	pendingActions map[*session.Instance]actionKind
 	// Backend hooks are replaceable by tests. They must not mutate home, list, UI, or storage.
-	applyInstance  func(*session.Instance) (*workspace.ApplyResult, error)
-	pauseInstance  func(*session.Instance) (bool, error)
-	killInstance   func(*session.Instance) error
-	saveInstances  func([]*session.Instance) error
-	deleteInstance func(string) error
+	applyInstance   func(*session.Instance) (*workspace.ApplyResult, error)
+	pauseInstance   func(*session.Instance) (bool, error)
+	killInstance    func(*session.Instance) error
+	saveInstances   func([]*session.Instance) error
+	deleteInstance  func(string) error
+	cleanupTerminal func(string)
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -1136,11 +1137,20 @@ func (m *home) handleApplyResult(msg applyResultMsg) tea.Cmd {
 func (m *home) handleApplyPaused(msg applyPausedMsg) tea.Cmd {
 	if msg.paused {
 		msg.instance.SetStatus(session.Paused)
+		m.cleanupTerminalForInstance(msg.instance.Title)
 	}
 	saveErr := m.saveCurrentInstances()
 	m.finishAction(msg.instance, actionApply)
 	m.showApplyResult(applyFinalMsg{instance: msg.instance, result: msg.result, paused: msg.paused, pauseErr: msg.pauseErr, saveErr: saveErr})
 	return m.instanceChanged()
+}
+
+func (m *home) cleanupTerminalForInstance(title string) {
+	if m.cleanupTerminal != nil {
+		m.cleanupTerminal(title)
+		return
+	}
+	m.tabbedWindow.CleanupTerminalForInstance(title)
 }
 
 func (m *home) saveCurrentInstances() error {

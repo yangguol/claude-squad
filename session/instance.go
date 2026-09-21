@@ -537,7 +537,9 @@ func (i *Instance) PreparePause() (paused bool, err error) {
 	if err := i.workspace.Prune(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to prune workspace: %w", err))
 		log.ErrorLog.Print(err)
-		return false, i.combineErrors(errs)
+		// Remove already succeeded, so the workspace is gone and the session is
+		// physically paused even though stale metadata may remain to be pruned.
+		return true, i.combineErrors(errs)
 	}
 
 	_ = clipboard.WriteAll(i.workspace.BranchName())

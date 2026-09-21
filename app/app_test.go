@@ -671,6 +671,108 @@ func TestApplyFlowUsesWorkspaceApplyBackend(t *testing.T) {
 	require.Contains(t, h.textOverlay.Render(), "Applied 1 changed path")
 }
 
+func TestApplySuccessCleansOriginalTerminalOnlyFromUpdate(t *testing.T) {
+	h, target := newDirectoryHome(t)
+	other, err := session.NewInstance(session.InstanceOptions{
+		Title: "other", Path: t.TempDir(), Program: "echo",
+		Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: true}, displayName: "other-source"},
+	})
+	require.NoError(t, err)
+	other.SetStatus(session.Ready)
+	h.list.AddInstance(other)()
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		return &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil
+	}
+	h.saveInstances = func([]*session.Instance) error { return nil }
+	h.pauseInstance = func(*session.Instance) (bool, error) { return true, nil }
+	var cleaned []string
+	h.cleanupTerminal = func(title string) { cleaned = append(cleaned, title) }
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	h.list.SetSelectedInstance(1)
+	applyMsg := cmd()
+	_, pauseCmd := h.Update(applyMsg)
+	pauseMsg := pauseCmd()
+	require.Empty(t, cleaned, "background pause command must not mutate terminal UI")
+	_, _ = h.Update(pauseMsg)
+
+	require.Equal(t, []string{target.Title}, cleaned)
+	require.Same(t, other, h.list.GetSelectedInstance())
+	require.Equal(t, session.Paused, target.Status)
+	require.Equal(t, session.Ready, other.Status)
+}
+
+func TestApplyPostPauseSaveFailureKeepsPausedAndCleansTerminal(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		return &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil
+	}
+	saves := 0
+	h.saveInstances = func(instances []*session.Instance) error {
+		saves++
+		if saves == 2 {
+			require.Equal(t, session.Paused, instances[0].Status)
+			return fmt.Errorf("post-pause save failed")
+		}
+		return nil
+	}
+	h.pauseInstance = func(*session.Instance) (bool, error) { return true, nil }
+	var cleaned []string
+	h.cleanupTerminal = func(title string) { cleaned = append(cleaned, title) }
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	msg := cmd()
+	for cmd != nil {
+		_, cmd = h.Update(msg)
+		if cmd != nil {
+			msg = cmd()
+		}
+	}
+
+	require.Equal(t, 2, saves)
+	require.Equal(t, session.Paused, instance.Status)
+	require.Equal(t, []string{instance.Title}, cleaned)
+	require.Contains(t, h.textOverlay.Render(), "Persistence failed: post-pause save failed")
+	require.Contains(t, h.textOverlay.Render(), "Session paused")
+}
+
+func TestApplyPartialPausePersistsPausedCleansTerminalAndReportsError(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		return &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil
+	}
+	var savedStatuses []session.Status
+	h.saveInstances = func(instances []*session.Instance) error {
+		savedStatuses = append(savedStatuses, instances[0].Status)
+		return nil
+	}
+	h.pauseInstance = func(*session.Instance) (bool, error) {
+		return true, fmt.Errorf("failed to prune workspace")
+	}
+	var cleaned []string
+	h.cleanupTerminal = func(title string) { cleaned = append(cleaned, title) }
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	msg := cmd()
+	for cmd != nil {
+		_, cmd = h.Update(msg)
+		if cmd != nil {
+			msg = cmd()
+		}
+	}
+
+	require.Equal(t, []session.Status{session.Ready, session.Paused}, savedStatuses)
+	require.Equal(t, session.Paused, instance.Status)
+	require.Equal(t, []string{instance.Title}, cleaned)
+	overlay := h.textOverlay.Render()
+	require.Contains(t, overlay, "Session paused")
+	require.Contains(t, overlay, "Pause cleanup failed: failed to prune workspace")
+	require.NotContains(t, overlay, "remains recoverable")
+}
+
 func TestApplyFlowPersistsBeforeAndAfterPause(t *testing.T) {
 	h, instance := newDirectoryHome(t)
 	events := runApplyFlow(t, h, &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil)

@@ -92,3 +92,28 @@ Fixed confirmed-action concurrency and ownership, corrected Apply persistence/pa
 ### Concerns
 
 - A successful backend kill followed by persistence deletion failure intentionally leaves the in-memory entry visible and reports that it stopped but could not be removed from persisted state; this is recoverable on retry/restart.
+
+## Fix Round 2
+
+### Status
+
+Fixed successful Apply terminal cleanup ownership and partial-pause state reporting. A physically removed workspace is now paused even when prune reports an error; the paused state is persisted, the original instance's terminal is cleaned synchronously in `Update`, and the cleanup error remains visible.
+
+### Exact evidence
+
+- TDD red: `go test ./session -run TestPreparePauseReportsPausedWhenRemoveSucceededButPruneFailed -count=1` — FAIL because `PreparePause` returned `paused=false` after workspace removal succeeded and prune failed.
+- `go test ./app -run 'TestKillCommand|TestApply|TestGeneralHelp|TestDirectoryApply' -count=1 -v` — PASS (`claude-squad/app` 16.159s). Includes command→message→Update coverage for successful Apply terminal cleanup against the original target, post-pause save failure, `paused=true` plus pause error, and the retained success/no-op/conflict/error/stale/duplicate paths.
+- `go test ./session -run 'TestPreparePause|TestPause' -count=1 -v` — PASS (`claude-squad/session` 0.434s). Covers prune-after-remove partial success and validation failure.
+- `go test ./app ./ui ./keys -count=1` — PASS (`app` 28.703s, `ui` 7.241s; `keys` has no test files).
+- `go test -count=1 ./...` — PASS. All repository packages passed; `session/workspace` completed in 133.385s.
+- `git diff --check` — PASS with no output.
+
+### Fix details
+
+- Successful and partially successful pauses clean the terminal cache only in the synchronous result handler and use the original action target's title, independent of current selection.
+- A prune failure after successful removal returns `paused=true` with the error. The app sets and saves `Paused`, cleans the terminal, and reports the pause-cleanup failure without claiming the session remains ready.
+- Failures before workspace removal continue to return `paused=false`; the session remains in its actual recoverable running/ready state.
+
+### Concerns
+
+- A post-pause persistence failure leaves the correct in-memory `Paused` state and reports the error, but disk state can remain pre-pause until a later successful save or shutdown save.
