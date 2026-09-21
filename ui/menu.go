@@ -130,10 +130,17 @@ func (m *Menu) addInstanceOptions() {
 	// Instance management group
 	options := []keys.KeyName{keys.KeyNew, keys.KeyKill}
 
-	// Action group
-	actionGroup := []keys.KeyName{keys.KeyEnter, keys.KeySubmit}
+	// Action group. Workspace-specific actions come from capabilities so mixed
+	// restored Git and directory sessions each render their own valid controls.
+	actionGroup := []keys.KeyName{keys.KeyEnter}
+	capabilities := m.instance.Capabilities()
+	if capabilities.Push {
+		actionGroup = append(actionGroup, keys.KeySubmit)
+	}
 	if m.instance.Status == session.Paused {
 		actionGroup = append(actionGroup, keys.KeyResume)
+	} else if capabilities.Apply {
+		actionGroup = append(actionGroup, keys.KeyApply)
 	} else {
 		actionGroup = append(actionGroup, keys.KeyCheckout)
 	}

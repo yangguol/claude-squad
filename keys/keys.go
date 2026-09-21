@@ -21,6 +21,7 @@ const (
 	KeySubmitName // SubmitName is a special keybinding for submitting the name of a new instance.
 
 	KeyCheckout
+	KeyApply
 	KeyResume
 	KeyPrompt // New key for entering a prompt
 	KeyHelp   // Key for showing help screen
@@ -106,6 +107,10 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyCheckout: key.NewBinding(
 		key.WithKeys("c"),
 		key.WithHelp("c", "checkout"),
+	),
+	KeyApply: key.NewBinding(
+		key.WithKeys("c"),
+		key.WithHelp("c", "apply"),
 	),
 	KeyTab: key.NewBinding(
 		key.WithKeys("tab"),

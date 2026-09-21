@@ -3,6 +3,7 @@ package ui
 import (
 	"claude-squad/log"
 	"claude-squad/session"
+	"claude-squad/session/workspace"
 	"errors"
 	"fmt"
 	"strings"
@@ -174,7 +175,7 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	remainingWidth := r.width
 	remainingWidth -= runewidth.StringWidth(prefix)
 	remainingWidth -= runewidth.StringWidth(branchIcon)
-	remainingWidth -= 2 // for the literal " " and "-" in the branchLine format string
+	remainingWidth -= 2 // for the literal " " and "-" in the workspaceLine format string
 
 	diffWidth := runewidth.StringWidth(addedDiff) + runewidth.StringWidth(removedDiff)
 	if diffWidth > 0 {
@@ -184,28 +185,32 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	// Use fixed width for diff stats to avoid layout issues
 	remainingWidth -= diffWidth
 
-	branch := i.Branch
-	if i.Started() && hasMultipleRepos {
+	workspaceLabel := i.Branch
+	modeLabel := "Git"
+	if i.WorkspaceMode() == workspace.ModeDirectory {
+		modeLabel = "Directory (isolated)"
+		workspaceLabel = i.DisplayWorkspace()
+	} else if i.Started() && hasMultipleRepos {
 		repoName, err := i.RepoName()
 		if err != nil {
 			log.ErrorLog.Printf("could not get repo name in instance renderer: %v", err)
 		} else {
-			branch += fmt.Sprintf(" (%s)", repoName)
+			workspaceLabel += fmt.Sprintf(" (%s)", repoName)
 		}
 	}
-	// Don't show branch if there's no space for it. Or show ellipsis if it's too long.
-	branchWidth := runewidth.StringWidth(branch)
+	workspaceLabel = fmt.Sprintf("%s: %s", modeLabel, workspaceLabel)
+	// Don't show the workspace if there's no space for it. Or show ellipsis if it's too long.
+	workspaceWidth := runewidth.StringWidth(workspaceLabel)
 	if remainingWidth < 0 {
-		branch = ""
-	} else if remainingWidth < branchWidth {
+		workspaceLabel = ""
+	} else if remainingWidth < workspaceWidth {
 		if remainingWidth < 3 {
-			branch = ""
+			workspaceLabel = ""
 		} else {
-			// We know the remainingWidth is at least 4 and branch is longer than that, so this is safe.
-			branch = runewidth.Truncate(branch, remainingWidth-3, "...")
+			workspaceLabel = runewidth.Truncate(workspaceLabel, remainingWidth-3, "...")
 		}
 	}
-	remainingWidth -= runewidth.StringWidth(branch)
+	remainingWidth -= runewidth.StringWidth(workspaceLabel)
 
 	// Add spaces to fill the remaining width.
 	spaces := ""
@@ -213,13 +218,13 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		spaces = strings.Repeat(" ", remainingWidth)
 	}
 
-	branchLine := fmt.Sprintf("%s %s-%s%s%s", strings.Repeat(" ", len(prefix)), branchIcon, branch, spaces, diff)
+	workspaceLine := fmt.Sprintf("%s %s-%s%s%s", strings.Repeat(" ", len(prefix)), branchIcon, workspaceLabel, spaces, diff)
 
 	// join title and subtitle
 	text := lipgloss.JoinVertical(
 		lipgloss.Left,
 		title,
-		descS.Render(branchLine),
+		descS.Render(workspaceLine),
 	)
 
 	return text

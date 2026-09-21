@@ -2,6 +2,8 @@ package ui
 
 import (
 	"claude-squad/session"
+	"claude-squad/session/workspace"
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -72,4 +74,35 @@ func TestMoveWithSingleItem(t *testing.T) {
 
 	require.False(t, l.MoveUp())
 	require.False(t, l.MoveDown())
+}
+
+func TestDirectoryInstanceRendersModeAndSourceName(t *testing.T) {
+	instance := testInstanceWithWorkspace(t, workspace.ModeDirectory, workspace.Capabilities{Apply: true}, "source-project", "internal-shadow-branch")
+	instance.SetStatus(session.Paused)
+	renderer := &InstanceRenderer{spinner: func() *spinner.Model { s := spinner.New(); return &s }(), width: 80}
+
+	rendered := renderer.Render(instance, 1, true, false)
+	require.Contains(t, rendered, "Directory (isolated)")
+	require.Contains(t, rendered, "source-project")
+	require.NotContains(t, rendered, "internal-shadow-branch")
+	require.NotContains(t, rendered, "/internal/worktree")
+}
+
+func TestMixedWorkspaceInstancesRenderTheirOwnMode(t *testing.T) {
+	s := spinner.New()
+	l := NewList(&s, false)
+	l.SetSize(100, 20)
+	gitInstance := testInstanceWithWorkspace(t, workspace.ModeGit, workspace.Capabilities{BranchPicker: true, Push: true}, "repo", "feature")
+	directoryInstance := testInstanceWithWorkspace(t, workspace.ModeDirectory, workspace.Capabilities{Apply: true}, "source-project", "internal-shadow-branch")
+	gitInstance.SetStatus(session.Paused)
+	directoryInstance.SetStatus(session.Paused)
+	l.AddInstance(gitInstance)
+	l.AddInstance(directoryInstance)
+
+	rendered := strings.ReplaceAll(l.String(), "\x1b", "")
+	require.Contains(t, rendered, "Git")
+	require.Contains(t, rendered, "feature")
+	require.Contains(t, rendered, "Directory (isolated)")
+	require.Contains(t, rendered, "source-project")
+	require.NotContains(t, rendered, "internal-shadow-branch")
 }

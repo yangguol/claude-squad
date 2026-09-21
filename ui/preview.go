@@ -2,6 +2,7 @@ package ui
 
 import (
 	"claude-squad/session"
+	"claude-squad/session/workspace"
 	"fmt"
 	"strings"
 
@@ -59,18 +60,16 @@ func (p *PreviewPane) UpdateContent(instance *session.Instance) error {
 		p.setFallbackState("Setting up workspace...")
 		return nil
 	case instance.Status == session.Paused:
+		detail := fmt.Sprintf("The instance can be checked out at '%s' (copied to your clipboard)", instance.Branch)
+		if instance.WorkspaceMode() == workspace.ModeDirectory {
+			detail = fmt.Sprintf("Directory workspace for '%s'. Press 'r' to continue editing.", instance.DisplayWorkspace())
+		}
 		p.setFallbackState(lipgloss.JoinVertical(lipgloss.Center,
 			"Session is paused. Press 'r' to resume.",
 			"",
 			lipgloss.NewStyle().
-				Foreground(lipgloss.AdaptiveColor{
-					Light: "#FFD700",
-					Dark:  "#FFD700",
-				}).
-				Render(fmt.Sprintf(
-					"The instance can be checked out at '%s' (copied to your clipboard)",
-					instance.Branch,
-				)),
+				Foreground(lipgloss.AdaptiveColor{Light: "#FFD700", Dark: "#FFD700"}).
+				Render(detail),
 		))
 		return nil
 	}

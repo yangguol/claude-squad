@@ -6,9 +6,11 @@ import (
 	"claude-squad/log"
 	"claude-squad/session"
 	"claude-squad/session/git"
+	"claude-squad/session/workspace"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -82,6 +84,8 @@ type home struct {
 	instanceStarting bool
 	// startingInstance holds a reference to the instance being started in the background.
 	startingInstance *session.Instance
+	// workspaceMode controls creation-time UI before the instance workspace exists.
+	workspaceMode workspace.Mode
 
 	// -- UI Components --
 
@@ -101,6 +105,10 @@ type home struct {
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
 	confirmationOverlay *overlay.ConfirmationOverlay
+	// confirmedAction is queued by a confirmation callback and returned by handleKeyPress.
+	confirmedAction tea.Cmd
+	// applyAndPause performs the directory handoff; replaceable in focused tests.
+	applyAndPause func(*session.Instance) (*workspace.ApplyResult, error)
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -117,18 +125,25 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		os.Exit(1)
 	}
 
+	mode, err := workspace.DetectMode(".")
+	if err != nil {
+		fmt.Printf("Failed to detect workspace mode: %v\n", err)
+		os.Exit(1)
+	}
+
 	h := &home{
-		ctx:          ctx,
-		spinner:      spinner.New(spinner.WithSpinner(spinner.MiniDot)),
-		menu:         ui.NewMenu(),
-		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
-		errBox:       ui.NewErrBox(),
-		storage:      storage,
-		appConfig:    appConfig,
-		program:      program,
-		autoYes:      autoYes,
-		state:        stateDefault,
-		appState:     appState,
+		ctx:           ctx,
+		spinner:       spinner.New(spinner.WithSpinner(spinner.MiniDot)),
+		menu:          ui.NewMenu(),
+		tabbedWindow:  ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
+		errBox:        ui.NewErrBox(),
+		storage:       storage,
+		appConfig:     appConfig,
+		program:       program,
+		autoYes:       autoYes,
+		workspaceMode: mode,
+		state:         stateDefault,
+		appState:      appState,
 	}
 	h.list = ui.NewList(&h.spinner, autoYes)
 
@@ -301,6 +316,9 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instanceChangedMsg:
 		// Handle instance changed after confirmation action
 		return m, m.instanceChanged()
+	case applyResultMsg:
+		m.showApplyResult(msg)
+		return m, nil
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -372,6 +390,12 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 	if name == keys.KeyShiftDown || name == keys.KeyShiftUp {
 		return nil, false
 	}
+	if name == keys.KeyCheckout {
+		selected := m.list.GetSelectedInstance()
+		if selected != nil && selected.Capabilities().Apply {
+			name = keys.KeyApply
+		}
+	}
 
 	// Skip the menu highlighting if the key is not in the map or we are using the shift up and down keys.
 	// TODO: cleanup: when you press enter on stateNew, we use keys.KeySubmitName. We should unify the keymap.
@@ -417,15 +441,18 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				return m, m.handleError(fmt.Errorf("title cannot be empty"))
 			}
 
-			// If promptAfterName, show prompt+branch overlay before starting
+			// If promptAfterName, show the prompt overlay before starting. Git mode
+			// includes branch selection; directory mode deliberately skips it.
 			if m.promptAfterName {
 				m.promptAfterName = false
 				m.state = statePrompt
 				m.menu.SetState(ui.StatePrompt)
 				m.textInputOverlay = m.newPromptOverlay()
-				// Trigger initial branch search (no debounce, version 0)
-				initialSearch := m.runBranchSearch("", m.textInputOverlay.BranchFilterVersion())
-				return m, tea.Batch(tea.WindowSize(), initialSearch)
+				if m.workspaceMode == workspace.ModeGit {
+					initialSearch := m.runBranchSearch("", m.textInputOverlay.BranchFilterVersion())
+					return m, tea.Batch(tea.WindowSize(), initialSearch)
+				}
+				return m, tea.WindowSize()
 			}
 
 			// Set Loading status and finalize into the list immediately
@@ -570,7 +597,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		if shouldClose {
 			m.state = stateDefault
 			m.confirmationOverlay = nil
-			return m, nil
+			cmd := m.confirmedAction
+			m.confirmedAction = nil
+			return m, cmd
 		}
 		return m, nil
 	}
@@ -608,18 +637,22 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 	switch name {
 	case keys.KeyHelp:
-		return m.showHelpScreen(helpTypeGeneral{}, nil)
+		return m.showHelpScreen(helpTypeGeneral{instance: m.list.GetSelectedInstance()}, nil)
 	case keys.KeyPrompt:
 		if m.list.NumInstances() >= GlobalInstanceLimit {
 			return m, m.handleError(
 				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 		}
 
-		// Start a background fetch so branches are up to date by the time the picker opens
-		fetchCmd := func() tea.Msg {
-			currentDir, _ := os.Getwd()
-			git.FetchBranches(currentDir)
-			return nil
+		// Git sessions fetch branches for the picker. Directory sessions have no
+		// user-facing branch and skip both fetch and picker.
+		var fetchCmd tea.Cmd
+		if m.workspaceMode == workspace.ModeGit {
+			fetchCmd = func() tea.Msg {
+				currentDir, _ := os.Getwd()
+				git.FetchBranches(currentDir)
+				return nil
+			}
 		}
 
 		instance, err := session.NewInstance(session.InstanceOptions{
@@ -709,7 +742,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, m.confirmAction(message, killAction)
 	case keys.KeySubmit:
 		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Status == session.Loading {
+		if selected == nil || selected.Status == session.Loading || !selected.Capabilities().Push {
 			return m, nil
 		}
 
@@ -732,7 +765,39 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 
-		// Show help screen before pausing
+		if selected.Capabilities().Apply {
+			if selected.Paused() {
+				return m, nil
+			}
+			applyAction := func() tea.Msg {
+				var result *workspace.ApplyResult
+				var err error
+				if m.applyAndPause != nil {
+					result, err = m.applyAndPause(selected)
+				} else {
+					result, err = selected.Apply()
+					if err == nil {
+						if pauseErr := selected.Pause(); pauseErr != nil {
+							err = fmt.Errorf("changes applied but failed to pause session: %w", pauseErr)
+						}
+					}
+				}
+				if err != nil {
+					return applyResultMsg{instance: selected, result: result, err: err}
+				}
+				m.tabbedWindow.CleanupTerminalForInstance(selected.Title)
+				if m.storage != nil {
+					if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+						return applyResultMsg{instance: selected, result: result, err: fmt.Errorf("changes applied and session paused but state could not be saved: %w", err)}
+					}
+				}
+				return applyResultMsg{instance: selected, result: result}
+			}
+			message := fmt.Sprintf("Apply changes from session '%s' to '%s'?", selected.Title, selected.DisplayWorkspace())
+			return m, m.confirmAction(message, applyAction)
+		}
+
+		// Git mode keeps the existing checkout/pause help flow.
 		m.showHelpScreen(helpTypeInstanceCheckout{}, func() {
 			if err := selected.Pause(); err != nil {
 				m.handleError(err)
@@ -847,6 +912,12 @@ type hideErrMsg struct{}
 type previewTickMsg struct{}
 
 type instanceChangedMsg struct{}
+
+type applyResultMsg struct {
+	instance *session.Instance
+	result   *workspace.ApplyResult
+	err      error
+}
 
 type instanceStartedMsg struct {
 	instance        *session.Instance
@@ -987,6 +1058,9 @@ func (m *home) handleError(err error) tea.Cmd {
 }
 
 func (m *home) newPromptOverlay() *overlay.TextInputOverlay {
+	if m.workspaceMode == workspace.ModeDirectory {
+		return overlay.NewTextInputOverlayWithProfiles("Enter prompt", "", m.appConfig.GetProfiles())
+	}
 	return overlay.NewTextInputOverlayWithBranchPicker("Enter prompt", "", m.appConfig.GetProfiles())
 }
 
@@ -1007,26 +1081,47 @@ func (m *home) cancelPromptOverlay() tea.Cmd {
 	)
 }
 
-// confirmAction shows a confirmation modal and stores the action to execute on confirm
+func (m *home) showApplyResult(msg applyResultMsg) {
+	var content string
+	if msg.err != nil {
+		var conflict *workspace.ConflictError
+		if errors.As(msg.err, &conflict) {
+			content = lipgloss.JoinVertical(lipgloss.Left,
+				titleStyle.Render("Apply Conflict"), "",
+				"The source was not changed. Resolve these paths and retry:",
+				strings.Join(conflict.Paths, "\n"))
+		} else {
+			content = lipgloss.JoinVertical(lipgloss.Left,
+				titleStyle.Render("Apply Failed"), "", msg.err.Error())
+		}
+	} else if msg.result == nil || len(msg.result.Changed) == 0 {
+		content = lipgloss.JoinVertical(lipgloss.Left,
+			titleStyle.Render("Apply Complete"), "", "No changes to apply. Session paused.")
+	} else {
+		content = lipgloss.JoinVertical(lipgloss.Left,
+			titleStyle.Render("Apply Complete"), "",
+			fmt.Sprintf("Applied %d changed path(s) to %s. Session paused.", len(msg.result.Changed), msg.instance.DisplayWorkspace()))
+	}
+	m.textOverlay = overlay.NewTextOverlay(content)
+	m.state = stateHelp
+}
+
+// confirmAction shows a confirmation modal and queues the action for Bubble Tea
+// when the user confirms. The action's returned message is propagated through
+// Update rather than being executed and discarded inside the callback.
 func (m *home) confirmAction(message string, action tea.Cmd) tea.Cmd {
 	m.state = stateConfirm
+	m.confirmedAction = nil
 
-	// Create and show the confirmation overlay using ConfirmationOverlay
 	m.confirmationOverlay = overlay.NewConfirmationOverlay(message)
-	// Set a fixed width for consistent appearance
 	m.confirmationOverlay.SetWidth(50)
-
-	// Set callbacks for confirmation and cancellation
 	m.confirmationOverlay.OnConfirm = func() {
 		m.state = stateDefault
-		// Execute the action if it exists
-		if action != nil {
-			_ = action()
-		}
+		m.confirmedAction = action
 	}
-
 	m.confirmationOverlay.OnCancel = func() {
 		m.state = stateDefault
+		m.confirmedAction = nil
 	}
 
 	return nil

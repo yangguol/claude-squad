@@ -48,12 +48,28 @@ type TextInputOverlay struct {
 
 // NewTextInputOverlay creates a new text input overlay with the given title and initial value.
 func NewTextInputOverlay(title string, initialValue string) *TextInputOverlay {
+	return NewTextInputOverlayWithProfiles(title, initialValue, nil)
+}
+
+// NewTextInputOverlayWithProfiles creates a prompt overlay without branch selection.
+func NewTextInputOverlayWithProfiles(title string, initialValue string, profiles []config.Profile) *TextInputOverlay {
 	ti := newTextarea(initialValue)
-	return &TextInputOverlay{
-		textarea: ti,
-		Title:    title,
-		numStops: 2, // textarea + enter button
+	var pp *ProfilePicker
+	numStops := 2 // textarea + enter button
+	if len(profiles) > 0 {
+		pp = NewProfilePicker(profiles)
+		if pp.HasMultiple() {
+			numStops = 3 // profile picker + textarea + enter button
+		}
 	}
+	overlay := &TextInputOverlay{
+		textarea:      ti,
+		Title:         title,
+		profilePicker: pp,
+		numStops:      numStops,
+	}
+	overlay.updateFocusState()
+	return overlay
 }
 
 // NewTextInputOverlayWithBranchPicker creates a text input overlay that includes an

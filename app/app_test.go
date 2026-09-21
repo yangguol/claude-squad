@@ -4,11 +4,14 @@ import (
 	"claude-squad/config"
 	"claude-squad/log"
 	"claude-squad/session"
+	"claude-squad/session/git"
+	"claude-squad/session/workspace"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -431,6 +434,144 @@ func TestMultipleConfirmationsDontInterfere(t *testing.T) {
 	// Test that cancelled action can still be executed independently
 	firstOnConfirm()
 	assert.True(t, action1Called, "First action should be callable after being replaced")
+}
+
+type appTestWorkspace struct {
+	mode         workspace.Mode
+	capabilities workspace.Capabilities
+	displayName  string
+}
+
+func (w *appTestWorkspace) Mode() workspace.Mode                 { return w.mode }
+func (w *appTestWorkspace) Capabilities() workspace.Capabilities { return w.capabilities }
+func (w *appTestWorkspace) WorkDir() string                      { return "/internal/worktree" }
+func (w *appTestWorkspace) DisplayName() string                  { return w.displayName }
+func (w *appTestWorkspace) BranchName() string                   { return "internal-shadow-branch" }
+func (w *appTestWorkspace) Setup() error                         { return nil }
+func (w *appTestWorkspace) IsValid() (bool, error)               { return true, nil }
+func (w *appTestWorkspace) IsDirty() (bool, error)               { return false, nil }
+func (w *appTestWorkspace) IsBranchCheckedOut() (bool, error)    { return false, nil }
+func (w *appTestWorkspace) Diff() *git.DiffStats                 { return &git.DiffStats{} }
+func (w *appTestWorkspace) DiffNumstat() *git.DiffStats          { return &git.DiffStats{} }
+func (w *appTestWorkspace) CommitChanges(string) error           { return nil }
+func (w *appTestWorkspace) PushChanges(string, bool) error       { return nil }
+func (w *appTestWorkspace) Apply() (*workspace.ApplyResult, error) {
+	return &workspace.ApplyResult{}, nil
+}
+func (w *appTestWorkspace) Remove() error             { return nil }
+func (w *appTestWorkspace) Prune() error              { return nil }
+func (w *appTestWorkspace) Cleanup() error            { return nil }
+func (w *appTestWorkspace) Serialize() workspace.Data { return workspace.Data{Mode: w.mode} }
+
+func newDirectoryHome(t *testing.T) (*home, *session.Instance) {
+	t.Helper()
+	instance, err := session.NewInstance(session.InstanceOptions{
+		Title: "directory-session", Path: t.TempDir(), Program: "echo",
+		Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: true}, displayName: "source-project"},
+	})
+	require.NoError(t, err)
+	instance.SetStatus(session.Ready)
+	s := spinner.New()
+	list := ui.NewList(&s, false)
+	list.AddInstance(instance)
+	list.SetSelectedInstance(0)
+	h := &home{
+		ctx: context.Background(), state: stateDefault, workspaceMode: workspace.ModeDirectory, keySent: true,
+		appConfig: config.DefaultConfig(), list: list, menu: ui.NewMenu(),
+		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
+		errBox:       ui.NewErrBox(),
+	}
+	return h, instance
+}
+
+func TestDirectoryPromptSkipsBranchPickerAndSearch(t *testing.T) {
+	h, _ := newDirectoryHome(t)
+	overlay := h.newPromptOverlay()
+	require.Equal(t, uint64(0), overlay.BranchFilterVersion())
+	require.Empty(t, overlay.BranchFilter())
+	require.NotContains(t, overlay.Render(), "Branch")
+}
+
+func TestDirectoryPushIsIgnored(t *testing.T) {
+	h, _ := newDirectoryHome(t)
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	require.Nil(t, cmd)
+	require.Equal(t, stateDefault, h.state)
+	require.Nil(t, h.confirmationOverlay)
+}
+
+func TestDirectoryApplyConfirmationAndResultMessages(t *testing.T) {
+	tests := []struct {
+		name   string
+		result *workspace.ApplyResult
+		err    error
+	}{
+		{name: "success", result: &workspace.ApplyResult{Changed: []string{"a.txt"}}},
+		{name: "no-op", result: &workspace.ApplyResult{}},
+		{name: "conflict", err: &workspace.ConflictError{Paths: []string{"a.txt", "b.txt"}}},
+		{name: "error", err: fmt.Errorf("disk failure")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, instance := newDirectoryHome(t)
+			h.applyAndPause = func(got *session.Instance) (*workspace.ApplyResult, error) {
+				require.Same(t, instance, got)
+				return tc.result, tc.err
+			}
+
+			_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+			require.Nil(t, cmd)
+			require.Equal(t, stateConfirm, h.state)
+			rendered := h.confirmationOverlay.Render()
+			require.Contains(t, rendered, "Apply changes from session 'directory-session'")
+			require.Contains(t, rendered, "to 'source-project'?")
+
+			_, cmd = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+			require.NotNil(t, cmd)
+			msg, ok := cmd().(applyResultMsg)
+			require.True(t, ok)
+			require.Equal(t, tc.result, msg.result)
+			require.Equal(t, tc.err, msg.err)
+
+			_, followup := h.Update(msg)
+			require.Nil(t, followup)
+			require.Equal(t, stateHelp, h.state)
+			require.NotNil(t, h.textOverlay)
+			overlayText := h.textOverlay.Render()
+			switch tc.name {
+			case "success":
+				require.Contains(t, overlayText, "Applied 1 changed path(s)")
+			case "no-op":
+				require.Contains(t, overlayText, "No changes to apply")
+			case "conflict":
+				require.Contains(t, overlayText, "Apply Conflict")
+				require.Contains(t, overlayText, "a.txt")
+				require.Contains(t, overlayText, "b.txt")
+			case "error":
+				require.Contains(t, overlayText, "Apply Failed")
+				require.Contains(t, overlayText, "disk failure")
+			}
+		})
+	}
+}
+
+func TestConfirmActionPropagatesReturnedMessage(t *testing.T) {
+	h := &home{ctx: context.Background(), state: stateDefault, appConfig: config.DefaultConfig()}
+	expected := instanceChangedMsg{}
+	h.confirmAction("Proceed?", func() tea.Msg { return expected })
+
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.NotNil(t, cmd)
+	_, ok := cmd().(instanceChangedMsg)
+	require.True(t, ok)
+}
+
+func TestDirectoryHelpIncludesIsolationCaveat(t *testing.T) {
+	_, instance := newDirectoryHome(t)
+	content := helpTypeGeneral{instance: instance}.toContent()
+	require.Contains(t, content, "Apply changes")
+	require.NotContains(t, content, "push branch")
+	require.True(t, strings.Contains(content, "Shared dependency directories") && strings.Contains(content, "not isolated"))
 }
 
 // TestConfirmationModalVisualAppearance tests that confirmation modal has distinct visual appearance
