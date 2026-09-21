@@ -48,6 +48,8 @@ var defaultPolicyRules = []policyRule{
 	{pattern: ".vscode/", class: ClassGenerated},
 	{pattern: ".DS_Store", class: ClassGenerated},
 	{pattern: "Thumbs.db", class: ClassGenerated},
+	{pattern: "Desktop.ini", class: ClassGenerated},
+	{pattern: "*.sw?", class: ClassGenerated},
 }
 
 func LoadPolicy(source string) (Policy, error) {
@@ -97,7 +99,7 @@ func LoadPolicy(source string) (Policy, error) {
 }
 
 func (p Policy) Classify(name string) EntryClass {
-	name = strings.Trim(strings.ReplaceAll(name, "\\", "/"), "/")
+	name = normalizePolicyPath(name)
 	class := ClassIncluded
 	for _, rule := range p.rules {
 		if rule.matches(name) {
@@ -109,6 +111,37 @@ func (p Policy) Classify(name string) EntryClass {
 		}
 	}
 	return class
+}
+
+func (p Policy) mayIncludeDescendant(name string) bool {
+	name = normalizePolicyPath(name)
+	lastMatch := -1
+	for index, rule := range p.rules {
+		if rule.matches(name) {
+			lastMatch = index
+		}
+	}
+	for _, rule := range p.rules[lastMatch+1:] {
+		if rule.negate && rule.mayMatchDescendant(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizePolicyPath(name string) string {
+	return strings.Trim(strings.ReplaceAll(name, "\\", "/"), "/")
+}
+
+func (r policyRule) mayMatchDescendant(name string) bool {
+	pattern := strings.Trim(r.pattern, "/")
+	if pattern == "" || name == "" {
+		return false
+	}
+	if strings.HasPrefix(r.pattern, "/") || strings.Contains(pattern, "/") {
+		return strings.HasPrefix(pattern, name+"/")
+	}
+	return true
 }
 
 func (r policyRule) matches(name string) bool {

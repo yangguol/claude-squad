@@ -54,10 +54,12 @@ func Scan(source string, policy Policy) (Snapshot, error) {
 		}
 		relative = filepath.ToSlash(relative)
 		if policy.Classify(relative) != ClassIncluded {
-			if directoryEntry.IsDir() {
+			if directoryEntry.IsDir() && !policy.mayIncludeDescendant(relative) {
 				return filepath.SkipDir
 			}
-			return nil
+			if !directoryEntry.IsDir() {
+				return nil
+			}
 		}
 
 		info, err := os.Lstat(name)

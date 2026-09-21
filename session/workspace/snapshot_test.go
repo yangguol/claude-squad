@@ -66,6 +66,20 @@ func TestScanExcludesAllNonIncludedClassifications(t *testing.T) {
 	require.Equal(t, []string{policyFileName, "keep.txt"}, snapshot.SortedPaths())
 }
 
+func TestScanIncludesExplicitlyNegatedDescendantOnly(t *testing.T) {
+	source := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(source, "ignored"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "ignored", "keep.txt"), []byte("keep"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "ignored", "drop.txt"), []byte("drop"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(source, policyFileName), []byte("ignored/\n!ignored/keep.txt\n"), 0o644))
+	policy, err := LoadPolicy(source)
+	require.NoError(t, err)
+
+	snapshot, err := Scan(source, policy)
+	require.NoError(t, err)
+	require.Equal(t, []string{policyFileName, "ignored/keep.txt"}, snapshot.SortedPaths())
+}
+
 func TestScanCanExplicitlyExcludePolicyFile(t *testing.T) {
 	source := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(source, policyFileName), []byte(policyFileName+"\n"), 0o644))

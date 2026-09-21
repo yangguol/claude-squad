@@ -66,3 +66,12 @@ func TestLoadPolicyWithoutProjectFileUsesDefaults(t *testing.T) {
 	require.Equal(t, ClassGenerated, policy.Classify("src/__pycache__/module.pyc"))
 	require.Equal(t, ClassGenerated, policy.Classify(".DS_Store"))
 }
+
+func TestPolicyClassifiesCommonEditorAndOSMetadataAsGenerated(t *testing.T) {
+	policy, err := LoadPolicy(t.TempDir())
+	require.NoError(t, err)
+
+	require.Equal(t, ClassGenerated, policy.Classify("src/.main.go.swp"))
+	require.Equal(t, ClassGenerated, policy.Classify("src/.main.go.swo"))
+	require.Equal(t, ClassGenerated, policy.Classify("Desktop.ini"))
+}
