@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPlanApplyCleanMergesAndLeavesSourceUntouched(t *testing.T) {
+func TestApplyTransactionCleanMerge(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := t.TempDir()
 	writeApplyFile(t, source, "both.txt", "one\ntwo\nthree\n", 0o644)
@@ -46,7 +46,56 @@ func TestPlanApplyCleanMergesAndLeavesSourceUntouched(t *testing.T) {
 	result, err := workspace.Apply()
 	require.NoError(t, err)
 	require.Equal(t, plan.ChangedPaths(), result.Changed)
-	require.Equal(t, before, mustSnapshot(t, source), "Task 6 Apply only plans")
+	require.NotEqual(t, before, mustSnapshot(t, source))
+	require.Equal(t, "agent\ntwo\nsource\n", mustReadFile(t, filepath.Join(source, "both.txt")))
+	require.Equal(t, "source\n", mustReadFile(t, filepath.Join(source, "source-only.txt")))
+	require.Equal(t, "source add\n", mustReadFile(t, filepath.Join(source, "source-add.txt")))
+	require.Equal(t, "agent\n", mustReadFile(t, filepath.Join(source, "agent-add.txt")))
+	require.NoFileExists(t, filepath.Join(source, "agent-delete.txt"))
+	require.NoFileExists(t, filepath.Join(source, "rename-old.txt"))
+	require.Equal(t, "rename\n", mustReadFile(t, filepath.Join(source, "rename-new.txt")))
+	info, err := os.Stat(filepath.Join(source, "script"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+	require.Equal(t, plan.MergedTree, workspace.data.LastAppliedTree)
+	require.NotEmpty(t, workspace.data.LastAppliedAt)
+}
+
+func TestApplyTransactionRevalidatesTouchedPaths(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "base", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "agent", 0o644)
+	applyBeforeRevalidateHook = func() { writeApplyFile(t, source, "file", "late", 0o644) }
+	t.Cleanup(func() { applyBeforeRevalidateHook = nil })
+
+	_, err := workspace.Apply()
+	var conflict *ConflictError
+	require.ErrorAs(t, err, &conflict)
+	require.Equal(t, []string{"file"}, conflict.Paths)
+	require.Equal(t, "late", mustReadFile(t, filepath.Join(source, "file")))
+}
+
+func TestApplyTransactionSymlinkAndIgnoredPaths(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, policyFileName, "ignored/\n[generated]\ndist/\n", 0o644)
+	writeApplyFile(t, source, "target", "target", 0o644)
+	writeApplyFile(t, source, "ignored/value", "source", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	require.NoError(t, os.Symlink("target", filepath.Join(workspace.WorkDir(), "link")))
+	writeApplyFile(t, workspace.WorkDir(), "ignored/value", "agent", 0o644)
+	writeApplyFile(t, workspace.WorkDir(), "dist/output", "generated", 0o644)
+
+	result, err := workspace.Apply()
+	require.NoError(t, err)
+	require.Equal(t, []string{"link"}, result.Changed)
+	target, err := os.Readlink(filepath.Join(source, "link"))
+	require.NoError(t, err)
+	require.Equal(t, "target", target)
+	require.Equal(t, "source", mustReadFile(t, filepath.Join(source, "ignored/value")))
+	require.NoFileExists(t, filepath.Join(source, "dist/output"))
 }
 
 func TestPlanApplyUnchangedReapplyIsNoop(t *testing.T) {
@@ -79,6 +128,83 @@ func TestPlanApplyIgnoresPersistedNonIncludedPaths(t *testing.T) {
 	plan, err := workspace.planApply()
 	require.NoError(t, err)
 	require.Equal(t, []string{"keep"}, plan.ChangedPaths())
+}
+
+type failingApplyOps struct {
+	fileOps
+	failRenameTarget string
+	failRestorePath  string
+}
+
+func (f failingApplyOps) Rename(oldpath, newpath string) error {
+	if filepath.Clean(newpath) == filepath.Clean(f.failRenameTarget) {
+		return errors.New("injected apply failure")
+	}
+	return f.fileOps.Rename(oldpath, newpath)
+}
+
+func (f failingApplyOps) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
+	if name == f.failRestorePath && flag&os.O_EXCL != 0 {
+		return nil, errors.New("injected rollback failure")
+	}
+	return f.fileOps.OpenFile(name, flag, mode)
+}
+
+func TestApplyRollbackRestoresUpdatesAndDeletions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "a-update", "before", 0o755)
+	writeApplyFile(t, source, "b-delete", "delete", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "a-update", "after", 0o644)
+	require.NoError(t, os.Remove(filepath.Join(workspace.WorkDir(), "b-delete")))
+	writeApplyFile(t, workspace.WorkDir(), "c-create", "create", 0o644)
+	before := mustSnapshot(t, source)
+	original := applyFS
+	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "c-create")}
+	t.Cleanup(func() { applyFS = original })
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "injected apply failure")
+	require.Equal(t, before, mustSnapshot(t, source))
+	transactions, err := FindIncompleteTransactions(filepath.Dir(workspace.data.RepoPath))
+	require.NoError(t, err)
+	require.Empty(t, transactions)
+}
+
+func TestApplyRollbackFailureRetainsIncompleteTransaction(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "a-update", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "a-update", "after", 0o644)
+	writeApplyFile(t, workspace.WorkDir(), "b-create", "create", 0o644)
+	original := applyFS
+	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "b-create"), failRestorePath: filepath.Join(workspace.data.SourcePath, "a-update")}
+	t.Cleanup(func() { applyFS = original })
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "injected apply failure")
+	require.ErrorContains(t, err, "injected rollback failure")
+	transactions, findErr := FindIncompleteTransactions(filepath.Dir(workspace.data.RepoPath))
+	require.NoError(t, findErr)
+	require.Len(t, transactions, 1)
+	require.Equal(t, transactionApplying, transactions[0].State)
+	require.DirExists(t, transactions[0].Directory)
+}
+
+func TestIncompleteTransactionDiscoveryDoesNotDelete(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "transactions", "session-nonce")
+	require.NoError(t, os.MkdirAll(directory, 0o700))
+	transaction := Transaction{Directory: directory, Version: 1, SessionID: "session", SourcePath: "/source", State: transactionPrepared}
+	require.NoError(t, writeTransactionManifest(transaction))
+
+	transactions, err := FindIncompleteTransactions(root)
+	require.NoError(t, err)
+	require.Len(t, transactions, 1)
+	require.Equal(t, directory, transactions[0].Directory)
+	require.FileExists(t, filepath.Join(directory, "manifest.json"))
 }
 
 func TestApplyConflictTypesAreSortedAndLeaveSourceUntouched(t *testing.T) {

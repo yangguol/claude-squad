@@ -330,6 +330,21 @@ func TestShadowRejectsLinkedOrExternalGitMetadata(t *testing.T) {
 	require.ErrorContains(t, err, "git metadata")
 }
 
+func TestIncompleteTransactionReportedOnRestoreAndPreserved(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "safe", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	data := workspace.Serialize()
+	directory := filepath.Join(filepath.Dir(data.Shadow.RepoPath), "transactions", data.Shadow.SessionID+"-incomplete")
+	require.NoError(t, os.MkdirAll(directory, 0o700))
+	require.NoError(t, writeTransactionManifest(Transaction{Directory: directory, Version: 1, SessionID: data.Shadow.SessionID, SourcePath: source, State: transactionApplying}))
+
+	_, err := RestoreShadow(data)
+	require.ErrorContains(t, err, "incomplete apply transactions")
+	require.FileExists(t, filepath.Join(directory, "manifest.json"))
+}
+
 func TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := t.TempDir()

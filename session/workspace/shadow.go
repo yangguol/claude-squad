@@ -106,6 +106,17 @@ func RestoreShadow(data Data) (Workspace, error) {
 	if err := validateShadowIdentity(stored, false); err != nil {
 		return nil, err
 	}
+	incomplete, err := FindIncompleteTransactions(filepath.Dir(stored.RepoPath))
+	if err != nil {
+		return nil, fmt.Errorf("inspect incomplete apply transactions: %w", err)
+	}
+	if len(incomplete) != 0 {
+		directories := make([]string, len(incomplete))
+		for index := range incomplete {
+			directories[index] = incomplete[index].Directory
+		}
+		return nil, fmt.Errorf("incomplete apply transactions require recovery: %s", strings.Join(directories, ", "))
+	}
 	if _, err := os.Lstat(stored.WorktreePath); err == nil {
 		valid, validateErr := validateWorktreeIdentity(stored)
 		if validateErr != nil || !valid {
