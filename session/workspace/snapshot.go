@@ -3,6 +3,7 @@ package workspace
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +29,8 @@ type Entry struct {
 type Snapshot struct {
 	Entries map[string]Entry `json:"entries"`
 }
+
+var scanAfterLstatHook func(string)
 
 func (s Snapshot) SortedPaths() []string {
 	paths := make([]string, 0, len(s.Entries))
@@ -67,11 +70,14 @@ func Scan(source string, policy Policy) (Snapshot, error) {
 			return fmt.Errorf("lstat %q: %w", relative, err)
 		}
 		mode := info.Mode()
+		if scanAfterLstatHook != nil {
+			scanAfterLstatHook(name)
+		}
 		switch {
 		case mode.IsDir():
 			return nil
 		case mode.IsRegular():
-			hash, err := hashRegularFile(name)
+			hash, err := hashOpenedRegularFile(name, info)
 			if err != nil {
 				return fmt.Errorf("hash %q: %w", relative, err)
 			}
@@ -104,16 +110,33 @@ func Scan(source string, policy Policy) (Snapshot, error) {
 	return snapshot, nil
 }
 
-func hashRegularFile(name string) (string, error) {
+func hashOpenedRegularFile(name string, expected os.FileInfo) (string, error) {
 	file, err := os.Open(name)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	opened, statErr := file.Stat()
+	if statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(expected, opened) {
+		_ = file.Close()
+		return "", errorsJoinMessage(statErr, "source changed while opening")
+	}
 
 	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
+	_, copyErr := io.Copy(hash, file)
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil {
+		return "", errorsJoinMessage(errors.Join(copyErr, closeErr), "read source")
+	}
+	final, statErr := os.Lstat(name)
+	if statErr != nil || !final.Mode().IsRegular() || !os.SameFile(expected, final) {
+		return "", errorsJoinMessage(statErr, "source changed while reading")
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func errorsJoinMessage(err error, message string) error {
+	if err == nil {
+		return fmt.Errorf("%s", message)
+	}
+	return fmt.Errorf("%s: %w", message, err)
 }

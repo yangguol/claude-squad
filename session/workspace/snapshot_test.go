@@ -12,6 +12,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestScanRejectsRegularFileReplacedBySymlinkBeforeOpen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior differs on Windows")
+	}
+	source := t.TempDir()
+	external := filepath.Join(t.TempDir(), "secret")
+	path := filepath.Join(source, "file")
+	require.NoError(t, os.WriteFile(path, []byte("inside"), 0o644))
+	require.NoError(t, os.WriteFile(external, []byte("outside"), 0o644))
+	scanAfterLstatHook = func(name string) {
+		if name != path {
+			return
+		}
+		scanAfterLstatHook = nil
+		require.NoError(t, os.Remove(path))
+		require.NoError(t, os.Symlink(external, path))
+	}
+	t.Cleanup(func() { scanAfterLstatHook = nil })
+
+	_, err := Scan(source, Policy{})
+	require.ErrorContains(t, err, "changed while opening")
+	require.Equal(t, "outside", string(requireFileContents(t, external)))
+}
+
+func requireFileContents(t *testing.T, name string) []byte {
+	t.Helper()
+	contents, err := os.ReadFile(name)
+	require.NoError(t, err)
+	return contents
+}
+
 func TestScanRecordsFilesModesAndSymlinksWithoutTraversal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior differs on Windows")

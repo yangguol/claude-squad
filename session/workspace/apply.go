@@ -64,6 +64,7 @@ type transactionEntry struct {
 	Payload           string      `json:"payload,omitempty"`
 	Target            string      `json:"target,omitempty"`
 	Backup            string      `json:"backup,omitempty"`
+	Displaced         string      `json:"displaced,omitempty"`
 	Expected          *Entry      `json:"expected,omitempty"`
 	ReplacesDirectory bool        `json:"replaces_directory,omitempty"`
 }
@@ -86,6 +87,7 @@ type fileOps interface {
 	Readlink(string) (string, error)
 	ReadDir(string) ([]os.DirEntry, error)
 	Symlink(string, string) error
+	Link(string, string) error
 	Rename(string, string) error
 	Remove(string) error
 	RemoveAll(string) error
@@ -104,6 +106,7 @@ func (osFileOps) OpenFile(name string, flag int, mode os.FileMode) (*os.File, er
 func (osFileOps) Readlink(name string) (string, error)         { return os.Readlink(name) }
 func (osFileOps) ReadDir(name string) ([]os.DirEntry, error)   { return os.ReadDir(name) }
 func (osFileOps) Symlink(oldname, newname string) error        { return os.Symlink(oldname, newname) }
+func (osFileOps) Link(oldname, newname string) error           { return os.Link(oldname, newname) }
 func (osFileOps) Rename(oldpath, newpath string) error         { return os.Rename(oldpath, newpath) }
 func (osFileOps) Remove(name string) error                     { return os.Remove(name) }
 func (osFileOps) RemoveAll(path string) error                  { return os.RemoveAll(path) }
@@ -115,6 +118,7 @@ var applyFS fileOps = osFileOps{}
 var applyBeforeRevalidateHook func()
 var applyAfterBackupHook func(string)
 var applyBeforeMutationHook func(string)
+var applyAfterMutationValidationHook func(string)
 
 func (p applyPlan) ChangedPaths() []string {
 	paths := make([]string, 0, len(p.Creates)+len(p.Updates)+len(p.Deletes))
@@ -162,6 +166,15 @@ func (w *shadowWorkspace) Apply() (*ApplyResult, error) {
 }
 
 func cleanupCommittedTransaction(transaction Transaction) error {
+	for _, item := range transaction.Entries {
+		if item.Displaced == "" {
+			continue
+		}
+		displaced := filepath.Join(transaction.SourcePath, filepath.FromSlash(item.Displaced))
+		if err := applyFS.Remove(displaced); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+			return fmt.Errorf("remove committed displaced source %q: %w", item.Path, err)
+		}
+	}
 	marker := transaction.Directory + ".cleanup.json"
 	markerTransaction := transaction
 	markerTransaction.Directory = ""
@@ -223,6 +236,11 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan) (Transaction, error
 		}
 		if expected, exists := plan.OursSnapshot.Entries[name]; exists {
 			item.Backup = filepath.ToSlash(filepath.Join("backup", name))
+			displaced, err := randomSiblingName(name, ".claude-squad-displaced-")
+			if err != nil {
+				return transaction, err
+			}
+			item.Displaced = displaced
 			item.Expected = &expected
 		} else if item.Operation != "delete" && planReplacesDirectory(plan, name) {
 			item.ReplacesDirectory = true
@@ -259,6 +277,14 @@ func writeTransactionManifest(transaction Transaction) error {
 		return errors.Join(fmt.Errorf("publish transaction manifest: %w", err), removeCreatedTemp(temporary))
 	}
 	return nil
+}
+
+func randomSiblingName(name, prefix string) (string, error) {
+	var nonce [12]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(name), prefix+hex.EncodeToString(nonce[:])), nil
 }
 
 func createExclusiveSibling(parent, prefix string, contents []byte, mode os.FileMode) (string, error) {
@@ -354,17 +380,11 @@ func snapshotOne(root, name string) (Entry, bool, error) {
 		entry.Type = EntryType("directory")
 	case info.Mode().IsRegular():
 		entry.Type = EntryRegular
-		file, err := applyFS.Open(path)
+		hash, err := hashOpenedRegularFileWithOps(path, info)
 		if err != nil {
 			return Entry{}, false, err
 		}
-		hash := sha256.New()
-		_, copyErr := io.Copy(hash, file)
-		closeErr := file.Close()
-		if err := errors.Join(copyErr, closeErr); err != nil {
-			return Entry{}, false, err
-		}
-		entry.ContentHash = hex.EncodeToString(hash.Sum(nil))
+		entry.ContentHash = hash
 	case info.Mode()&os.ModeSymlink != 0:
 		entry.Type = EntrySymlink
 		entry.SymlinkTarget, err = applyFS.Readlink(path)
@@ -409,13 +429,15 @@ func (w *shadowWorkspace) executeTransaction(transaction *Transaction) error {
 			rollbackErr := w.rollbackTransaction(transaction, applied, createdDirs)
 			return errors.Join(fmt.Errorf("apply %q: %w", item.Path, err), wrapRollbackError(rollbackErr))
 		}
-		newDirs, err := w.applyTransactionEntry(*transaction, item)
+		newDirs, mutated, err := w.applyTransactionEntry(*transaction, item)
 		createdDirs = append(createdDirs, newDirs...)
+		if mutated {
+			applied = append(applied, index)
+		}
 		if err != nil {
 			rollbackErr := w.rollbackTransaction(transaction, applied, createdDirs)
 			return errors.Join(fmt.Errorf("apply %q: %w", item.Path, err), wrapRollbackError(rollbackErr))
 		}
-		applied = append(applied, index)
 	}
 	transaction.State = transactionCommitted
 	if err := writeTransactionManifest(*transaction); err != nil {
@@ -459,6 +481,37 @@ func (w *shadowWorkspace) revalidateTransactionEntry(transaction Transaction, it
 		return &ConflictError{Paths: []string{item.Path}}
 	}
 	return nil
+}
+
+func readOpenedRegularFileWithOps(path string, expected os.FileInfo) ([]byte, error) {
+	file, err := applyFS.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(expected, opened) {
+		_ = file.Close()
+		return nil, errorsJoinMessage(statErr, "source changed while opening")
+	}
+	contents, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	final, statErr := applyFS.Lstat(path)
+	if statErr != nil || !final.Mode().IsRegular() || !os.SameFile(expected, final) {
+		return nil, errorsJoinMessage(statErr, "source changed while reading")
+	}
+	return contents, nil
+}
+
+func hashOpenedRegularFileWithOps(path string, expected os.FileInfo) (string, error) {
+	contents, err := readOpenedRegularFileWithOps(path, expected)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(contents)
+	return hex.EncodeToString(hash[:]), nil
 }
 
 func snapshotPath(path, displayName string) (Entry, bool, error) {
@@ -517,64 +570,137 @@ func (w *shadowWorkspace) backupEntry(transaction Transaction, item *transaction
 	if err := applyFS.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
 		return err
 	}
-	entry, _, err := snapshotOne(w.data.SourcePath, item.Path)
+	info, err := applyFS.Lstat(source)
 	if err != nil {
 		return err
 	}
-	if entry.Type == EntrySymlink {
-		return applyFS.Symlink(entry.SymlinkTarget, backup)
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, readErr := applyFS.Readlink(source)
+		if readErr != nil {
+			return readErr
+		}
+		return applyFS.Symlink(target, backup)
 	}
-	contents, err := os.ReadFile(source)
+	if !info.Mode().IsRegular() {
+		return errors.New("source backup is not a regular file or symlink")
+	}
+	contents, err := readOpenedRegularFileWithOps(source, info)
 	if err != nil {
 		return err
 	}
-	return writeExclusiveFile(backup, contents, entry.Mode)
+	return writeExclusiveFile(backup, contents, info.Mode().Perm())
 }
 
-func (w *shadowWorkspace) applyTransactionEntry(transaction Transaction, item transactionEntry) ([]string, error) {
+func (w *shadowWorkspace) applyTransactionEntry(transaction Transaction, item transactionEntry) ([]string, bool, error) {
 	target := filepath.Join(w.data.SourcePath, filepath.FromSlash(item.Path))
 	if item.Operation == "delete" {
-		return nil, applyFS.Remove(target)
+		if err := w.displaceExpectedSource(transaction, item, target); err != nil {
+			return nil, false, err
+		}
+		return nil, true, nil
 	}
 	createdDirs, err := w.createMissingParents(filepath.Dir(target))
 	if err != nil {
-		return createdDirs, err
+		return createdDirs, false, err
 	}
 	if err := ensureRealContainedPath(w.data.SourcePath, filepath.Dir(target), false, "apply path parent"); err != nil {
-		return createdDirs, err
+		return createdDirs, false, err
 	}
 	if info, statErr := applyFS.Lstat(target); statErr == nil && info.IsDir() {
-		entries, readErr := applyFS.ReadDir(target)
-		if readErr != nil {
-			return createdDirs, readErr
-		}
-		if len(entries) != 0 {
-			return createdDirs, fmt.Errorf("replacement directory %q is not empty", item.Path)
-		}
-		if err := applyFS.Remove(target); err != nil {
-			return createdDirs, err
+		if !item.ReplacesDirectory {
+			entries, readErr := applyFS.ReadDir(target)
+			if readErr != nil {
+				return createdDirs, false, readErr
+			}
+			if len(entries) != 0 {
+				return createdDirs, false, fmt.Errorf("replacement directory %q is not empty", item.Path)
+			}
+			if err := applyFS.Remove(target); err != nil {
+				return createdDirs, false, err
+			}
 		}
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) && !errors.Is(statErr, syscall.ENOTDIR) {
-		return createdDirs, statErr
+		return createdDirs, false, statErr
 	}
 	var temporary string
-	if item.Type == EntrySymlink {
-		temporary, err = createExclusiveSymlinkSibling(filepath.Dir(target), ".claude-squad-apply-", item.Target)
-	} else {
+	if item.Type != EntrySymlink {
 		payload := filepath.Join(transaction.Directory, filepath.FromSlash(item.Payload))
 		contents, readErr := os.ReadFile(payload)
 		if readErr != nil {
-			return createdDirs, readErr
+			return createdDirs, false, readErr
 		}
 		temporary, err = createExclusiveSibling(filepath.Dir(target), ".claude-squad-apply-", contents, item.Mode)
+		if err != nil {
+			return createdDirs, false, err
+		}
+	}
+	if item.Backup != "" {
+		if err := w.displaceExpectedSource(transaction, item, target); err != nil {
+			return createdDirs, false, errors.Join(err, removeCreatedTemp(temporary))
+		}
+	}
+	if item.ReplacesDirectory {
+		for _, other := range transaction.Entries {
+			if other.Displaced == "" || !strings.HasPrefix(other.Path, item.Path+"/") {
+				continue
+			}
+			displaced := filepath.Join(w.data.SourcePath, filepath.FromSlash(other.Displaced))
+			if err := applyFS.Remove(displaced); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return createdDirs, false, errors.Join(err, removeCreatedTemp(temporary))
+			}
+		}
+		if err := applyFS.Remove(target); err != nil {
+			return createdDirs, false, errors.Join(err, removeCreatedTemp(temporary))
+		}
+	}
+	if item.Type == EntrySymlink {
+		err = applyFS.Symlink(item.Target, target)
+	} else {
+		err = applyFS.Link(temporary, target)
+		if err == nil {
+			err = removeCreatedTemp(temporary)
+		}
 	}
 	if err != nil {
-		return createdDirs, err
+		return createdDirs, item.Backup != "", errors.Join(err, removeCreatedTemp(temporary))
 	}
-	if err := applyFS.Rename(temporary, target); err != nil {
-		return createdDirs, errors.Join(err, removeCreatedTemp(temporary))
+	return createdDirs, true, nil
+}
+
+func (w *shadowWorkspace) displaceExpectedSource(transaction Transaction, item transactionEntry, target string) error {
+	if item.Displaced == "" || item.Backup == "" {
+		return errors.New("transaction entry is missing displacement metadata")
 	}
-	return createdDirs, nil
+	displaced := filepath.Join(w.data.SourcePath, filepath.FromSlash(item.Displaced))
+	if filepath.Dir(displaced) != filepath.Dir(target) {
+		return errors.New("transaction displacement is not a target sibling")
+	}
+	before, err := applyFS.Lstat(target)
+	if err != nil {
+		return err
+	}
+	if applyAfterMutationValidationHook != nil {
+		applyAfterMutationValidationHook(item.Path)
+	}
+	if err := applyFS.Link(target, displaced); err != nil {
+		return err
+	}
+	displacedInfo, displacedStatErr := applyFS.Lstat(displaced)
+	displacedEntry, exists, displacedErr := snapshotPath(displaced, item.Path)
+	if displacedStatErr != nil || !os.SameFile(before, displacedInfo) || displacedErr != nil || !exists || item.Expected == nil || !reflect.DeepEqual(displacedEntry, *item.Expected) {
+		return errors.Join(&ConflictError{Paths: []string{item.Path}}, removeCreatedTemp(displaced), displacedStatErr, displacedErr)
+	}
+	if err := applyFS.Remove(target); err != nil {
+		return errors.Join(err, removeCreatedTemp(displaced))
+	}
+	if _, err := applyFS.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		restoreErr := applyFS.Rename(displaced, target)
+		if err == nil {
+			err = &ConflictError{Paths: []string{item.Path}}
+		}
+		return errors.Join(err, restoreErr)
+	}
+	return nil
 }
 
 func (w *shadowWorkspace) createMissingParents(parent string) ([]string, error) {
@@ -627,6 +753,15 @@ func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied 
 			continue
 		}
 		backup := filepath.Join(transaction.Directory, filepath.FromSlash(item.Backup))
+		if item.Displaced != "" {
+			displaced := filepath.Join(w.data.SourcePath, filepath.FromSlash(item.Displaced))
+			if err := applyFS.Rename(displaced, target); err == nil {
+				continue
+			} else if !errors.Is(err, os.ErrNotExist) {
+				rollbackErr = errors.Join(rollbackErr, err)
+				continue
+			}
+		}
 		info, err := applyFS.Lstat(backup)
 		if err != nil {
 			rollbackErr = errors.Join(rollbackErr, err)

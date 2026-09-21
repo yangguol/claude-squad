@@ -137,12 +137,16 @@ type failingApplyOps struct {
 	failRestorePath  string
 }
 
-func (f failingApplyOps) Rename(oldpath, newpath string) error {
-	if filepath.Clean(newpath) == filepath.Clean(f.failRestorePath) && strings.HasPrefix(filepath.Base(oldpath), ".claude-squad-rollback-") {
-		return errors.New("injected rollback failure")
-	}
+func (f failingApplyOps) Link(oldpath, newpath string) error {
 	if filepath.Clean(newpath) == filepath.Clean(f.failRenameTarget) {
 		return errors.New("injected apply failure")
+	}
+	return f.fileOps.Link(oldpath, newpath)
+}
+
+func (f failingApplyOps) Rename(oldpath, newpath string) error {
+	if filepath.Clean(newpath) == filepath.Clean(f.failRestorePath) && (strings.HasPrefix(filepath.Base(oldpath), ".claude-squad-rollback-") || strings.HasPrefix(filepath.Base(oldpath), ".claude-squad-displaced-")) {
+		return errors.New("injected rollback failure")
 	}
 	return f.fileOps.Rename(oldpath, newpath)
 }
@@ -202,6 +206,24 @@ func TestApplyPreservesPredictableSiblingCollision(t *testing.T) {
 	_, err := workspace.Apply()
 	require.NoError(t, err)
 	require.Equal(t, "unplanned", mustReadFile(t, collision))
+}
+
+func TestApplyRejectsSourceChangeBetweenValidationAndMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "agent", 0o644)
+	applyAfterMutationValidationHook = func(string) {
+		applyAfterMutationValidationHook = nil
+		require.NoError(t, os.Remove(filepath.Join(source, "file")))
+		writeApplyFile(t, source, "file", "late", 0o644)
+	}
+	t.Cleanup(func() { applyAfterMutationValidationHook = nil })
+
+	_, err := workspace.Apply()
+	require.Error(t, err)
+	require.Equal(t, "late", mustReadFile(t, filepath.Join(source, "file")))
 }
 
 func TestApplyRejectsPostBackupCreateTargetDirectory(t *testing.T) {
