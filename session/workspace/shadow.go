@@ -315,6 +315,9 @@ func (w *shadowWorkspace) Prune() error {
 	if err := ensureRealContainedPath(filepath.Dir(w.data.RepoPath), w.data.RepoPath, false, "repository path"); err != nil {
 		return err
 	}
+	if err := validateGitMetadata(w.data.RepoPath); err != nil {
+		return err
+	}
 	_, err := runGit(w.data.RepoPath, nil, "worktree", "prune")
 	return err
 }
@@ -760,6 +763,14 @@ func validateGitMetadata(repoPath string) error {
 func validateWorktreeIdentity(data ShadowData) (bool, error) {
 	if err := ensureRealContainedPath(filepath.Dir(data.RepoPath), data.WorktreePath, false, "worktree path"); err != nil {
 		return false, err
+	}
+	topLevel, err := runGit(data.WorktreePath, nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return false, nil
+	}
+	canonicalTopLevel, err := filepath.EvalSymlinks(strings.TrimSpace(topLevel))
+	if err != nil || filepath.Clean(canonicalTopLevel) != filepath.Clean(data.WorktreePath) {
+		return false, nil
 	}
 	commonDir, err := runGit(data.WorktreePath, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil || filepath.Clean(strings.TrimSpace(commonDir)) != filepath.Join(data.RepoPath, ".git") {

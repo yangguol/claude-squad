@@ -310,3 +310,96 @@ No output (passed).
 ### Concerns
 
 - Filesystem identity checks are fail-closed and substantially narrow race windows, but Go's portable path APIs cannot provide a single atomic openat-style transaction across every path component and Git subprocess invocation.
+
+## Fix Round 3
+
+### Changes
+
+- Public `Prune` now validates that `.git` is the exact local metadata directory immediately before invoking `git worktree prune`, rejecting symlinked and external gitdirs.
+- Existing restored worktrees now require the canonical `git rev-parse --show-toplevel` result to exactly equal the persisted worktree path; genuinely absent paused worktrees remain restorable.
+- Added focused regressions for both linked/external `.git` forms during prune and for a persisted path nested inside another linked worktree.
+
+### TDD failure evidence
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test ./session/workspace -run 'TestShadowPruneRejectsLinkedOrExternalGitMetadata|TestRestoreShadowRejectsNestedDirectoryInsideOwnedWorktree' -count=1 -v
+```
+
+```text
+--- FAIL: TestRestoreShadowRejectsNestedDirectoryInsideOwnedWorktree (2.06s)
+    An error is expected but got nil.
+--- FAIL: TestShadowPruneRejectsLinkedOrExternalGitMetadata (1.23s)
+    --- FAIL: TestShadowPruneRejectsLinkedOrExternalGitMetadata/symlink (0.62s)
+        An error is expected but got nil.
+    --- FAIL: TestShadowPruneRejectsLinkedOrExternalGitMetadata/gitfile (0.62s)
+        An error is expected but got nil.
+FAIL
+FAIL  claude-squad/session/workspace  3.950s
+```
+
+### Exact verification
+
+Covering regressions:
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test ./session/workspace -run 'TestShadowPruneRejectsLinkedOrExternalGitMetadata|TestRestoreShadowRejects(UnrelatedWorktreeButAllowsAbsentPausedWorktree|NestedDirectoryInsideOwnedWorktree)' -count=1 -v
+```
+
+```text
+=== RUN   TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree
+--- PASS: TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree (2.45s)
+=== RUN   TestRestoreShadowRejectsNestedDirectoryInsideOwnedWorktree
+--- PASS: TestRestoreShadowRejectsNestedDirectoryInsideOwnedWorktree (2.16s)
+=== RUN   TestShadowPruneRejectsLinkedOrExternalGitMetadata
+=== RUN   TestShadowPruneRejectsLinkedOrExternalGitMetadata/symlink
+=== RUN   TestShadowPruneRejectsLinkedOrExternalGitMetadata/gitfile
+--- PASS: TestShadowPruneRejectsLinkedOrExternalGitMetadata (1.21s)
+    --- PASS: TestShadowPruneRejectsLinkedOrExternalGitMetadata/symlink (0.63s)
+    --- PASS: TestShadowPruneRejectsLinkedOrExternalGitMetadata/gitfile (0.58s)
+PASS
+ok  claude-squad/session/workspace  6.212s
+```
+
+Focused Task 4 tests:
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test ./session/workspace -run 'TestShadow|TestImportSnapshot' -count=1 -v
+```
+
+```text
+PASS
+ok  claude-squad/session/workspace  19.069s
+```
+
+Uncached full suite:
+
+```text
+PATH=/Users/yangguoliang/.local/bin:$PATH go test -count=1 ./...
+```
+
+```text
+ok  claude-squad  0.585s
+ok  claude-squad/app  9.483s
+?   claude-squad/cmd  [no test files]
+?   claude-squad/cmd/cmd_test  [no test files]
+ok  claude-squad/config  5.285s
+?   claude-squad/daemon  [no test files]
+?   claude-squad/keys  [no test files]
+?   claude-squad/log  [no test files]
+ok  claude-squad/session  6.121s
+ok  claude-squad/session/git  2.838s
+ok  claude-squad/session/tmux  1.860s
+ok  claude-squad/session/workspace  28.905s
+ok  claude-squad/ui  9.137s
+?   claude-squad/ui/overlay  [no test files]
+```
+
+```text
+git diff --check
+```
+
+No output (passed).
+
+### Concerns
+
+- The existing portable filesystem/Git subprocess race-window concern remains; both operations now fail closed based on exact identity checks immediately before use.

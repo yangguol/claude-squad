@@ -355,6 +355,55 @@ func TestRestoreShadowRejectsUnrelatedWorktreeButAllowsAbsentPausedWorktree(t *t
 	require.NoError(t, ws.Cleanup())
 }
 
+func TestRestoreShadowRejectsNestedDirectoryInsideOwnedWorktree(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+	ws, _, err := NewShadow(source, "nested-restore")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	data := ws.Serialize()
+	require.NoError(t, ws.Remove())
+
+	parentWorktree := filepath.Dir(data.Shadow.WorktreePath)
+	require.NoError(t, os.Remove(parentWorktree))
+	_, err = runGit(data.Shadow.RepoPath, nil, "worktree", "add", "--", parentWorktree, data.Shadow.BranchName)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = runGit(data.Shadow.RepoPath, nil, "worktree", "remove", "--force", "--", parentWorktree)
+		_ = ws.Cleanup()
+	})
+	require.NoError(t, os.Mkdir(data.Shadow.WorktreePath, 0o700))
+
+	_, err = RestoreShadow(data)
+	require.ErrorContains(t, err, "worktree identity")
+}
+
+func TestShadowPruneRejectsLinkedOrExternalGitMetadata(t *testing.T) {
+	for _, kind := range []string{"symlink", "gitfile"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			source := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("safe"), 0o644))
+			ws, _, err := NewShadow(source, "prune-metadata")
+			require.NoError(t, err)
+			data := ws.Serialize().Shadow
+
+			outside := t.TempDir()
+			require.NoError(t, runGitOnly(outside, "init"))
+			gitMetadata := filepath.Join(data.RepoPath, ".git")
+			require.NoError(t, os.RemoveAll(gitMetadata))
+			if kind == "symlink" {
+				require.NoError(t, os.Symlink(filepath.Join(outside, ".git"), gitMetadata))
+			} else {
+				require.NoError(t, os.WriteFile(gitMetadata, []byte("gitdir: "+filepath.Join(outside, ".git")+"\n"), 0o600))
+			}
+
+			require.ErrorContains(t, ws.Prune(), "git metadata")
+		})
+	}
+}
+
 func TestImportSnapshotRejectsModeAndSymlinkMutations(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
