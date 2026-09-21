@@ -17,7 +17,17 @@ func getWorktreeDirectory() (string, error) {
 	return filepath.Join(configDir, "worktrees"), nil
 }
 
-// GitWorktree manages git worktree operations for a session
+// WorktreeData is a read-only snapshot of a GitWorktree's persisted state.
+type WorktreeData struct {
+	RepoPath         string `json:"repo_path"`
+	WorktreePath     string `json:"worktree_path"`
+	SessionName      string `json:"session_name"`
+	BranchName       string `json:"branch_name"`
+	BaseCommitSHA    string `json:"base_commit_sha"`
+	IsExistingBranch bool   `json:"is_existing_branch"`
+}
+
+// GitWorktree manages git worktree operations for a session.
 type GitWorktree struct {
 	// Path to the repository
 	repoPath string
@@ -105,6 +115,18 @@ func NewGitWorktreeFromBranch(repoPath string, branchName string, sessionName st
 		worktreePath:     worktreePath,
 		isExistingBranch: true,
 	}, nil
+}
+
+// Data returns a copy of the worktree's persisted state.
+func (g *GitWorktree) Data() WorktreeData {
+	return WorktreeData{
+		RepoPath:         g.repoPath,
+		WorktreePath:     g.worktreePath,
+		SessionName:      g.sessionName,
+		BranchName:       g.branchName,
+		BaseCommitSHA:    g.baseCommitSHA,
+		IsExistingBranch: g.isExistingBranch,
+	}
 }
 
 // IsExistingBranch returns whether this worktree uses a pre-existing branch
