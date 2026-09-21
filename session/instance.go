@@ -224,6 +224,11 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 			return fmt.Errorf("failed to create workspace: %w", err)
 		}
 		i.sessionWorkspace = sessionWorkspace
+		// Keep the legacy concrete field populated until Task 5 migrates all
+		// lifecycle and persistence paths to Workspace.
+		if gitWorktree, ok := workspace.GitWorktree(sessionWorkspace); ok {
+			i.gitWorktree = gitWorktree
+		}
 		i.Branch = branchName
 	}
 
@@ -294,8 +299,14 @@ func (i *Instance) Kill() error {
 		}
 	}
 
-	// Then clean up git worktree
-	if i.gitWorktree != nil {
+	// Then clean up the workspace. Factory-created Git sessions also retain the
+	// same worktree in gitWorktree for transitional compatibility, so prefer the
+	// workspace to avoid cleaning the same resource twice.
+	if i.sessionWorkspace != nil {
+		if err := i.sessionWorkspace.Cleanup(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to cleanup workspace: %w", err))
+		}
+	} else if i.gitWorktree != nil {
 		if err := i.gitWorktree.Cleanup(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to cleanup git worktree: %w", err))
 		}
