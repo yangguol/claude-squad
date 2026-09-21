@@ -46,7 +46,7 @@ func (p *PreviewPane) SetSize(width, maxHeight int) {
 func (p *PreviewPane) setFallbackState(message string) {
 	p.previewState = previewState{
 		fallback: true,
-		text:     lipgloss.JoinVertical(lipgloss.Center, FallBackText, "", message),
+		text:     lipgloss.JoinVertical(lipgloss.Center, RenderFallbackLogo(p.width), "", message),
 	}
 }
 
