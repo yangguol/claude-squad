@@ -77,7 +77,7 @@ cs
 
 Claude Squad detects the workspace mode automatically. Inside a Git repository it keeps the existing Git worktree and branch workflow. In any other directory it shows `Directory (isolated)` and gives each session an independent copy backed by data under `~/.claude-squad/shadow-projects/`; it does not create `.git` in your source directory.
 
-In directory mode, agent edits stay isolated until you select the session and press `c` to **Apply**. Apply performs a three-way merge against the session's starting snapshot and the current source. If the same content changed incompatibly, Claude Squad reports the conflicting paths and leaves the source unchanged; resolve the source or session edit before retrying. Push and branch selection remain Git-mode-only actions.
+In directory mode, agent edits stay isolated until you select the session and press `c` to **Apply**. Apply performs a three-way merge against the session's starting snapshot and the current source. If the same content changed incompatibly, Claude Squad reports the conflicting paths and leaves the source unchanged; resolve the source or session edit before retrying. In Git mode, `c` checks out the session branch and `p` commits and pushes it; push and branch checkout are unavailable in directory mode.
 
 Directory mode classifies files as included, excluded, shared, or generated. Included files are isolated and can be applied. Excluded and generated files are neither copied nor applied. Shared dependency directories are linked to the source to avoid expensive copies, so writes inside them are immediately visible to every session and are not isolated or applied. By default, `node_modules/`, `.venv/`, and `venv/` are shared; common build output, cache, editor, and OS-artifact paths are generated and omitted (`dist/`, `build/`, `target/`, `out/`, `.cache/`, Python caches, `.idea/`, `.vscode/`, `.DS_Store`, `Thumbs.db`, `Desktop.ini`, and `*.sw?`).
 
@@ -125,8 +125,8 @@ The menu at the bottom of the screen shows available commands:
 ##### Actions
 - `↵/o` - Attach to the selected session to reprompt
 - `ctrl-q` - Detach from session
-- `s` - Commit and push branch to github
-- `c` - Checkout. Commits changes and pauses the session
+- `p` - Commit and push the branch to GitHub (Git mode only)
+- `c` - Checkout: commit changes and pause the session (Git mode), or Apply changes to the source directory and pause (directory mode)
 - `r` - Resume a paused session
 - `?` - Show help menu
 

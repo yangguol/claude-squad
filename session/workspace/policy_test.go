@@ -24,15 +24,29 @@ vendor/
 	policy, err := LoadPolicy(source)
 	require.NoError(t, err)
 
-	require.Equal(t, ClassShared, policy.Classify(".venv"))
+	require.Equal(t, ClassShared, policy.ClassifyEntry(".venv", true))
 	require.Equal(t, ClassShared, policy.Classify(".venv/bin/python"))
-	require.Equal(t, ClassShared, policy.Classify("vendor"))
+	require.Equal(t, ClassShared, policy.ClassifyEntry("vendor", true))
 	require.Equal(t, ClassGenerated, policy.Classify("build/output"))
 	require.Equal(t, ClassGenerated, policy.Classify(".generated/cache"))
-	require.Equal(t, ClassIncluded, policy.Classify("dist"), "project negation must override defaults")
-	require.Equal(t, ClassExcluded, policy.Classify("node_modules"), "later project rules must override defaults and earlier project rules")
+	require.Equal(t, ClassIncluded, policy.ClassifyEntry("dist", true), "project negation must override defaults")
+	require.Equal(t, ClassExcluded, policy.ClassifyEntry("node_modules", true), "later project rules must override defaults and earlier project rules")
 	require.Equal(t, ClassIncluded, policy.Classify("src/main.go"))
 	require.Equal(t, ClassIncluded, policy.Classify(".claude-squad-ignore"))
+}
+
+func TestPolicyTrailingSlashMatchesOnlyDirectoriesAndDescendants(t *testing.T) {
+	source := t.TempDir()
+	contents := "foo/\n!foo/keep.txt\n"
+	require.NoError(t, os.WriteFile(filepath.Join(source, ".claude-squad-ignore"), []byte(contents), 0o644))
+
+	policy, err := LoadPolicy(source)
+	require.NoError(t, err)
+
+	require.Equal(t, ClassIncluded, policy.ClassifyEntry("foo", false), "a trailing slash must not match a regular file")
+	require.Equal(t, ClassExcluded, policy.ClassifyEntry("foo", true), "a trailing slash must match a directory")
+	require.Equal(t, ClassExcluded, policy.ClassifyEntry("foo/other.txt", false), "a trailing slash must match directory descendants")
+	require.Equal(t, ClassIncluded, policy.ClassifyEntry("foo/keep.txt", false), "a later explicit negation must include the descendant")
 }
 
 func TestPolicyOrdinaryPatternsAndNegationPrecedence(t *testing.T) {

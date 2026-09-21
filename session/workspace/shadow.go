@@ -591,7 +591,7 @@ func sharedDirectories(source string, policy Policy) ([]string, error) {
 		if entry.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
-		if entry.IsDir() && policy.Classify(relative) == ClassShared {
+		if entry.IsDir() && policy.ClassifyEntry(relative, true) == ClassShared {
 			result = append(result, relative)
 			return filepath.SkipDir
 		}

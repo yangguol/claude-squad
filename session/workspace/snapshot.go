@@ -53,7 +53,7 @@ func Scan(source string, policy Policy) (Snapshot, error) {
 			return fmt.Errorf("resolve relative path for %q: %w", name, err)
 		}
 		relative = filepath.ToSlash(relative)
-		if policy.Classify(relative) != ClassIncluded {
+		if policy.ClassifyEntry(relative, directoryEntry.IsDir()) != ClassIncluded {
 			if directoryEntry.IsDir() && !policy.mayIncludeDescendant(relative) {
 				return filepath.SkipDir
 			}

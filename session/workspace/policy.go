@@ -98,11 +98,20 @@ func LoadPolicy(source string) (Policy, error) {
 	return policy, nil
 }
 
+// Classify classifies a non-directory entry. Call ClassifyEntry when the
+// caller knows whether the entry is a directory.
 func (p Policy) Classify(name string) EntryClass {
+	return p.ClassifyEntry(name, false)
+}
+
+// ClassifyEntry classifies an entry with directory context. Patterns ending in
+// a slash match directories and their descendants, but not regular files with
+// the same name.
+func (p Policy) ClassifyEntry(name string, isDir bool) EntryClass {
 	name = normalizePolicyPath(name)
 	class := ClassIncluded
 	for _, rule := range p.rules {
-		if rule.matches(name) {
+		if rule.matches(name, isDir) {
 			if rule.negate {
 				class = ClassIncluded
 			} else {
@@ -117,7 +126,7 @@ func (p Policy) mayIncludeDescendant(name string) bool {
 	name = normalizePolicyPath(name)
 	lastMatch := -1
 	for index, rule := range p.rules {
-		if rule.matches(name) {
+		if rule.matches(name, true) {
 			lastMatch = index
 		}
 	}
@@ -152,31 +161,32 @@ func (r policyRule) mayMatchDescendant(name string) bool {
 	return true
 }
 
-func (r policyRule) matches(name string) bool {
+func (r policyRule) matches(name string, isDir bool) bool {
 	pattern := strings.Trim(r.pattern, "/")
 	if pattern == "" || name == "" {
 		return false
 	}
 
+	directoryOnly := strings.HasSuffix(r.pattern, "/")
 	rooted := strings.HasPrefix(r.pattern, "/") || strings.Contains(pattern, "/")
 	if rooted {
-		return matchPathOrParent(pattern, name)
+		return matchPathOrParent(pattern, name, directoryOnly, isDir)
 	}
 
 	parts := strings.Split(name, "/")
-	for _, part := range parts {
+	for index, part := range parts {
 		matched, _ := path.Match(pattern, part)
-		if matched {
+		if matched && (!directoryOnly || index < len(parts)-1 || isDir) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchPathOrParent(pattern, name string) bool {
+func matchPathOrParent(pattern, name string, directoryOnly, isDir bool) bool {
 	for candidate := name; candidate != ""; {
 		matched, _ := path.Match(pattern, candidate)
-		if matched {
+		if matched && (!directoryOnly || candidate != name || isDir) {
 			return true
 		}
 		index := strings.LastIndexByte(candidate, '/')

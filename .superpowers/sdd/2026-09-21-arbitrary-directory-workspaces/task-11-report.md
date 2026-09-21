@@ -24,6 +24,18 @@ Completed directory-mode user documentation and automated end-to-end acceptance 
 
 Not attempted. The execution environment did not expose a real interactive stdin/stdout terminal with terminal automation (`test -t 0`, `test -t 1`, and `expect` availability check returned `interactive-automation-unavailable`). Per the ledger ruling, automated E2E and build verification are binding; interactive mode labels/actions and visual `ygl` placement remain unavailable for direct manual observation in this run.
 
+## Fix Round 1
+
+- Corrected the README controls to match the TUI: `p` commits and pushes in Git mode only; `c` checks out in Git mode and applies in directory mode.
+- Added directory context to policy classification while preserving `Policy.Classify` for regular/non-directory callers. Trailing-slash rules now match directories and descendants, not same-named regular files; later explicit negations still win.
+- Added policy and scanner regressions covering `foo/` directory exclusion, descendant exclusion, same-named regular-file inclusion, and explicit descendant negation.
+- `go test ./session/workspace -run 'TestPolicy|TestLoadPolicy|TestScan|TestDirectoryWorkspaceEndToEnd' -v` — PASS.
+- `go test ./session/workspace -run 'TestDirectoryWorkspaceEndToEnd' -v` — PASS; completed in 5.65s.
+- `go test -count=1 ./...` — PASS; all packages passed uncached, including `session/workspace` in 125.309s.
+- `go vet ./...` — PASS with no output.
+- `go build -o /tmp/claude-squad-ygl .` — PASS.
+- `git diff --check` — PASS with no output.
+
 ## Concerns
 
 - No implementation concerns identified.

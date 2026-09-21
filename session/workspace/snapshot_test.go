@@ -66,6 +66,42 @@ func TestScanExcludesAllNonIncludedClassifications(t *testing.T) {
 	require.Equal(t, []string{policyFileName, "keep.txt"}, snapshot.SortedPaths())
 }
 
+func TestScanTrailingSlashExcludesDirectoryButNotSameNamedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, string)
+		want  []string
+	}{
+		{
+			name: "directory and descendants",
+			setup: func(t *testing.T, source string) {
+				require.NoError(t, os.Mkdir(filepath.Join(source, "foo"), 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(source, "foo", "hidden.txt"), []byte("hidden"), 0o644))
+			},
+			want: []string{policyFileName},
+		},
+		{
+			name: "regular file",
+			setup: func(t *testing.T, source string) {
+				require.NoError(t, os.WriteFile(filepath.Join(source, "foo"), []byte("keep"), 0o644))
+			},
+			want: []string{policyFileName, "foo"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := t.TempDir()
+			tc.setup(t, source)
+			require.NoError(t, os.WriteFile(filepath.Join(source, policyFileName), []byte("foo/\n"), 0o644))
+			policy, err := LoadPolicy(source)
+			require.NoError(t, err)
+
+			snapshot, err := Scan(source, policy)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, snapshot.SortedPaths())
+		})
+	}
+}
+
 func TestScanIncludesExplicitlyNegatedDescendantOnly(t *testing.T) {
 	source := t.TempDir()
 	require.NoError(t, os.Mkdir(filepath.Join(source, "ignored"), 0o755))
