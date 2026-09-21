@@ -20,11 +20,11 @@ func TestInstanceDataGitWorkspaceRoundTrip(t *testing.T) {
 		},
 	}
 	instance, err := FromInstanceData(InstanceData{
-		Title: "git-session", Path: "/repo", Branch: "feature", Status: Paused, Workspace: stored,
+		Title: "git-session", Path: "/repo", Branch: "feature", Status: Paused, Workspace: &stored,
 	})
 	require.NoError(t, err)
 	require.Equal(t, workspace.ModeGit, instance.WorkspaceMode())
-	require.Equal(t, stored, instance.ToInstanceData().Workspace)
+	require.Equal(t, stored, *instance.ToInstanceData().Workspace)
 	require.True(t, instance.Capabilities().Push)
 }
 
@@ -40,13 +40,54 @@ func TestInstanceDataDirectoryWorkspaceRoundTrip(t *testing.T) {
 
 	stored := ws.Serialize()
 	instance, err := FromInstanceData(InstanceData{
-		Title: "directory-session", Path: source, Branch: branch, Status: Paused, Workspace: stored,
+		Title: "directory-session", Path: source, Branch: branch, Status: Paused, Workspace: &stored,
 	})
 	require.NoError(t, err)
 	require.Equal(t, workspace.ModeDirectory, instance.WorkspaceMode())
-	require.Equal(t, stored, instance.ToInstanceData().Workspace)
+	require.Equal(t, stored, *instance.ToInstanceData().Workspace)
 	require.Equal(t, workspace.Capabilities{Apply: true}, instance.Capabilities())
 	require.Equal(t, filepath.Base(source), instance.DisplayWorkspace())
+}
+
+func TestPresentEmptyWorkspaceDoesNotFallBackToLegacyWorktree(t *testing.T) {
+	record := `{
+		"title":"malformed","path":"/repo","branch":"feature","status":3,
+		"workspace":{},
+		"worktree":{"repo_path":"/repo","worktree_path":"/worktree","session_name":"legacy","branch_name":"feature","base_commit_sha":"base"}
+	}`
+	var data InstanceData
+	require.NoError(t, json.Unmarshal([]byte(record), &data))
+	require.NotNil(t, data.Workspace)
+
+	_, err := FromInstanceData(data)
+	require.ErrorContains(t, err, `unsupported workspace mode ""`)
+}
+
+func TestStorageRejectsPresentMalformedWorkspaceInsteadOfLegacyFallback(t *testing.T) {
+	state := &memoryInstanceStorage{instances: json.RawMessage(`[{
+		"title":"malformed","path":"/repo","branch":"feature","status":3,
+		"workspace":{},
+		"worktree":{"repo_path":"/repo","worktree_path":"/worktree","session_name":"legacy","branch_name":"feature","base_commit_sha":"base"}
+	}]`)}
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+
+	_, err = storage.LoadInstances()
+	require.ErrorContains(t, err, `unsupported workspace mode ""`)
+}
+
+type memoryInstanceStorage struct {
+	instances json.RawMessage
+}
+
+func (s *memoryInstanceStorage) SaveInstances(instances json.RawMessage) error {
+	s.instances = instances
+	return nil
+}
+func (s *memoryInstanceStorage) GetInstances() json.RawMessage { return s.instances }
+func (s *memoryInstanceStorage) DeleteAllInstances() error {
+	s.instances = nil
+	return nil
 }
 
 func TestLegacyWorktreeRecordRestoresAsGitWorkspace(t *testing.T) {
@@ -69,7 +110,7 @@ func TestLegacyWorktreeRecordRestoresAsGitWorkspace(t *testing.T) {
 			RepoPath: "/repo", WorktreePath: "/worktree", SessionName: "legacy",
 			BranchName: "feature", BaseCommitSHA: "base", IsExistingBranch: true,
 		},
-	}, saved.Workspace)
+	}, *saved.Workspace)
 
 	encoded, err := json.Marshal(saved)
 	require.NoError(t, err)

@@ -21,7 +21,7 @@ type InstanceData struct {
 	AutoYes   bool      `json:"auto_yes"`
 
 	Program   string           `json:"program"`
-	Workspace workspace.Data   `json:"workspace"`
+	Workspace *workspace.Data  `json:"workspace,omitempty"`
 	Worktree  *GitWorktreeData `json:"worktree,omitempty"`
 	DiffStats DiffStatsData    `json:"diff_stats"`
 }

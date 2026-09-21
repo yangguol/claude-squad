@@ -84,7 +84,9 @@ type fakeWorkspace struct {
 	displayName   string
 	branchName    string
 	valid         bool
+	validErr      error
 	dirty         bool
+	dirtyCalls    int
 	diff          *git.DiffStats
 	events        *[]string
 	setupErr      error
@@ -108,8 +110,8 @@ func (w *fakeWorkspace) WorkDir() string                        { return w.workD
 func (w *fakeWorkspace) DisplayName() string                    { return w.displayName }
 func (w *fakeWorkspace) BranchName() string                     { return w.branchName }
 func (w *fakeWorkspace) Setup() error                           { w.setupCalls++; w.record("setup"); return w.setupErr }
-func (w *fakeWorkspace) IsValid() (bool, error)                 { return w.valid, nil }
-func (w *fakeWorkspace) IsDirty() (bool, error)                 { return w.dirty, nil }
+func (w *fakeWorkspace) IsValid() (bool, error)                 { return w.valid, w.validErr }
+func (w *fakeWorkspace) IsDirty() (bool, error)                 { w.dirtyCalls++; return w.dirty, nil }
 func (w *fakeWorkspace) IsBranchCheckedOut() (bool, error)      { return false, nil }
 func (w *fakeWorkspace) Diff() *git.DiffStats                   { w.record("diff"); return w.diff }
 func (w *fakeWorkspace) DiffNumstat() *git.DiffStats            { return w.diff }
@@ -181,6 +183,40 @@ type failingPtyFactory struct{}
 
 func (*failingPtyFactory) Start(*exec.Cmd) (*os.File, error) { return nil, fmt.Errorf("pty failed") }
 func (*failingPtyFactory) Close()                            {}
+
+func TestResumePreservesPreexistingValidWorkspaceWhenTmuxStartFails(t *testing.T) {
+	ws := &fakeWorkspace{mode: workspace.ModeDirectory, workDir: t.TempDir(), valid: true}
+	instance, err := NewInstance(InstanceOptions{Title: "resume-existing", Path: t.TempDir(), Program: "claude", Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Paused
+	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps(instance.Title, instance.Program, &failingPtyFactory{}, cmd_test.MockCmdExec{
+		RunFunc:    func(*exec.Cmd) error { return fmt.Errorf("missing") },
+		OutputFunc: func(*exec.Cmd) ([]byte, error) { return nil, nil },
+	}))
+
+	require.Error(t, instance.Resume())
+	require.Equal(t, Paused, instance.Status)
+	require.Zero(t, ws.setupCalls)
+	require.Zero(t, ws.cleanupCalls, "resume must not clean a workspace it did not acquire")
+}
+
+func TestPauseStopsWhenWorkspaceValidationFails(t *testing.T) {
+	ws := &fakeWorkspace{mode: workspace.ModeGit, workDir: t.TempDir(), validErr: fmt.Errorf("validation failed"), dirty: true}
+	instance, err := NewInstance(InstanceOptions{Title: "pause-validation", Path: t.TempDir(), Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Running
+	instance.tmuxSession = tmux.NewTmuxSessionWithDeps(instance.Title, "", &nullPtyFactory{t: t}, cmd_test.MockCmdExec{})
+
+	err = instance.Pause()
+	require.ErrorContains(t, err, "failed to validate workspace")
+	require.Equal(t, Running, instance.Status)
+	require.Zero(t, ws.dirtyCalls)
+	require.Zero(t, ws.commitCalls)
+	require.Zero(t, ws.removeCalls)
+	require.Zero(t, ws.pruneCalls)
+}
 
 func TestInstanceWorkspacePauseResumeKillAndDiffDelegate(t *testing.T) {
 	ws := &fakeWorkspace{mode: workspace.ModeGit, workDir: filepath.Join(t.TempDir(), "missing"), branchName: "branch", valid: true, dirty: true, diff: &git.DiffStats{Added: 2}}

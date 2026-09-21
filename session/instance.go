@@ -84,7 +84,8 @@ func (i *Instance) ToInstanceData() InstanceData {
 	}
 
 	if i.workspace != nil {
-		data.Workspace = i.workspace.Serialize()
+		serialized := i.workspace.Serialize()
+		data.Workspace = &serialized
 	}
 
 	// Only include diff stats if they exist
@@ -101,9 +102,10 @@ func (i *Instance) ToInstanceData() InstanceData {
 
 // FromInstanceData creates a new Instance from serialized data
 func FromInstanceData(data InstanceData) (*Instance, error) {
-	workspaceData := data.Workspace
-	hasWorkspaceData := workspaceData.Version != 0 || workspaceData.Mode != "" || workspaceData.Git != nil || workspaceData.Shadow != nil
-	if !hasWorkspaceData && data.Worktree != nil {
+	var workspaceData workspace.Data
+	if data.Workspace != nil {
+		workspaceData = *data.Workspace
+	} else if data.Worktree != nil {
 		workspaceData = workspace.Data{
 			Version: workspace.CurrentVersion,
 			Mode:    workspace.ModeGit,
@@ -475,8 +477,9 @@ func (i *Instance) Pause() error {
 	// on it. Skip dirty check and Remove, prune any lingering metadata, then
 	// transition to Paused so the user can recover via Resume.
 	if valid, err := i.workspace.IsValid(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to validate worktree: %w", err))
-		log.ErrorLog.Print(err)
+		validationErr := fmt.Errorf("failed to validate workspace: %w", err)
+		log.ErrorLog.Print(validationErr)
+		return validationErr
 	} else if !valid {
 		log.WarningLog.Printf("worktree at %s is orphaned; skipping dirty check and remove",
 			i.workspace.WorkDir())
@@ -558,15 +561,27 @@ func (i *Instance) Resume() error {
 	// throws away anything uncommitted in it. After a normal Pause the directory is gone
 	// and that is exactly what we want; but an instance paused because its tmux session
 	// died still has its worktree — and the work in it — sitting on disk, so leave it be.
+	workspaceAcquired := false
 	if valid, err := i.workspace.IsValid(); err != nil || !valid {
 		if err != nil {
-			log.WarningLog.Printf("could not validate worktree at %s, recreating it: %v",
+			log.WarningLog.Printf("could not validate workspace at %s, recreating it: %v",
 				i.workspace.WorkDir(), err)
 		}
 		if err := i.workspace.Setup(); err != nil {
 			log.ErrorLog.Print(err)
-			return fmt.Errorf("failed to setup git worktree: %w", err)
+			return fmt.Errorf("failed to setup workspace: %w", err)
 		}
+		workspaceAcquired = true
+	}
+
+	cleanupAcquiredWorkspace := func(startErr error) error {
+		if workspaceAcquired {
+			if cleanupErr := i.workspace.Cleanup(); cleanupErr != nil {
+				startErr = fmt.Errorf("%v (cleanup error: %v)", startErr, cleanupErr)
+				log.ErrorLog.Print(startErr)
+			}
+		}
+		return fmt.Errorf("failed to start new session: %w", startErr)
 	}
 
 	// Check if tmux session still exists from pause, otherwise create new one
@@ -577,24 +592,14 @@ func (i *Instance) Resume() error {
 			// If restore fails, fall back to creating new session
 			if err := i.tmuxSession.Start(i.workspace.WorkDir()); err != nil {
 				log.ErrorLog.Print(err)
-				// Cleanup git worktree if tmux session creation fails
-				if cleanupErr := i.workspace.Cleanup(); cleanupErr != nil {
-					err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
-					log.ErrorLog.Print(err)
-				}
-				return fmt.Errorf("failed to start new session: %w", err)
+				return cleanupAcquiredWorkspace(err)
 			}
 		}
 	} else {
 		// Create new tmux session
 		if err := i.tmuxSession.Start(i.workspace.WorkDir()); err != nil {
 			log.ErrorLog.Print(err)
-			// Cleanup git worktree if tmux session creation fails
-			if cleanupErr := i.workspace.Cleanup(); cleanupErr != nil {
-				err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
-				log.ErrorLog.Print(err)
-			}
-			return fmt.Errorf("failed to start new session: %w", err)
+			return cleanupAcquiredWorkspace(err)
 		}
 	}
 
