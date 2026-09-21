@@ -1,6 +1,7 @@
 package git
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,6 +108,34 @@ func TestSetupFromExistingBranch_RecordsBaseCommit(t *testing.T) {
 	want := strings.TrimSpace(mustRunGit(t, repoPath, "rev-parse", "feature/test"))
 	if got := g.GetBaseCommitSHA(); got != want {
 		t.Fatalf("GetBaseCommitSHA() = %q, want %q", got, want)
+	}
+}
+
+func TestCleanupWorktreeEntriesPropagatesBranchDeletionError(t *testing.T) {
+	worktrees := t.TempDir()
+	requireNoError(t, os.Mkdir(filepath.Join(worktrees, "session"), 0o700))
+	want := errors.New("delete branch")
+	err := cleanupWorktreeEntries(worktrees, map[string]string{filepath.Join(worktrees, "session"): "feature"},
+		func(string) error { return want }, os.RemoveAll)
+	if !errors.Is(err, want) {
+		t.Fatalf("cleanupWorktreeEntries() error = %v, want %v", err, want)
+	}
+}
+
+func TestCleanupWorktreeEntriesPropagatesRemoveAllError(t *testing.T) {
+	worktrees := t.TempDir()
+	requireNoError(t, os.Mkdir(filepath.Join(worktrees, "session"), 0o700))
+	want := errors.New("remove all")
+	err := cleanupWorktreeEntries(worktrees, nil, func(string) error { return nil }, func(string) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("cleanupWorktreeEntries() error = %v, want %v", err, want)
+	}
+}
+
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

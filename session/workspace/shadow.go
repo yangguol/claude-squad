@@ -624,6 +624,17 @@ func newSessionID() (string, error) {
 	return hex.EncodeToString(value), nil
 }
 
+// ValidateStoredShadowReferences verifies raw persisted state before reset can
+// overwrite it. Any malformed record fails closed.
+func ValidateStoredShadowReferences() error {
+	root, err := shadowRoot()
+	if err != nil {
+		return err
+	}
+	_, err = storedShadowProjectReferences(root)
+	return err
+}
+
 // CleanupShadowProjects removes validated shadow projects that are not referenced
 // by persisted sessions. Invalid projects and incomplete apply transactions are
 // preserved and reported so reset cannot silently discard recoverable state.
@@ -714,26 +725,71 @@ func storedShadowProjectReferences(root string) (map[string]bool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read persisted session state: %w", err)
 	}
-	var state struct {
-		Instances []struct {
-			Title     string `json:"title"`
-			Workspace *Data  `json:"workspace"`
-		} `json:"instances"`
-	}
-	if err := json.Unmarshal(contents, &state); err != nil {
+	var stateFields map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &stateFields); err != nil {
 		return nil, fmt.Errorf("decode persisted session state: %w", err)
 	}
+	instancesJSON, present := stateFields["instances"]
+	if !present || string(instancesJSON) == "null" {
+		return nil, errors.New("persisted session state has missing or null instances")
+	}
+	var instances []json.RawMessage
+	if err := json.Unmarshal(instancesJSON, &instances); err != nil {
+		return nil, fmt.Errorf("decode persisted instances: %w", err)
+	}
 	var errs []error
-	for _, instance := range state.Instances {
-		if instance.Workspace == nil || instance.Workspace.Mode != ModeDirectory || instance.Workspace.Shadow == nil {
+	for index, rawInstance := range instances {
+		var fields map[string]json.RawMessage
+		if len(rawInstance) == 0 || string(rawInstance) == "null" || json.Unmarshal(rawInstance, &fields) != nil || fields == nil {
+			errs = append(errs, fmt.Errorf("reject persisted instance %d: malformed instance object", index))
 			continue
 		}
-		data := *instance.Workspace.Shadow
+		var title string
+		if rawTitle, ok := fields["title"]; ok {
+			_ = json.Unmarshal(rawTitle, &title)
+		}
+		rawWorkspace, hasWorkspace := fields["workspace"]
+		if !hasWorkspace {
+			// Legacy Git records store only worktree data and remain valid.
+			if _, legacy := fields["worktree"]; !legacy {
+				errs = append(errs, fmt.Errorf("reject persisted workspace %q: workspace data is missing", title))
+			}
+			continue
+		}
+		if string(rawWorkspace) == "null" {
+			errs = append(errs, fmt.Errorf("reject persisted workspace %q: workspace data is null", title))
+			continue
+		}
+		var workspace Data
+		if err := json.Unmarshal(rawWorkspace, &workspace); err != nil {
+			errs = append(errs, fmt.Errorf("reject persisted workspace %q: %w", title, err))
+			continue
+		}
+		switch workspace.Mode {
+		case ModeGit:
+			if workspace.Version != CurrentVersion || workspace.Git == nil || workspace.Shadow != nil {
+				errs = append(errs, fmt.Errorf("reject persisted Git workspace %q: malformed workspace data", title))
+				continue
+			}
+			if err := validateGitData(*workspace.Git); err != nil {
+				errs = append(errs, fmt.Errorf("reject persisted Git workspace %q: %w", title, err))
+			}
+			continue
+		case ModeDirectory:
+			if workspace.Version != CurrentVersion || workspace.Shadow == nil || workspace.Git != nil {
+				errs = append(errs, fmt.Errorf("reject persisted directory workspace %q: shadow data is missing", title))
+				continue
+			}
+		default:
+			errs = append(errs, fmt.Errorf("reject persisted workspace %q: invalid mode %q", title, workspace.Mode))
+			continue
+		}
+		data := *workspace.Shadow
 		if len(data.ProjectID) == 64 {
 			references[data.ProjectID] = true
 		}
 		if err := validateStoredShadowReference(root, data); err != nil {
-			errs = append(errs, fmt.Errorf("reject persisted shadow workspace %q: %w", instance.Title, err))
+			errs = append(errs, fmt.Errorf("reject persisted shadow workspace %q: %w", title, err))
 		}
 	}
 	if len(errs) != 0 {
@@ -842,12 +898,57 @@ func validateCleanupMetadata(metadata shadowProjectMetadata, projectID string) e
 	return nil
 }
 
+var cleanupBeforeQuarantine = func(string) {}
+
 func removeShadowProject(root, projectPath string) error {
+	rootInfo, err := os.Lstat(root)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("shadow root changed before quarantine")
+	}
+	projectInfo, err := os.Lstat(projectPath)
+	if err != nil || !projectInfo.IsDir() || projectInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("shadow project %q changed before quarantine", projectPath)
+	}
+	if filepath.Dir(projectPath) != root {
+		return fmt.Errorf("shadow project %q is not a direct child of shadow root", projectPath)
+	}
 	if err := ensureRealContainedPath(root, projectPath, false, "project path"); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(projectPath); err != nil {
-		return fmt.Errorf("remove shadow project %q: %w", projectPath, err)
+
+	cleanupBeforeQuarantine(projectPath)
+	currentRootInfo, err := os.Lstat(root)
+	if err != nil || !os.SameFile(rootInfo, currentRootInfo) {
+		return errors.New("shadow root changed before quarantine")
+	}
+	currentProjectInfo, err := os.Lstat(projectPath)
+	if err != nil || !os.SameFile(projectInfo, currentProjectInfo) || !currentProjectInfo.IsDir() || currentProjectInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("shadow project %q changed before quarantine", projectPath)
+	}
+
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return fmt.Errorf("generate shadow quarantine name: %w", err)
+	}
+	quarantine := filepath.Join(root, ".cleanup-"+hex.EncodeToString(random))
+	if filepath.Dir(quarantine) != root {
+		return errors.New("invalid shadow quarantine path")
+	}
+	if _, err := os.Lstat(quarantine); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return fmt.Errorf("shadow quarantine path %q already exists", quarantine)
+		}
+		return fmt.Errorf("inspect shadow quarantine path %q: %w", quarantine, err)
+	}
+	if err := os.Rename(projectPath, quarantine); err != nil {
+		return fmt.Errorf("quarantine shadow project %q: %w", projectPath, err)
+	}
+	quarantinedInfo, err := os.Lstat(quarantine)
+	if err != nil || !os.SameFile(projectInfo, quarantinedInfo) || !quarantinedInfo.IsDir() || quarantinedInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("quarantined shadow project %q has invalid identity", quarantine)
+	}
+	if err := os.RemoveAll(quarantine); err != nil {
+		return fmt.Errorf("remove quarantined shadow project %q: %w", quarantine, err)
 	}
 	return nil
 }

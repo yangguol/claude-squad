@@ -1,7 +1,7 @@
 package git
 
 import (
-	"claude-squad/log"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -149,6 +149,32 @@ func (g *GitWorktree) Cleanup() error {
 	return nil
 }
 
+func cleanupWorktreeEntries(worktreesDir string, worktreeBranches map[string]string, deleteBranch, removeAll func(string) error) error {
+	entries, err := os.ReadDir(worktreesDir)
+	if err != nil {
+		return fmt.Errorf("failed to read worktree directory: %w", err)
+	}
+	var errs []error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		worktreePath := filepath.Join(worktreesDir, entry.Name())
+		for path, branch := range worktreeBranches {
+			if strings.Contains(path, entry.Name()) {
+				if err := deleteBranch(branch); err != nil {
+					errs = append(errs, err)
+				}
+				break
+			}
+		}
+		if err := removeAll(worktreePath); err != nil {
+			errs = append(errs, fmt.Errorf("failed to remove worktree directory %q: %w", worktreePath, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // Remove removes the worktree but keeps the branch
 func (g *GitWorktree) Remove() error {
 	// Remove the worktree using git command
@@ -172,11 +198,6 @@ func CleanupWorktrees() error {
 	worktreesDir, err := getWorktreeDirectory()
 	if err != nil {
 		return fmt.Errorf("failed to get worktree directory: %w", err)
-	}
-
-	entries, err := os.ReadDir(worktreesDir)
-	if err != nil {
-		return fmt.Errorf("failed to read worktree directory: %w", err)
 	}
 
 	// Get a list of all branches associated with worktrees
@@ -203,34 +224,20 @@ func CleanupWorktrees() error {
 		}
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			worktreePath := filepath.Join(worktreesDir, entry.Name())
-
-			// Delete the branch associated with this worktree if found
-			for path, branch := range worktreeBranches {
-				if strings.Contains(path, entry.Name()) {
-					// Delete the branch
-					deleteCmd := exec.Command("git", "branch", "-D", branch)
-					if err := deleteCmd.Run(); err != nil {
-						// Log the error but continue with other worktrees
-						log.ErrorLog.Printf("failed to delete branch %s: %v", branch, err)
-					}
-					break
-				}
-			}
-
-			// Remove the worktree directory
-			os.RemoveAll(worktreePath)
+	deleteBranch := func(branch string) error {
+		if err := exec.Command("git", "branch", "-D", branch).Run(); err != nil {
+			return fmt.Errorf("failed to delete branch %s: %w", branch, err)
 		}
+		return nil
 	}
+	cleanupErr := cleanupWorktreeEntries(worktreesDir, worktreeBranches, deleteBranch, os.RemoveAll)
 
 	// You have to prune the cleaned up worktrees.
 	cmd = exec.Command("git", "worktree", "prune")
 	_, err = cmd.Output()
 	if err != nil {
-		return fmt.Errorf("failed to prune worktrees: %w", err)
+		err = fmt.Errorf("failed to prune worktrees: %w", err)
 	}
 
-	return nil
+	return errors.Join(cleanupErr, err)
 }

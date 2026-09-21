@@ -774,7 +774,19 @@ func FindIncompleteTransactions(root string) ([]Transaction, error) {
 		}
 		contents, err := os.ReadFile(filepath.Join(directory, "manifest.json"))
 		if errors.Is(err, os.ErrNotExist) {
-			continue
+			if transaction, recorded := byDirectory[directory]; recorded && transaction.State == transactionCommitted {
+				continue
+			}
+			markerContents, markerErr := os.ReadFile(directory + ".cleanup.json")
+			if markerErr == nil {
+				var transaction Transaction
+				if err := json.Unmarshal(markerContents, &transaction); err == nil && transaction.State == transactionCommitted {
+					transaction.Directory = directory
+					byDirectory[directory] = transaction
+					continue
+				}
+			}
+			return nil, fmt.Errorf("transaction directory %q is missing manifest.json", entry.Name())
 		}
 		if err != nil {
 			return nil, err

@@ -89,6 +89,7 @@ var (
 				return fmt.Errorf("failed to initialize storage: %w", err)
 			}
 			return resetAll(
+				workspace.ValidateStoredShadowReferences,
 				storage.DeleteAllInstances,
 				func() error { return tmux.CleanupSessions(cmd2.MakeExecutor()) },
 				git.CleanupWorktrees,
@@ -129,12 +130,13 @@ var (
 	}
 )
 
-func resetAll(deleteStorage, cleanupTmux, cleanupWorktrees, cleanupShadowProjects, stopDaemon func() error) error {
+func resetAll(validateReferences, deleteStorage, cleanupTmux, cleanupWorktrees, cleanupShadowProjects, stopDaemon func() error) error {
 	steps := []struct {
 		run     func() error
 		failure string
 		success string
 	}{
+		{validateReferences, "failed to validate persisted shadow references", "Persisted shadow references have been validated"},
 		{deleteStorage, "failed to reset storage", "Storage has been reset successfully"},
 		{cleanupTmux, "failed to cleanup tmux sessions", "Tmux sessions have been cleaned up"},
 		{cleanupWorktrees, "failed to cleanup worktrees", "Worktrees have been cleaned up"},

@@ -607,6 +607,90 @@ func TestCleanupShadowProjectsMalformedStateFailsClosedButReportsProjects(t *tes
 	require.DirExists(t, malformed)
 }
 
+func TestStoredShadowProjectReferencesRejectsMalformedStateShapes(t *testing.T) {
+	tests := []struct {
+		name  string
+		state string
+	}{
+		{"missing instances", `{}`},
+		{"null instances", `{"instances":null}`},
+		{"malformed instance", `{"instances":[null]}`},
+		{"malformed workspace", `{"instances":[{"workspace":7}]}`},
+		{"directory missing shadow", `{"instances":[{"workspace":{"version":1,"mode":"directory"}}]}`},
+		{"directory null shadow", `{"instances":[{"workspace":{"version":1,"mode":"directory","shadow":null}}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			root, err := shadowRoot()
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(home, ".claude-squad", "state.json"), []byte(test.state), 0o600))
+			_, err = storedShadowProjectReferences(root)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestStoredShadowProjectReferencesAllowsLegacyGitRecord(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root, err := shadowRoot()
+	require.NoError(t, err)
+	state := `{"instances":[{"title":"legacy","worktree":{"repo_path":"/repo","worktree_path":"/tree","branch_name":"branch"}}]}`
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".claude-squad", "state.json"), []byte(state), 0o600))
+	references, err := storedShadowProjectReferences(root)
+	require.NoError(t, err)
+	require.Empty(t, references)
+}
+
+func TestCleanupShadowProjectsReportsTransactionDirectoryWithoutManifest(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	canonicalSource, err := filepath.EvalSymlinks(source)
+	require.NoError(t, err)
+	root, err := shadowRoot()
+	require.NoError(t, err)
+	projectID := shadowProjectID(canonicalSource)
+	project := filepath.Join(root, projectID)
+	require.NoError(t, writeShadowProjectMetadataForTest(project, shadowProjectMetadata{Version: CurrentVersion, ProjectID: projectID, SourcePath: canonicalSource}))
+	incomplete := filepath.Join(project, "transactions", "interrupted")
+	require.NoError(t, os.MkdirAll(incomplete, 0o700))
+
+	err = CleanupShadowProjects()
+	require.ErrorContains(t, err, "missing manifest.json")
+	require.DirExists(t, project)
+	require.DirExists(t, incomplete)
+}
+
+func TestCleanupShadowProjectsRejectsProjectReplacementBeforeQuarantine(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	canonicalSource, err := filepath.EvalSymlinks(source)
+	require.NoError(t, err)
+	root, err := shadowRoot()
+	require.NoError(t, err)
+	projectID := shadowProjectID(canonicalSource)
+	project := filepath.Join(root, projectID)
+	require.NoError(t, writeShadowProjectMetadataForTest(project, shadowProjectMetadata{Version: CurrentVersion, ProjectID: projectID, SourcePath: canonicalSource}))
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "keep"), []byte("safe"), 0o600))
+	originalHook := cleanupBeforeQuarantine
+	cleanupBeforeQuarantine = func(path string) {
+		require.Equal(t, project, path)
+		require.NoError(t, os.RemoveAll(path))
+		require.NoError(t, os.Symlink(outside, path))
+	}
+	t.Cleanup(func() { cleanupBeforeQuarantine = originalHook })
+
+	err = CleanupShadowProjects()
+	require.ErrorContains(t, err, "changed before quarantine")
+	require.FileExists(t, filepath.Join(outside, "keep"))
+	info, statErr := os.Lstat(project)
+	require.NoError(t, statErr)
+	require.NotZero(t, info.Mode()&os.ModeSymlink)
+}
+
 func TestCleanupShadowProjectsKeepsActiveSession(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := t.TempDir()

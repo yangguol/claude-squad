@@ -53,3 +53,26 @@ PASS. All repository packages passed; `session/workspace` completed in 133.342s.
 ## Commit
 
 `eab8370 feat: clean shadow workspaces on reset`
+
+## Fix Round 1
+
+### Changes
+
+- Reset now validates raw persisted shadow references before `DeleteAllInstances`; malformed state aborts reset without rewriting `state.json` or deleting shadow projects.
+- Persisted-state parsing now rejects missing/null `instances`, malformed instance/workspace objects, and directory workspaces with missing/null shadow data while preserving valid legacy Git records.
+- Project cleanup now revalidates root/project identity and atomically renames a direct project child to a randomized quarantine entry under the canonical shadow root before recursive removal. Replacement races fail closed and retain/report the replacement.
+- Transaction directories without `manifest.json` are reported as incomplete and preserve their project; committed cleanup markers remain discoverable.
+- Native Git cleanup now returns aggregated branch-deletion and `RemoveAll` failures instead of logging or discarding them, while retaining the existing cleanup scope.
+
+### TDD and verification
+
+- New regressions cover reset-path malformed-state preservation, strict stored-state shapes and legacy Git compatibility, project replacement before quarantine, missing transaction manifests, and injected native branch/removal failures.
+- Focused: `go test -count=1 ./session/workspace . -run 'TestCleanupShadowProjects|TestStoredShadowProjectReferences|TestReset' -v` — PASS.
+- Focused: `go test -count=1 ./session/git -run 'TestCleanupWorktree' -v` — PASS.
+- Full: `go test -count=1 ./...` — PASS.
+- Static: `go vet ./...` — PASS.
+- Diff: `git diff --check` — PASS.
+
+### Remaining concern
+
+- Portable path APIs cannot eliminate every post-rename mutation race inside a directory controlled by a concurrent local actor. Quarantining the validated direct child under the same validated root removes the dangerous parent/symlink substitution window before recursive traversal; recursive removal remains best-effort and reports failures.
