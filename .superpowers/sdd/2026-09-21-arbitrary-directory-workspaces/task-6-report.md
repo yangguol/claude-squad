@@ -56,4 +56,4 @@ PASS with no output.
 
 ## Commit
 
-Pending at report creation; filled after commit below.
+`7756679 feat: plan safe three-way directory merges`
