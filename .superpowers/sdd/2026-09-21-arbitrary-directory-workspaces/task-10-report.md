@@ -56,3 +56,48 @@ PASS. All repository packages passed; `session/workspace` completed in 118.155s 
 ## Commit
 
 `ae9f752 feat: add ygl mark to startup logo`
+
+## Fix Round 1
+
+### Status
+
+Fixed fallback rendering so `PreviewPane.String()` composes the unchanged logo and stored fallback message using the pane's current width. Resizing an existing fallback state now omits `ygl` before overflow and adds it at the exact fit boundary; non-fallback rendering and fallback vertical sizing behavior remain unchanged.
+
+### TDD red
+
+`go test ./ui -run 'TestRenderFallbackLogoMarkFitBoundary|TestFallbackRenderingRespondsToResize' -v`
+
+FAIL in `TestFallbackRenderingRespondsToResize`: after creating fallback state at `logoWidth+markWidth-1` and widening to `logoWidth+markWidth`, the rendered output still did not contain `ygl`. The exact renderer boundary test already passed, isolating the defect to cached fallback-state rendering.
+
+### Focused renderer and preview tests
+
+`go test ./ui -run 'TestRenderFallbackLogo|TestFallbackRenderingRespondsToResize' -v`
+
+PASS. Covers omission at `logoWidth+markWidth-1`, inclusion at exactly `logoWidth+markWidth`, and an existing fallback state resized narrow → exact-fit → narrow. Width assertions use `lipgloss.Width`; mark detection strips adaptive ANSI styling.
+
+### UI suite
+
+`go test ./ui -v`
+
+PASS in 5.928s, including renderer, fallback resize, terminal fallback-state, normal preview-content, and scrolling coverage.
+
+### Uncached full suite
+
+`go test -count=1 ./...`
+
+PASS. All repository packages passed; `session/workspace` completed in 116.008s and `ui` in 8.581s.
+
+### Static and diff checks
+
+- `go vet ./...` — PASS with no output.
+- `git diff --check` — PASS with no output.
+
+### Implementation evidence
+
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/ui/preview.go`: stores only the fallback message in fallback state and invokes `RenderFallbackLogo(p.width)` from `String()`, so current width controls every fallback render without changing non-fallback paths or the existing vertical-padding calculation.
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/ui/consts_test.go`: verifies exact visible-width boundaries with the adaptive styled mark.
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/ui/preview_test.go`: verifies both resize directions on one existing fallback state and checks every shrunk output line for overflow with `lipgloss.Width`.
+
+### Concerns
+
+None identified.

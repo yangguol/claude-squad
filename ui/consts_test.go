@@ -28,6 +28,18 @@ func TestRenderFallbackLogoOmitsYGLWhenNarrow(t *testing.T) {
 	require.Equal(t, strings.Count(FallBackText, "\n"), strings.Count(rendered, "\n"), "mark must not wrap")
 }
 
+func TestRenderFallbackLogoMarkFitBoundary(t *testing.T) {
+	logoWidth := lipgloss.Width(FallBackText)
+	markWidth := lipgloss.Width(fallbackMarkStyle.Render("ygl"))
+
+	justTooNarrow := RenderFallbackLogo(logoWidth + markWidth - 1)
+	require.NotContains(t, ansi.Strip(justTooNarrow), "ygl")
+
+	exactFit := RenderFallbackLogo(logoWidth + markWidth)
+	require.Contains(t, lastVisibleLine(ansi.Strip(exactFit)), "ygl")
+	require.Equal(t, logoWidth+markWidth, lipgloss.Width(exactFit))
+}
+
 func lastVisibleLine(s string) string {
 	lines := strings.Split(s, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {

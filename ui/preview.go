@@ -27,6 +27,8 @@ type previewState struct {
 	fallback bool
 	// text is the text displayed in the preview pane
 	text string
+	// fallbackMessage is composed with the width-aware logo when fallback content is rendered.
+	fallbackMessage string
 }
 
 func NewPreviewPane() *PreviewPane {
@@ -45,8 +47,8 @@ func (p *PreviewPane) SetSize(width, maxHeight int) {
 // setFallbackState sets the preview state with fallback text and a message
 func (p *PreviewPane) setFallbackState(message string) {
 	p.previewState = previewState{
-		fallback: true,
-		text:     lipgloss.JoinVertical(lipgloss.Center, RenderFallbackLogo(p.width), "", message),
+		fallback:        true,
+		fallbackMessage: message,
 	}
 }
 
@@ -121,11 +123,14 @@ func (p *PreviewPane) String() string {
 	}
 
 	if p.previewState.fallback {
+		fallbackText := lipgloss.JoinVertical(lipgloss.Center,
+			RenderFallbackLogo(p.width), "", p.previewState.fallbackMessage)
+
 		// Calculate available height for fallback text
 		availableHeight := p.height - 3 - 4 // 2 for borders, 1 for margin, 1 for padding
 
 		// Count the number of lines in the fallback text
-		fallbackLines := len(strings.Split(p.previewState.text, "\n"))
+		fallbackLines := len(strings.Split(fallbackText, "\n"))
 
 		// Calculate padding needed above and below to center the content
 		totalPadding := availableHeight - fallbackLines
@@ -141,7 +146,7 @@ func (p *PreviewPane) String() string {
 		if topPadding > 0 {
 			lines = append(lines, strings.Repeat("\n", topPadding))
 		}
-		lines = append(lines, p.previewState.text)
+		lines = append(lines, fallbackText)
 		if bottomPadding > 0 {
 			lines = append(lines, strings.Repeat("\n", bottomPadding))
 		}

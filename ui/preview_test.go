@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -378,6 +380,26 @@ func TestPreviewContentWithoutScrolling(t *testing.T) {
 	// Verify the rendered string contains the content
 	renderedString := previewPane.String()
 	require.Contains(t, renderedString, "test", "Rendered preview should contain the test content")
+}
+
+func TestFallbackRenderingRespondsToResize(t *testing.T) {
+	logoWidth := lipgloss.Width(FallBackText)
+	markWidth := lipgloss.Width(fallbackMarkStyle.Render("ygl"))
+	pane := NewPreviewPane()
+	pane.SetSize(logoWidth+markWidth-1, 30)
+	require.NoError(t, pane.UpdateContent(nil))
+
+	require.NotContains(t, ansi.Strip(pane.String()), "ygl", "mark must be omitted just below the fit boundary")
+
+	pane.SetSize(logoWidth+markWidth, 30)
+	require.Contains(t, ansi.Strip(pane.String()), "ygl", "mark must appear when an existing fallback state grows to the exact fit boundary")
+
+	pane.SetSize(logoWidth+markWidth-1, 30)
+	rendered := pane.String()
+	require.NotContains(t, ansi.Strip(rendered), "ygl", "mark must disappear when an existing fallback state shrinks below the fit boundary")
+	for _, line := range strings.Split(rendered, "\n") {
+		require.LessOrEqual(t, lipgloss.Width(line), logoWidth+markWidth-1, "fallback rendering must not overflow after shrinking")
+	}
 }
 
 // Helper function for max
