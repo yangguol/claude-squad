@@ -80,6 +80,20 @@ func TestScanIncludesExplicitlyNegatedDescendantOnly(t *testing.T) {
 	require.Equal(t, []string{policyFileName, "ignored/keep.txt"}, snapshot.SortedPaths())
 }
 
+func TestScanIncludesDescendantMatchedByWildcardNegation(t *testing.T) {
+	source := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(source, "ignored", "sub"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "ignored", "sub", "keep.txt"), []byte("keep"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "ignored", "sub", "drop.txt"), []byte("drop"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(source, policyFileName), []byte("ignored/\n!ignored/*/keep.txt\n"), 0o644))
+	policy, err := LoadPolicy(source)
+	require.NoError(t, err)
+
+	snapshot, err := Scan(source, policy)
+	require.NoError(t, err)
+	require.Equal(t, []string{policyFileName, "ignored/sub/keep.txt"}, snapshot.SortedPaths())
+}
+
 func TestScanCanExplicitlyExcludePolicyFile(t *testing.T) {
 	source := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(source, policyFileName), []byte(policyFileName+"\n"), 0o644))

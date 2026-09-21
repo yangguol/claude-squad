@@ -139,7 +139,15 @@ func (r policyRule) mayMatchDescendant(name string) bool {
 		return false
 	}
 	if strings.HasPrefix(r.pattern, "/") || strings.Contains(pattern, "/") {
-		return strings.HasPrefix(pattern, name+"/")
+		patternParts := strings.Split(pattern, "/")
+		nameParts := strings.Split(name, "/")
+		for index := 0; index < len(nameParts) && index < len(patternParts); index++ {
+			matched, _ := path.Match(patternParts[index], nameParts[index])
+			if !matched {
+				return false
+			}
+		}
+		return len(nameParts) <= len(patternParts)
 	}
 	return true
 }
