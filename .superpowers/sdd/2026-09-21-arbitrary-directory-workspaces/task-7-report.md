@@ -62,3 +62,52 @@ PASS with no output.
 ## Commit
 
 `63b7acd feat: apply directory changes transactionally`
+
+## Fix Round 1
+
+### Status
+
+Resolved all six review findings: source and manifest temporaries now use collision-safe exclusive siblings and only transaction-created names are cleaned; every source mutation is preceded by authoritative entry and symlink-safe ancestor revalidation after backup; rollback tracks and safely removes transaction-created parents; directory-to-file and file-to-tree changes are ordered correctly; regular-file rollback publishes through an exclusive sibling and atomic rename; and committed cleanup failures are returned while the committed manifest and payload remain discoverable.
+
+### TDD evidence
+
+The new focused tests initially failed as expected:
+
+`go test ./session/workspace -run 'TestApplyPreservesPredictableSiblingCollision|TestApplyRejectsPostBackupSourceAndAncestorChanges|TestApplyRollbackRemovesCreatedParents|TestApplyDirectoryToFileAndFileToTree|TestApplyReportsCommittedCleanupFailure' -v`
+
+FAIL: the predictable sibling was deleted, post-backup source/ancestor changes were overwritten, created parent directories survived rollback, both directory/file transition directions failed, and committed cleanup errors were ignored.
+
+### Final focused transactional tests
+
+`go test ./session/workspace -run 'TestApplyTransaction|TestApplyRollback|TestIncompleteTransaction|TestApplyPreservesPredictableSiblingCollision|TestApplyRejectsPostBackupSourceAndAncestorChanges|TestApplyDirectoryToFileAndFileToTree|TestApplyReportsCommittedCleanupFailure' -v`
+
+PASS (`ok claude-squad/session/workspace 43.229s`).
+
+### Final workspace suite
+
+`go test ./session/workspace -v`
+
+PASS (`ok claude-squad/session/workspace 111.491s`).
+
+### Final uncached full suite
+
+`go test -count=1 ./...`
+
+PASS. All repository packages passed; `session/workspace` completed in 115.252s.
+
+### Final static patch check
+
+`git diff --check`
+
+PASS with no output.
+
+### Files
+
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/apply.go`
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/apply_test.go`
+- `/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/.superpowers/sdd/2026-09-21-arbitrary-directory-workspaces/task-7-report.md`
+
+### Concerns
+
+- As before, filesystem durability is atomic at rename boundaries but does not fsync files or directories against machine-level power loss.
+- The remaining unavoidable OS race is between the final userspace revalidation syscall and the immediately following mutation syscall; deterministic hooks verify that all changes introduced before final revalidation are rejected without overwrite.

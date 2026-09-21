@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -137,17 +138,13 @@ type failingApplyOps struct {
 }
 
 func (f failingApplyOps) Rename(oldpath, newpath string) error {
+	if filepath.Clean(newpath) == filepath.Clean(f.failRestorePath) && strings.HasPrefix(filepath.Base(oldpath), ".claude-squad-rollback-") {
+		return errors.New("injected rollback failure")
+	}
 	if filepath.Clean(newpath) == filepath.Clean(f.failRenameTarget) {
 		return errors.New("injected apply failure")
 	}
 	return f.fileOps.Rename(oldpath, newpath)
-}
-
-func (f failingApplyOps) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
-	if name == f.failRestorePath && flag&os.O_EXCL != 0 {
-		return nil, errors.New("injected rollback failure")
-	}
-	return f.fileOps.OpenFile(name, flag, mode)
 }
 
 func TestApplyRollbackRestoresUpdatesAndDeletions(t *testing.T) {
@@ -191,6 +188,118 @@ func TestApplyRollbackFailureRetainsIncompleteTransaction(t *testing.T) {
 	require.Len(t, transactions, 1)
 	require.Equal(t, transactionApplying, transactions[0].State)
 	require.DirExists(t, transactions[0].Directory)
+}
+
+func TestApplyPreservesPredictableSiblingCollision(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	collision := filepath.Join(source, ".claude-squad-apply-file-tmp")
+	writeApplyFile(t, source, filepath.Base(collision), "unplanned", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+
+	_, err := workspace.Apply()
+	require.NoError(t, err)
+	require.Equal(t, "unplanned", mustReadFile(t, collision))
+}
+
+func TestApplyRejectsPostBackupSourceAndAncestorChanges(t *testing.T) {
+	tests := map[string]func(*testing.T, string){
+		"source": func(t *testing.T, source string) {
+			writeApplyFile(t, source, "dir/file", "late", 0o644)
+		},
+		"ancestor": func(t *testing.T, source string) {
+			require.NoError(t, os.Remove(filepath.Join(source, "dir", "file")))
+			require.NoError(t, os.Remove(filepath.Join(source, "dir")))
+			require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(source, "dir")))
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			source := t.TempDir()
+			writeApplyFile(t, source, "dir/file", "before", 0o644)
+			workspace := newApplyWorkspace(t, source)
+			writeApplyFile(t, workspace.WorkDir(), "dir/file", "after", 0o644)
+			applyAfterBackupHook = func(string) { mutate(t, source) }
+			t.Cleanup(func() { applyAfterBackupHook = nil })
+
+			_, err := workspace.Apply()
+			require.Error(t, err)
+			if name == "source" {
+				require.Equal(t, "late", mustReadFile(t, filepath.Join(source, "dir/file")))
+			} else {
+				info, statErr := os.Lstat(filepath.Join(source, "dir"))
+				require.NoError(t, statErr)
+				require.NotZero(t, info.Mode()&os.ModeSymlink)
+			}
+		})
+	}
+}
+
+func TestApplyRollbackRemovesCreatedParents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "old", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "new/child", "created", 0o644)
+	writeApplyFile(t, workspace.WorkDir(), "zz-fail", "created", 0o644)
+	original := applyFS
+	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "zz-fail")}
+	t.Cleanup(func() { applyFS = original })
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "injected apply failure")
+	require.NoDirExists(t, filepath.Join(source, "new"))
+}
+
+func TestApplyDirectoryToFileAndFileToTree(t *testing.T) {
+	tests := []struct{ name, sourcePath, worktreePath string }{
+		{name: "directory-to-file", sourcePath: "kind/child", worktreePath: "kind"},
+		{name: "file-to-tree", sourcePath: "kind", worktreePath: "kind/child"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			source := t.TempDir()
+			writeApplyFile(t, source, test.sourcePath, "before", 0o644)
+			workspace := newApplyWorkspace(t, source)
+			require.NoError(t, os.RemoveAll(filepath.Join(workspace.WorkDir(), "kind")))
+			writeApplyFile(t, workspace.WorkDir(), test.worktreePath, "after", 0o644)
+
+			_, err := workspace.Apply()
+			require.NoError(t, err)
+			require.Equal(t, "after", mustReadFile(t, filepath.Join(source, filepath.FromSlash(test.worktreePath))))
+		})
+	}
+}
+
+type cleanupFailOps struct{ fileOps }
+
+func (f cleanupFailOps) RemoveAll(path string) error {
+	if filepath.Base(filepath.Dir(path)) == "transactions" || filepath.Base(path) != "transactions" {
+		return errors.New("injected cleanup failure")
+	}
+	return f.fileOps.RemoveAll(path)
+}
+
+func TestApplyReportsCommittedCleanupFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	original := applyFS
+	applyFS = cleanupFailOps{fileOps: original}
+	t.Cleanup(func() { applyFS = original })
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "cleanup committed transaction")
+	require.Equal(t, "after", mustReadFile(t, filepath.Join(source, "file")))
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+	require.NoError(t, globErr)
+	require.NotEmpty(t, matches)
 }
 
 func TestIncompleteTransactionDiscoveryDoesNotDelete(t *testing.T) {
