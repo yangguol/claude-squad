@@ -637,7 +637,7 @@ func TestStoredShadowProjectReferencesAllowsLegacyGitRecord(t *testing.T) {
 	t.Setenv("HOME", home)
 	root, err := shadowRoot()
 	require.NoError(t, err)
-	state := `{"instances":[{"title":"legacy","worktree":{"repo_path":"/repo","worktree_path":"/tree","branch_name":"branch"}}]}`
+	state := `{"instances":[{"title":"legacy","worktree":{"repo_path":"/repo","worktree_path":"/tree","session_name":"legacy","branch_name":"branch"}}]}`
 	require.NoError(t, os.WriteFile(filepath.Join(home, ".claude-squad", "state.json"), []byte(state), 0o600))
 	references, err := storedShadowProjectReferences(root)
 	require.NoError(t, err)

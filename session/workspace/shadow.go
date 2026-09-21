@@ -750,9 +750,20 @@ func storedShadowProjectReferences(root string) (map[string]bool, error) {
 		}
 		rawWorkspace, hasWorkspace := fields["workspace"]
 		if !hasWorkspace {
-			// Legacy Git records store only worktree data and remain valid.
-			if _, legacy := fields["worktree"]; !legacy {
+			// Legacy Git records store only worktree data and remain valid when
+			// they contain enough data to restore a Git workspace.
+			rawWorktree, legacy := fields["worktree"]
+			if !legacy {
 				errs = append(errs, fmt.Errorf("reject persisted workspace %q: workspace data is missing", title))
+				continue
+			}
+			var worktree GitData
+			if string(rawWorktree) == "null" || json.Unmarshal(rawWorktree, &worktree) != nil {
+				errs = append(errs, fmt.Errorf("reject persisted legacy Git worktree %q: malformed worktree data", title))
+				continue
+			}
+			if err := validateGitData(worktree); err != nil {
+				errs = append(errs, fmt.Errorf("reject persisted legacy Git worktree %q: %w", title, err))
 			}
 			continue
 		}

@@ -76,3 +76,24 @@ PASS. All repository packages passed; `session/workspace` completed in 133.342s.
 ### Remaining concern
 
 - Portable path APIs cannot eliminate every post-rename mutation race inside a directory controlled by a concurrent local actor. Quarantining the validated direct child under the same validated root removes the dangerous parent/symlink substitution window before recursive traversal; recursive removal remains best-effort and reports failures.
+
+## Fix Round 2
+
+### Changes
+
+- Legacy state detection now decodes `worktree` and applies the same required Git fields used by workspace restoration instead of accepting the key's mere presence.
+- Explicit null, empty, non-object, and incomplete legacy worktree data now fail reset preflight before storage or project cleanup; structurally valid legacy Git records remain accepted.
+- Actual reset-path regressions verify malformed legacy state bytes and shadow project directories are preserved, and valid legacy state completes reset.
+
+### TDD and verification
+
+- Red: `go test -count=1 . -run 'TestReset(RejectsMalformedLegacyWorktree|AcceptsStructurallyValidLegacyGitRecord)' -v` — malformed legacy cases reached storage deletion/project cleanup instead of failing preflight.
+- Green focused: `go test -count=1 ./session/workspace . -run 'TestCleanupShadowProjects|TestStoredShadowProjectReferences|TestReset' -v` — PASS.
+- Full: `go test -count=1 ./...` — PASS; `session/workspace` completed in 117.385s.
+- Static: `go vet ./...` — PASS with no output.
+- Diff: `git diff --check` — PASS with no output.
+
+### Concerns
+
+- Descriptor-relative platform-specific recursive deletion remains intentionally out of scope; validated same-root quarantine rename containment is retained per ruling.
+- Quoted porcelain paths remain deferred Minor per ruling.

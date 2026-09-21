@@ -90,6 +90,59 @@ func TestResetMalformedPersistedStateDoesNotClearStateOrShadowProject(t *testing
 	require.DirExists(t, project)
 }
 
+func TestResetRejectsMalformedLegacyWorktreeAndPreservesStateAndProjects(t *testing.T) {
+	tests := []struct {
+		name     string
+		worktree string
+	}{
+		{name: "null", worktree: `null`},
+		{name: "empty", worktree: `{}`},
+		{name: "wrong type", worktree: `"not-an-object"`},
+		{name: "missing required field", worktree: `{"repo_path":"/repo","worktree_path":"/tree","branch_name":"branch"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			configDir := filepath.Join(home, ".claude-squad")
+			project := filepath.Join(configDir, "shadow-projects", strings.Repeat("a", 64))
+			require.NoError(t, os.MkdirAll(project, 0o700))
+			statePath := filepath.Join(configDir, config.StateFileName)
+			persisted := []byte(`{"instances":[{"title":"legacy","worktree":` + test.worktree + `}]}`)
+			require.NoError(t, os.WriteFile(statePath, persisted, 0o600))
+			storage, err := session.NewStorage(config.LoadState())
+			require.NoError(t, err)
+
+			err = resetAll(workspace.ValidateStoredShadowReferences, storage.DeleteAllInstances,
+				func() error { return nil }, func() error { return nil }, workspace.CleanupShadowProjects, func() error { return nil })
+			require.ErrorContains(t, err, "legacy Git worktree")
+			contents, readErr := os.ReadFile(statePath)
+			require.NoError(t, readErr)
+			require.Equal(t, persisted, contents)
+			require.DirExists(t, project)
+		})
+	}
+}
+
+func TestResetAcceptsStructurallyValidLegacyGitRecord(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".claude-squad")
+	require.NoError(t, os.MkdirAll(filepath.Join(configDir, "shadow-projects"), 0o700))
+	statePath := filepath.Join(configDir, config.StateFileName)
+	persisted := []byte(`{"instances":[{"title":"legacy","worktree":{"repo_path":"/repo","worktree_path":"/tree","session_name":"legacy","branch_name":"branch"}}]}`)
+	require.NoError(t, os.WriteFile(statePath, persisted, 0o600))
+	storage, err := session.NewStorage(config.LoadState())
+	require.NoError(t, err)
+
+	err = resetAll(workspace.ValidateStoredShadowReferences, storage.DeleteAllInstances,
+		func() error { return nil }, func() error { return nil }, workspace.CleanupShadowProjects, func() error { return nil })
+	require.NoError(t, err)
+	contents, readErr := os.ReadFile(statePath)
+	require.NoError(t, readErr)
+	require.JSONEq(t, `{"instances":[],"help_screens_seen":0}`, string(contents))
+}
+
 func TestValidateWorkingDirectoryAllowsPlainDirectory(t *testing.T) {
 	require.NoError(t, validateWorkingDirectory(t.TempDir()))
 }
