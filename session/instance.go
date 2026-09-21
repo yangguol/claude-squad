@@ -4,6 +4,7 @@ import (
 	"claude-squad/log"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
+	"claude-squad/session/workspace"
 	"errors"
 	"path/filepath"
 
@@ -64,8 +65,10 @@ type Instance struct {
 	started bool
 	// tmuxSession is the tmux session for the instance.
 	tmuxSession *tmux.TmuxSession
-	// gitWorktree is the git worktree for the instance.
+	// gitWorktree is retained for instances restored from legacy storage.
 	gitWorktree *git.GitWorktree
+	// sessionWorkspace is created through the workspace factory for new instances.
+	sessionWorkspace workspace.Workspace
 }
 
 // ToInstanceData converts an Instance to its serializable form
@@ -216,21 +219,12 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 	i.tmuxSession = tmuxSession
 
 	if firstTimeSetup {
-		if i.selectedBranch != "" {
-			gitWorktree, err := git.NewGitWorktreeFromBranch(i.Path, i.selectedBranch, i.Title)
-			if err != nil {
-				return fmt.Errorf("failed to create git worktree from branch: %w", err)
-			}
-			i.gitWorktree = gitWorktree
-			i.Branch = i.selectedBranch
-		} else {
-			gitWorktree, branchName, err := git.NewGitWorktree(i.Path, i.Title)
-			if err != nil {
-				return fmt.Errorf("failed to create git worktree: %w", err)
-			}
-			i.gitWorktree = gitWorktree
-			i.Branch = branchName
+		sessionWorkspace, branchName, err := workspace.New(i.Path, i.Title, i.selectedBranch)
+		if err != nil {
+			return fmt.Errorf("failed to create workspace: %w", err)
 		}
+		i.sessionWorkspace = sessionWorkspace
+		i.Branch = branchName
 	}
 
 	// Setup error handler to cleanup resources on any error
@@ -262,16 +256,15 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 			return setupErr
 		}
 	} else {
-		// Setup git worktree first
-		if err := i.gitWorktree.Setup(); err != nil {
-			setupErr = fmt.Errorf("failed to setup git worktree: %w", err)
+		// Setup workspace first.
+		if err := i.sessionWorkspace.Setup(); err != nil {
+			setupErr = fmt.Errorf("failed to setup workspace: %w", err)
 			return setupErr
 		}
 
-		// Create new session
-		if err := i.tmuxSession.Start(i.gitWorktree.GetWorktreePath()); err != nil {
-			// Cleanup git worktree if tmux session creation fails
-			if cleanupErr := i.gitWorktree.Cleanup(); cleanupErr != nil {
+		// Create new session.
+		if err := i.tmuxSession.Start(i.sessionWorkspace.WorkDir()); err != nil {
+			if cleanupErr := i.sessionWorkspace.Cleanup(); cleanupErr != nil {
 				err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
 			}
 			setupErr = fmt.Errorf("failed to start new session: %w", err)

@@ -39,14 +39,12 @@ var (
 				return err
 			}
 
-			// Check if we're in a git repository
 			currentDir, err := filepath.Abs(".")
 			if err != nil {
 				return fmt.Errorf("failed to get current directory: %w", err)
 			}
-
-			if !git.IsGitRepo(currentDir) {
-				return fmt.Errorf("error: %s must be run from within a git repository", binName)
+			if err := validateWorkingDirectory(currentDir); err != nil {
+				return err
 			}
 
 			cfg := config.LoadConfig()
@@ -144,6 +142,17 @@ var (
 		},
 	}
 )
+
+func validateWorkingDirectory(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("failed to access working directory %q: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("working directory %q is not a directory", path)
+	}
+	return nil
+}
 
 func init() {
 	rootCmd.Flags().StringVarP(&programFlag, "program", "p", "",
