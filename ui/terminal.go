@@ -127,7 +127,7 @@ func (t *TerminalPane) ensureSessionLocked(instance *session.Instance) error {
 		return nil
 	}
 
-	worktreePath := instance.GetWorktreePath()
+	worktreePath := instance.WorkDir()
 	if worktreePath == "" {
 		return nil
 	}

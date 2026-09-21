@@ -3,6 +3,7 @@ package session
 import (
 	"claude-squad/cmd/cmd_test"
 	"claude-squad/log"
+	"claude-squad/session/git"
 	"claude-squad/session/tmux"
 	"claude-squad/session/workspace"
 	"fmt"
@@ -50,7 +51,7 @@ func TestStartPausesInstanceWhenTmuxSessionNoLongerExists(t *testing.T) {
 		},
 	}
 
-	instance, err := NewInstance(InstanceOptions{Title: "revived", Path: t.TempDir(), Program: "claude"})
+	instance, err := NewInstance(InstanceOptions{Title: "revived", Path: t.TempDir(), Program: "claude", Workspace: &fakeWorkspace{mode: workspace.ModeGit}})
 	require.NoError(t, err)
 	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps("revived", "claude", ptyFactory, cmdExec))
 
@@ -67,7 +68,7 @@ func TestStartRestoresInstanceWhenTmuxSessionSurvives(t *testing.T) {
 		RunFunc: func(cmd *exec.Cmd) error { return nil },
 	}
 
-	instance, err := NewInstance(InstanceOptions{Title: "alive", Path: t.TempDir(), Program: "claude"})
+	instance, err := NewInstance(InstanceOptions{Title: "alive", Path: t.TempDir(), Program: "claude", Workspace: &fakeWorkspace{mode: workspace.ModeGit}})
 	require.NoError(t, err)
 	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps("alive", "claude", ptyFactory, cmdExec))
 
@@ -76,33 +77,165 @@ func TestStartRestoresInstanceWhenTmuxSessionSurvives(t *testing.T) {
 	require.Equal(t, 1, ptyFactory.calls)
 }
 
+type fakeWorkspace struct {
+	mode          workspace.Mode
+	capabilities  workspace.Capabilities
+	workDir       string
+	displayName   string
+	branchName    string
+	valid         bool
+	dirty         bool
+	diff          *git.DiffStats
+	events        *[]string
+	setupErr      error
+	cleanupErr    error
+	setupCalls    int
+	cleanupCalls  int
+	commitCalls   int
+	removeCalls   int
+	pruneCalls    int
+	serializeData workspace.Data
+}
+
+func (w *fakeWorkspace) record(event string) {
+	if w.events != nil {
+		*w.events = append(*w.events, event)
+	}
+}
+func (w *fakeWorkspace) Mode() workspace.Mode                   { return w.mode }
+func (w *fakeWorkspace) Capabilities() workspace.Capabilities   { return w.capabilities }
+func (w *fakeWorkspace) WorkDir() string                        { return w.workDir }
+func (w *fakeWorkspace) DisplayName() string                    { return w.displayName }
+func (w *fakeWorkspace) BranchName() string                     { return w.branchName }
+func (w *fakeWorkspace) Setup() error                           { w.setupCalls++; w.record("setup"); return w.setupErr }
+func (w *fakeWorkspace) IsValid() (bool, error)                 { return w.valid, nil }
+func (w *fakeWorkspace) IsDirty() (bool, error)                 { return w.dirty, nil }
+func (w *fakeWorkspace) IsBranchCheckedOut() (bool, error)      { return false, nil }
+func (w *fakeWorkspace) Diff() *git.DiffStats                   { w.record("diff"); return w.diff }
+func (w *fakeWorkspace) DiffNumstat() *git.DiffStats            { return w.diff }
+func (w *fakeWorkspace) CommitChanges(string) error             { w.commitCalls++; w.record("commit"); return nil }
+func (w *fakeWorkspace) PushChanges(string, bool) error         { return nil }
+func (w *fakeWorkspace) Apply() (*workspace.ApplyResult, error) { return &workspace.ApplyResult{}, nil }
+func (w *fakeWorkspace) Remove() error                          { w.removeCalls++; w.record("remove"); return nil }
+func (w *fakeWorkspace) Prune() error                           { w.pruneCalls++; w.record("prune"); return nil }
+func (w *fakeWorkspace) Cleanup() error                         { w.cleanupCalls++; w.record("cleanup"); return w.cleanupErr }
+func (w *fakeWorkspace) Serialize() workspace.Data              { return w.serializeData }
+
+func TestInstanceWorkspaceSetupPrecedesTmuxStartAndUsesWorkDir(t *testing.T) {
+	events := []string{}
+	ws := &fakeWorkspace{mode: workspace.ModeDirectory, workDir: "/workspace-dir", branchName: "session/test", events: &events}
+	hasSessionCalls := 0
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			if strings.Contains(cmd.String(), "has-session") {
+				hasSessionCalls++
+				if hasSessionCalls == 1 {
+					return fmt.Errorf("missing")
+				}
+			}
+			return nil
+		},
+		OutputFunc: func(*exec.Cmd) ([]byte, error) { return nil, nil },
+	}
+	pty := &recordingPtyFactory{t: t, events: &events}
+	instance, err := NewInstance(InstanceOptions{Title: "workspace-start", Path: t.TempDir(), Program: "claude", Workspace: ws})
+	require.NoError(t, err)
+	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps(instance.Title, instance.Program, pty, cmdExec))
+
+	require.NoError(t, instance.Start(true))
+	require.Equal(t, []string{"setup", "tmux-start"}, events[:2])
+	require.Contains(t, pty.command, "-c /workspace-dir")
+	require.Equal(t, "session/test", instance.Branch)
+}
+
+type recordingPtyFactory struct {
+	t       *testing.T
+	events  *[]string
+	command string
+}
+
+func (p *recordingPtyFactory) Start(cmd *exec.Cmd) (*os.File, error) {
+	if p.command == "" {
+		*p.events = append(*p.events, "tmux-start")
+		p.command = cmd.String()
+	}
+	return os.OpenFile(filepath.Join(p.t.TempDir(), "pty"), os.O_CREATE|os.O_RDWR, 0o644)
+}
+func (*recordingPtyFactory) Close() {}
+
+func TestStartCleansWorkspaceWhenTmuxStartFailsBeforeStarted(t *testing.T) {
+	ws := &fakeWorkspace{mode: workspace.ModeDirectory, workDir: t.TempDir()}
+	instance, err := NewInstance(InstanceOptions{Title: "failed-start", Path: t.TempDir(), Program: "claude", Workspace: ws})
+	require.NoError(t, err)
+	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps(instance.Title, instance.Program, &failingPtyFactory{}, cmd_test.MockCmdExec{
+		RunFunc:    func(*exec.Cmd) error { return fmt.Errorf("missing") },
+		OutputFunc: func(*exec.Cmd) ([]byte, error) { return nil, nil },
+	}))
+
+	require.Error(t, instance.Start(true))
+	require.False(t, instance.Started())
+	require.Equal(t, 1, ws.cleanupCalls)
+}
+
+type failingPtyFactory struct{}
+
+func (*failingPtyFactory) Start(*exec.Cmd) (*os.File, error) { return nil, fmt.Errorf("pty failed") }
+func (*failingPtyFactory) Close()                            {}
+
+func TestInstanceWorkspacePauseResumeKillAndDiffDelegate(t *testing.T) {
+	ws := &fakeWorkspace{mode: workspace.ModeGit, workDir: filepath.Join(t.TempDir(), "missing"), branchName: "branch", valid: true, dirty: true, diff: &git.DiffStats{Added: 2}}
+	instance, err := NewInstance(InstanceOptions{Title: "lifecycle", Path: t.TempDir(), Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Running
+	instance.tmuxSession = tmux.NewTmuxSessionWithDeps(instance.Title, "", &nullPtyFactory{t: t}, cmd_test.MockCmdExec{
+		RunFunc:    func(*exec.Cmd) error { return fmt.Errorf("missing") },
+		OutputFunc: func(*exec.Cmd) ([]byte, error) { return nil, nil },
+	})
+
+	require.Same(t, ws.diff, instance.ComputeDiff())
+	require.NoError(t, instance.Pause())
+	require.Equal(t, 1, ws.commitCalls)
+	require.Equal(t, 1, ws.removeCalls)
+	require.Equal(t, 1, ws.pruneCalls)
+
+	ws.valid = false
+	require.Error(t, instance.Resume()) // tmux start fails after setup
+	require.Equal(t, 1, ws.setupCalls)
+	require.Equal(t, 1, ws.cleanupCalls)
+
+	instance.Status = Running
+	require.Error(t, instance.Kill()) // tmux close fails, workspace still cleaned
+	require.Equal(t, 2, ws.cleanupCalls)
+}
+
 func TestFactoryCreatedGitInstanceRepoNameAndDisplay(t *testing.T) {
 	instance, repo := startFactoryGitInstance(t, "factory-display")
 
 	repoName, err := instance.RepoName()
 	require.NoError(t, err)
 	require.Equal(t, filepath.Base(repo), repoName)
-	require.Equal(t, filepath.Base(repo), instance.sessionWorkspace.DisplayName())
-	require.NotNil(t, instance.gitWorktree)
-	require.Equal(t, instance.sessionWorkspace.WorkDir(), instance.GetWorktreePath())
+	require.Equal(t, filepath.Base(repo), instance.workspace.DisplayName())
+	require.Equal(t, workspace.ModeGit, instance.WorkspaceMode())
+	require.Equal(t, instance.workspace.WorkDir(), instance.WorkDir())
 }
 
 func TestFactoryCreatedGitInstanceSerialization(t *testing.T) {
 	instance, _ := startFactoryGitInstance(t, "factory-serialization")
 
 	data := instance.ToInstanceData()
-	serialized := instance.sessionWorkspace.Serialize().Git
+	serialized := instance.workspace.Serialize().Git
 	require.NotNil(t, serialized)
-	require.Equal(t, serialized.RepoPath, data.Worktree.RepoPath)
-	require.Equal(t, serialized.WorktreePath, data.Worktree.WorktreePath)
-	require.Equal(t, serialized.BranchName, data.Worktree.BranchName)
-	require.Equal(t, serialized.BaseCommitSHA, data.Worktree.BaseCommitSHA)
+	require.Equal(t, workspace.CurrentVersion, data.Workspace.Version)
+	require.Equal(t, workspace.ModeGit, data.Workspace.Mode)
+	require.Equal(t, serialized, data.Workspace.Git)
+	require.Nil(t, data.Worktree)
 }
 
 func TestFactoryCreatedGitInstanceComputeDiff(t *testing.T) {
 	instance, _ := startFactoryGitInstance(t, "factory-diff")
 
-	require.NoError(t, os.WriteFile(filepath.Join(instance.GetWorktreePath(), "change.txt"), []byte("change\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(instance.WorkDir(), "change.txt"), []byte("change\n"), 0o644))
 	diff := instance.ComputeDiff()
 	require.NoError(t, diff.Error)
 	require.Contains(t, diff.Content, "change.txt")
@@ -110,7 +243,7 @@ func TestFactoryCreatedGitInstanceComputeDiff(t *testing.T) {
 
 func TestFactoryCreatedGitInstancePause(t *testing.T) {
 	instance, _ := startFactoryGitInstance(t, "factory-pause")
-	worktreePath := instance.GetWorktreePath()
+	worktreePath := instance.WorkDir()
 
 	require.NoError(t, instance.Pause())
 	require.Equal(t, Paused, instance.Status)
@@ -119,9 +252,9 @@ func TestFactoryCreatedGitInstancePause(t *testing.T) {
 
 func TestFactoryCreatedGitInstanceKillCleansWorkspaceExactlyOnce(t *testing.T) {
 	instance, _ := startFactoryGitInstance(t, "factory-cleanup")
-	counter := &cleanupCountingWorkspace{Workspace: instance.sessionWorkspace}
-	instance.sessionWorkspace = counter
-	worktreePath := instance.GetWorktreePath()
+	counter := &cleanupCountingWorkspace{Workspace: instance.workspace}
+	instance.workspace = counter
+	worktreePath := instance.WorkDir()
 
 	require.NoError(t, instance.Kill())
 	require.Equal(t, 1, counter.cleanupCalls)
@@ -161,7 +294,7 @@ func startFactoryGitInstance(t *testing.T, title string) (*Instance, string) {
 	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps(title, "claude", ptyFactory, cmdExec))
 	require.NoError(t, instance.Start(true))
 	t.Cleanup(func() {
-		if _, err := os.Stat(instance.GetWorktreePath()); err == nil {
+		if _, err := os.Stat(instance.WorkDir()); err == nil {
 			_ = instance.Kill()
 		}
 	})

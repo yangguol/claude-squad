@@ -10,16 +10,6 @@ type gitWorkspace struct {
 	worktree *git.GitWorktree
 }
 
-// GitWorktree returns the concrete worktree behind a Git workspace. It is a
-// transitional bridge for session lifecycle code pending full Workspace migration.
-func GitWorktree(ws Workspace) (*git.GitWorktree, bool) {
-	gitWS, ok := ws.(*gitWorkspace)
-	if !ok {
-		return nil, false
-	}
-	return gitWS.worktree, true
-}
-
 func NewGit(path, sessionName, branch string) (Workspace, string, error) {
 	if branch == "" {
 		worktree, branchName, err := git.NewGitWorktree(path, sessionName)
