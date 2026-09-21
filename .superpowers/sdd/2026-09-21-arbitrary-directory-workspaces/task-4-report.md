@@ -107,4 +107,4 @@ ok  	claude-squad/ui	9.227s
 
 ## Commit
 
-Pending at report creation; updated after commit in the final task response.
+`33c0c2d feat: create shadow git workspaces`
