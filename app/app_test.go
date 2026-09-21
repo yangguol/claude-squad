@@ -440,6 +440,9 @@ type appTestWorkspace struct {
 	mode         workspace.Mode
 	capabilities workspace.Capabilities
 	displayName  string
+	applyResult  *workspace.ApplyResult
+	applyErr     error
+	applyCalls   int
 }
 
 func (w *appTestWorkspace) Mode() workspace.Mode                 { return w.mode }
@@ -456,7 +459,11 @@ func (w *appTestWorkspace) DiffNumstat() *git.DiffStats          { return &git.D
 func (w *appTestWorkspace) CommitChanges(string) error           { return nil }
 func (w *appTestWorkspace) PushChanges(string, bool) error       { return nil }
 func (w *appTestWorkspace) Apply() (*workspace.ApplyResult, error) {
-	return &workspace.ApplyResult{}, nil
+	w.applyCalls++
+	if w.applyResult == nil && w.applyErr == nil {
+		return &workspace.ApplyResult{}, nil
+	}
+	return w.applyResult, w.applyErr
 }
 func (w *appTestWorkspace) Remove() error             { return nil }
 func (w *appTestWorkspace) Prune() error              { return nil }
@@ -464,10 +471,16 @@ func (w *appTestWorkspace) Cleanup() error            { return nil }
 func (w *appTestWorkspace) Serialize() workspace.Data { return workspace.Data{Mode: w.mode} }
 
 func newDirectoryHome(t *testing.T) (*home, *session.Instance) {
+	h, instance, _ := newDirectoryHomeWithWorkspace(t)
+	return h, instance
+}
+
+func newDirectoryHomeWithWorkspace(t *testing.T) (*home, *session.Instance, *appTestWorkspace) {
 	t.Helper()
+	backend := &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: true}, displayName: "source-project"}
 	instance, err := session.NewInstance(session.InstanceOptions{
 		Title: "directory-session", Path: t.TempDir(), Program: "echo",
-		Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: true}, displayName: "source-project"},
+		Workspace: backend,
 	})
 	require.NoError(t, err)
 	instance.SetStatus(session.Ready)
@@ -481,7 +494,7 @@ func newDirectoryHome(t *testing.T) (*home, *session.Instance) {
 		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
 		errBox:       ui.NewErrBox(),
 	}
-	return h, instance
+	return h, instance, backend
 }
 
 func TestDirectoryPromptSkipsBranchPickerAndSearch(t *testing.T) {
@@ -514,10 +527,12 @@ func TestDirectoryApplyConfirmationAndResultMessages(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			h, instance := newDirectoryHome(t)
-			h.applyAndPause = func(got *session.Instance) (*workspace.ApplyResult, error) {
+			h.applyInstance = func(got *session.Instance) (*workspace.ApplyResult, error) {
 				require.Same(t, instance, got)
 				return tc.result, tc.err
 			}
+			h.saveInstances = func([]*session.Instance) error { return nil }
+			h.pauseInstance = func(*session.Instance) (bool, error) { return true, nil }
 
 			_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
 			require.Nil(t, cmd)
@@ -534,7 +549,9 @@ func TestDirectoryApplyConfirmationAndResultMessages(t *testing.T) {
 			require.Equal(t, tc.err, msg.err)
 
 			_, followup := h.Update(msg)
-			require.Nil(t, followup)
+			for followup != nil {
+				_, followup = h.Update(followup())
+			}
 			require.Equal(t, stateHelp, h.state)
 			require.NotNil(t, h.textOverlay)
 			overlayText := h.textOverlay.Render()
@@ -542,7 +559,7 @@ func TestDirectoryApplyConfirmationAndResultMessages(t *testing.T) {
 			case "success":
 				require.Contains(t, overlayText, "Applied 1 changed path(s)")
 			case "no-op":
-				require.Contains(t, overlayText, "No changes to apply")
+				require.Contains(t, overlayText, "source is up to date")
 			case "conflict":
 				require.Contains(t, overlayText, "Apply Conflict")
 				require.Contains(t, overlayText, "a.txt")
@@ -572,6 +589,257 @@ func TestDirectoryHelpIncludesIsolationCaveat(t *testing.T) {
 	require.Contains(t, content, "Apply changes")
 	require.NotContains(t, content, "push branch")
 	require.True(t, strings.Contains(content, "Shared dependency directories") && strings.Contains(content, "not isolated"))
+}
+
+func TestGeneralHelpDerivesPushAndApplyIndependently(t *testing.T) {
+	makeInstance := func(capabilities workspace.Capabilities) *session.Instance {
+		instance, err := session.NewInstance(session.InstanceOptions{
+			Title: "capabilities", Path: t.TempDir(), Program: "echo",
+			Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: capabilities, displayName: "source"},
+		})
+		require.NoError(t, err)
+		return instance
+	}
+
+	tests := []struct {
+		name      string
+		instance  *session.Instance
+		wantPush  bool
+		wantApply bool
+		wantGitC  bool
+	}{
+		{name: "nil selection"},
+		{name: "push only", instance: makeInstance(workspace.Capabilities{Push: true}), wantPush: true},
+		{name: "apply only", instance: makeInstance(workspace.Capabilities{Apply: true}), wantApply: true},
+		{name: "both", instance: makeInstance(workspace.Capabilities{Push: true, Apply: true}), wantPush: true, wantApply: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			content := helpTypeGeneral{instance: tc.instance}.toContent()
+			require.Equal(t, tc.wantPush, strings.Contains(content, "push branch"))
+			require.Equal(t, tc.wantApply, strings.Contains(content, "Apply changes"))
+			require.Equal(t, tc.wantGitC, strings.Contains(content, "Checkout: commit"))
+		})
+	}
+}
+
+func runApplyFlow(t *testing.T, h *home, result *workspace.ApplyResult, applyErr error) []string {
+	t.Helper()
+	events := []string{}
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		events = append(events, "apply")
+		return result, applyErr
+	}
+	h.saveInstances = func([]*session.Instance) error {
+		events = append(events, "save")
+		return nil
+	}
+	h.pauseInstance = func(*session.Instance) (bool, error) {
+		events = append(events, "pause")
+		return true, nil
+	}
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.NotNil(t, cmd)
+	msg := cmd()
+	for {
+		_, cmd = h.Update(msg)
+		if cmd == nil {
+			break
+		}
+		msg = cmd()
+	}
+	return events
+}
+
+func TestApplyFlowUsesWorkspaceApplyBackend(t *testing.T) {
+	h, _, backend := newDirectoryHomeWithWorkspace(t)
+	backend.applyResult = &workspace.ApplyResult{Changed: []string{"real.txt"}}
+	h.saveInstances = func([]*session.Instance) error { return nil }
+	h.pauseInstance = func(*session.Instance) (bool, error) { return true, nil }
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	msg := cmd()
+	for cmd != nil {
+		_, cmd = h.Update(msg)
+		if cmd != nil {
+			msg = cmd()
+		}
+	}
+	require.Equal(t, 1, backend.applyCalls)
+	require.Contains(t, h.textOverlay.Render(), "Applied 1 changed path")
+}
+
+func TestApplyFlowPersistsBeforeAndAfterPause(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	events := runApplyFlow(t, h, &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil)
+	require.Equal(t, []string{"apply", "save", "pause", "save"}, events)
+	require.Equal(t, session.Paused, instance.Status)
+	require.Contains(t, h.textOverlay.Render(), "Applied 1 changed path")
+	require.Contains(t, h.textOverlay.Render(), "Session paused")
+}
+
+func TestApplySaveFailurePreservesRunningSession(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	events := []string{}
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		events = append(events, "apply")
+		return &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil
+	}
+	h.saveInstances = func([]*session.Instance) error {
+		events = append(events, "save")
+		return fmt.Errorf("save unavailable")
+	}
+	h.pauseInstance = func(*session.Instance) (bool, error) {
+		events = append(events, "pause")
+		return true, nil
+	}
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	_, cmd = h.Update(cmd())
+	require.Nil(t, cmd)
+	require.Equal(t, []string{"apply", "save"}, events)
+	require.Equal(t, session.Ready, instance.Status)
+	overlay := h.textOverlay.Render()
+	require.Contains(t, overlay, "Apply Complete")
+	require.Contains(t, overlay, "Persistence failed")
+	require.Contains(t, overlay, "was not paused")
+}
+
+func TestApplyPauseFailureReportsAppliedSourceAndPersists(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	events := []string{}
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		events = append(events, "apply")
+		return &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil
+	}
+	h.saveInstances = func([]*session.Instance) error {
+		events = append(events, "save")
+		return nil
+	}
+	h.pauseInstance = func(*session.Instance) (bool, error) {
+		events = append(events, "pause")
+		return false, fmt.Errorf("tmux detach failed")
+	}
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	msg := cmd()
+	for cmd != nil {
+		_, cmd = h.Update(msg)
+		if cmd != nil {
+			msg = cmd()
+		}
+	}
+	require.Equal(t, []string{"apply", "save", "pause", "save"}, events)
+	require.Equal(t, session.Ready, instance.Status)
+	overlay := h.textOverlay.Render()
+	require.Contains(t, overlay, "Apply Complete")
+	require.Contains(t, overlay, "Pause cleanup failed")
+	require.NotContains(t, overlay, "Apply Failed")
+}
+
+func TestApplyCommandDoesNotMutateModelAndStaleSelectionIsSafe(t *testing.T) {
+	h, target := newDirectoryHome(t)
+	other, err := session.NewInstance(session.InstanceOptions{
+		Title: "other", Path: t.TempDir(), Program: "echo",
+		Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: true}, displayName: "other-source"},
+	})
+	require.NoError(t, err)
+	other.SetStatus(session.Ready)
+	h.list.AddInstance(other)()
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		return &workspace.ApplyResult{Changed: []string{"a.txt"}}, nil
+	}
+	h.saveInstances = func([]*session.Instance) error { return nil }
+	h.pauseInstance = func(*session.Instance) (bool, error) { return true, nil }
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	h.list.SetSelectedInstance(1)
+	msg := cmd()
+	require.Equal(t, session.Ready, target.Status, "background command must not mutate model status")
+	require.Same(t, other, h.list.GetSelectedInstance())
+	for cmd != nil {
+		_, cmd = h.Update(msg)
+		if cmd != nil {
+			msg = cmd()
+		}
+	}
+	require.Equal(t, session.Paused, target.Status)
+	require.Equal(t, session.Ready, other.Status)
+	require.Same(t, other, h.list.GetSelectedInstance())
+}
+
+func TestKillCommandDoesNotDeleteNewSelectionAndSuppressesDuplicate(t *testing.T) {
+	h, target := newDirectoryHome(t)
+	other, err := session.NewInstance(session.InstanceOptions{
+		Title: "other", Path: t.TempDir(), Program: "echo",
+		Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: true}, displayName: "other-source"},
+	})
+	require.NoError(t, err)
+	other.SetStatus(session.Ready)
+	h.list.AddInstance(other)()
+	killCalls := 0
+	deleteCalls := 0
+	h.killInstance = func(got *session.Instance) error {
+		require.Same(t, target, got)
+		killCalls++
+		return nil
+	}
+	h.deleteInstance = func(title string) error {
+		require.Equal(t, target.Title, title)
+		deleteCalls++
+		return nil
+	}
+
+	h.keySent = true
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.True(t, h.actionPending(target))
+	h.keySent = true
+	_, duplicate := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
+	require.Nil(t, duplicate)
+	require.Equal(t, stateDefault, h.state, "duplicate kill must not open another confirmation")
+	h.list.SetSelectedInstance(1)
+
+	msg := cmd()
+	require.Equal(t, 2, h.list.NumInstances(), "command must not mutate the list")
+	_, _ = h.Update(msg)
+	require.Equal(t, 1, killCalls)
+	require.Equal(t, 1, deleteCalls)
+	require.False(t, h.list.ContainsInstance(target))
+	require.True(t, h.list.ContainsInstance(other))
+	require.Same(t, other, h.list.GetSelectedInstance())
+}
+
+func TestApplyDuplicateSuppressedUntilFlowCompletes(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	calls := 0
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		calls++
+		return &workspace.ApplyResult{}, nil
+	}
+	h.saveInstances = func([]*session.Instance) error { return nil }
+	h.pauseInstance = func(*session.Instance) (bool, error) { return true, nil }
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, first := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.True(t, h.actionPending(instance))
+	h.keySent = true
+	_, duplicate := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	require.Nil(t, duplicate)
+	require.Equal(t, 0, calls)
+
+	msg := first()
+	for first != nil {
+		_, first = h.Update(msg)
+		if first != nil {
+			msg = first()
+		}
+	}
+	require.Equal(t, 1, calls)
+	require.False(t, h.actionPending(instance))
 }
 
 // TestConfirmationModalVisualAppearance tests that confirmation modal has distinct visual appearance

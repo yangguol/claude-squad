@@ -53,17 +53,20 @@ func (h helpTypeGeneral) toContent() string {
 		"",
 		headerStyle.Render("Handoff:"),
 	}
-	if h.instance != nil && h.instance.Capabilities().Apply {
-		lines = append(lines,
-			keyStyle.Render("c")+descStyle.Render("         - Apply changes to the source directory and pause"),
-			keyStyle.Render("r")+descStyle.Render("         - Resume a paused session"),
-			"",
-			descStyle.Render("Shared dependency directories are linked to the source and are not isolated between sessions."))
-	} else {
-		lines = append(lines,
-			keyStyle.Render("p")+descStyle.Render("         - Commit and push branch to github"),
-			keyStyle.Render("c")+descStyle.Render("         - Checkout: commit changes and pause session"),
-			keyStyle.Render("r")+descStyle.Render("         - Resume a paused session"))
+	if h.instance != nil {
+		capabilities := h.instance.Capabilities()
+		if capabilities.Push {
+			lines = append(lines, keyStyle.Render("p")+descStyle.Render("         - Commit and push branch to github"))
+		}
+		if capabilities.Apply {
+			lines = append(lines, keyStyle.Render("c")+descStyle.Render("         - Apply changes to the source directory and pause"))
+		} else if h.instance.WorkspaceMode() == workspace.ModeGit {
+			lines = append(lines, keyStyle.Render("c")+descStyle.Render("         - Checkout: commit changes and pause session"))
+		}
+		lines = append(lines, keyStyle.Render("r")+descStyle.Render("         - Resume a paused session"))
+		if capabilities.Apply {
+			lines = append(lines, "", descStyle.Render("Shared dependency directories are linked to the source and are not isolated between sessions."))
+		}
 	}
 	lines = append(lines,
 		"",
@@ -76,17 +79,21 @@ func (h helpTypeGeneral) toContent() string {
 
 func (h helpTypeInstanceStart) toContent() string {
 	workspaceDescription := fmt.Sprintf("• Git branch: %s (isolated worktree)", lipgloss.NewStyle().Bold(true).Render(h.instance.Branch))
-	handoff := []string{
-		keyStyle.Render("c") + descStyle.Render("     - Checkout this instance's branch"),
-		keyStyle.Render("p") + descStyle.Render("     - Push branch to GitHub to create a PR"),
-	}
 	if h.instance.WorkspaceMode() == workspace.ModeDirectory {
 		workspaceDescription = fmt.Sprintf("• Directory (isolated): %s", lipgloss.NewStyle().Bold(true).Render(h.instance.DisplayWorkspace()))
-		handoff = []string{
-			keyStyle.Render("c") + descStyle.Render("     - Apply changes to the source directory and pause"),
+	}
+	capabilities := h.instance.Capabilities()
+	handoff := []string{}
+	if capabilities.Push {
+		handoff = append(handoff, keyStyle.Render("p")+descStyle.Render("     - Push branch to GitHub to create a PR"))
+	}
+	if capabilities.Apply {
+		handoff = append(handoff,
+			keyStyle.Render("c")+descStyle.Render("     - Apply changes to the source directory and pause"),
 			"",
-			descStyle.Render("Shared dependency directories are linked to the source and are not isolated between sessions."),
-		}
+			descStyle.Render("Shared dependency directories are linked to the source and are not isolated between sessions."))
+	} else if h.instance.WorkspaceMode() == workspace.ModeGit {
+		handoff = append(handoff, keyStyle.Render("c")+descStyle.Render("     - Checkout this instance's branch"))
 	}
 	lines := []string{
 		titleStyle.Render("Instance Created"), "",

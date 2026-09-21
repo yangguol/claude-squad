@@ -38,6 +38,13 @@ func Run(ctx context.Context, program string, autoYes bool) error {
 
 type state int
 
+type actionKind string
+
+const (
+	actionApply actionKind = "apply"
+	actionKill  actionKind = "kill"
+)
+
 const (
 	stateDefault state = iota
 	// stateNew is the state when the user is creating a new instance.
@@ -107,8 +114,14 @@ type home struct {
 	confirmationOverlay *overlay.ConfirmationOverlay
 	// confirmedAction is queued by a confirmation callback and returned by handleKeyPress.
 	confirmedAction tea.Cmd
-	// applyAndPause performs the directory handoff; replaceable in focused tests.
-	applyAndPause func(*session.Instance) (*workspace.ApplyResult, error)
+	// pendingActions prevents concurrent destructive operations against one instance.
+	pendingActions map[*session.Instance]actionKind
+	// Backend hooks are replaceable by tests. They must not mutate home, list, UI, or storage.
+	applyInstance  func(*session.Instance) (*workspace.ApplyResult, error)
+	pauseInstance  func(*session.Instance) (bool, error)
+	killInstance   func(*session.Instance) error
+	saveInstances  func([]*session.Instance) error
+	deleteInstance func(string) error
 }
 
 func newHome(ctx context.Context, program string, autoYes bool) *home {
@@ -316,9 +329,28 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instanceChangedMsg:
 		// Handle instance changed after confirmation action
 		return m, m.instanceChanged()
+	case killResultMsg:
+		m.finishAction(msg.instance, actionKill)
+		if msg.err != nil {
+			return m, m.handleError(msg.err)
+		}
+		if !m.list.ContainsInstance(msg.instance) {
+			return m, nil
+		}
+		deleteInstance := m.deleteInstance
+		if deleteInstance == nil {
+			deleteInstance = m.storage.DeleteInstance
+		}
+		if err := deleteInstance(msg.instance.Title); err != nil {
+			return m, m.handleError(fmt.Errorf("session stopped but persisted entry could not be deleted: %w", err))
+		}
+		m.tabbedWindow.CleanupTerminalForInstance(msg.instance.Title)
+		m.list.RemoveInstance(msg.instance)
+		return m, m.instanceChanged()
 	case applyResultMsg:
-		m.showApplyResult(msg)
-		return m, nil
+		return m, m.handleApplyResult(msg)
+	case applyPausedMsg:
+		return m, m.handleApplyPaused(msg)
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -709,37 +741,27 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, m.instanceChanged()
 	case keys.KeyKill:
 		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Status == session.Loading {
+		if selected == nil || selected.Status == session.Loading || m.actionPending(selected) {
 			return m, nil
 		}
 
-		// Create the kill action as a tea.Cmd
+		killInstance := m.killInstance
+		if killInstance == nil {
+			killInstance = (*session.Instance).Kill
+		}
 		killAction := func() tea.Msg {
 			checkedOut, err := selected.IsBranchCheckedOut()
 			if err != nil {
-				return err
+				return killResultMsg{instance: selected, err: err}
 			}
-
 			if checkedOut {
-				return fmt.Errorf("instance %s is currently checked out", selected.Title)
+				return killResultMsg{instance: selected, err: fmt.Errorf("instance %s is currently checked out", selected.Title)}
 			}
-
-			// Clean up terminal session for this instance
-			m.tabbedWindow.CleanupTerminalForInstance(selected.Title)
-
-			// Delete from storage first
-			if err := m.storage.DeleteInstance(selected.Title); err != nil {
-				return err
-			}
-
-			// Then kill the instance
-			m.list.Kill()
-			return instanceChangedMsg{}
+			return killResultMsg{instance: selected, err: killInstance(selected)}
 		}
 
-		// Show confirmation modal
 		message := fmt.Sprintf("[!] Kill session '%s'?", selected.Title)
-		return m, m.confirmAction(message, killAction)
+		return m, m.confirmTargetAction(message, selected, actionKill, killAction)
 	case keys.KeySubmit:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading || !selected.Capabilities().Push {
@@ -766,35 +788,19 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 
 		if selected.Capabilities().Apply {
-			if selected.Paused() {
+			if selected.Paused() || m.actionPending(selected) {
 				return m, nil
 			}
+			apply := m.applyInstance
+			if apply == nil {
+				apply = (*session.Instance).Apply
+			}
 			applyAction := func() tea.Msg {
-				var result *workspace.ApplyResult
-				var err error
-				if m.applyAndPause != nil {
-					result, err = m.applyAndPause(selected)
-				} else {
-					result, err = selected.Apply()
-					if err == nil {
-						if pauseErr := selected.Pause(); pauseErr != nil {
-							err = fmt.Errorf("changes applied but failed to pause session: %w", pauseErr)
-						}
-					}
-				}
-				if err != nil {
-					return applyResultMsg{instance: selected, result: result, err: err}
-				}
-				m.tabbedWindow.CleanupTerminalForInstance(selected.Title)
-				if m.storage != nil {
-					if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
-						return applyResultMsg{instance: selected, result: result, err: fmt.Errorf("changes applied and session paused but state could not be saved: %w", err)}
-					}
-				}
-				return applyResultMsg{instance: selected, result: result}
+				result, err := apply(selected)
+				return applyResultMsg{instance: selected, result: result, err: err}
 			}
 			message := fmt.Sprintf("Apply changes from session '%s' to '%s'?", selected.Title, selected.DisplayWorkspace())
-			return m, m.confirmAction(message, applyAction)
+			return m, m.confirmTargetAction(message, selected, actionApply, applyAction)
 		}
 
 		// Git mode keeps the existing checkout/pause help flow.
@@ -913,10 +919,31 @@ type previewTickMsg struct{}
 
 type instanceChangedMsg struct{}
 
+type killResultMsg struct {
+	instance *session.Instance
+	err      error
+}
+
 type applyResultMsg struct {
 	instance *session.Instance
 	result   *workspace.ApplyResult
 	err      error
+}
+
+type applyPausedMsg struct {
+	instance *session.Instance
+	result   *workspace.ApplyResult
+	paused   bool
+	pauseErr error
+}
+
+type applyFinalMsg struct {
+	instance *session.Instance
+	result   *workspace.ApplyResult
+	paused   bool
+	applyErr error
+	pauseErr error
+	saveErr  error
 }
 
 type instanceStartedMsg struct {
@@ -1081,29 +1108,116 @@ func (m *home) cancelPromptOverlay() tea.Cmd {
 	)
 }
 
-func (m *home) showApplyResult(msg applyResultMsg) {
-	var content string
+func (m *home) handleApplyResult(msg applyResultMsg) tea.Cmd {
+	if !m.list.ContainsInstance(msg.instance) {
+		m.finishAction(msg.instance, actionApply)
+		return nil
+	}
 	if msg.err != nil {
+		m.finishAction(msg.instance, actionApply)
+		m.showApplyResult(applyFinalMsg{instance: msg.instance, result: msg.result, applyErr: msg.err})
+		return nil
+	}
+	if err := m.saveCurrentInstances(); err != nil {
+		m.finishAction(msg.instance, actionApply)
+		m.showApplyResult(applyFinalMsg{instance: msg.instance, result: msg.result, saveErr: err})
+		return nil
+	}
+	pause := m.pauseInstance
+	if pause == nil {
+		pause = (*session.Instance).PreparePause
+	}
+	return func() tea.Msg {
+		paused, err := pause(msg.instance)
+		return applyPausedMsg{instance: msg.instance, result: msg.result, paused: paused, pauseErr: err}
+	}
+}
+
+func (m *home) handleApplyPaused(msg applyPausedMsg) tea.Cmd {
+	if msg.paused {
+		msg.instance.SetStatus(session.Paused)
+	}
+	saveErr := m.saveCurrentInstances()
+	m.finishAction(msg.instance, actionApply)
+	m.showApplyResult(applyFinalMsg{instance: msg.instance, result: msg.result, paused: msg.paused, pauseErr: msg.pauseErr, saveErr: saveErr})
+	return m.instanceChanged()
+}
+
+func (m *home) saveCurrentInstances() error {
+	if m.saveInstances != nil {
+		return m.saveInstances(m.list.GetInstances())
+	}
+	if m.storage != nil {
+		return m.storage.SaveInstances(m.list.GetInstances())
+	}
+	return nil
+}
+
+func (m *home) showApplyResult(msg applyFinalMsg) {
+	var content string
+	if msg.applyErr != nil {
 		var conflict *workspace.ConflictError
-		if errors.As(msg.err, &conflict) {
+		if errors.As(msg.applyErr, &conflict) {
 			content = lipgloss.JoinVertical(lipgloss.Left,
 				titleStyle.Render("Apply Conflict"), "",
 				"The source was not changed. Resolve these paths and retry:",
 				strings.Join(conflict.Paths, "\n"))
 		} else {
 			content = lipgloss.JoinVertical(lipgloss.Left,
-				titleStyle.Render("Apply Failed"), "", msg.err.Error())
+				titleStyle.Render("Apply Failed"), "", msg.applyErr.Error())
 		}
-	} else if msg.result == nil || len(msg.result.Changed) == 0 {
-		content = lipgloss.JoinVertical(lipgloss.Left,
-			titleStyle.Render("Apply Complete"), "", "No changes to apply. Session paused.")
 	} else {
-		content = lipgloss.JoinVertical(lipgloss.Left,
-			titleStyle.Render("Apply Complete"), "",
-			fmt.Sprintf("Applied %d changed path(s) to %s. Session paused.", len(msg.result.Changed), msg.instance.DisplayWorkspace()))
+		summary := "No changes needed; source is up to date."
+		if msg.result != nil && len(msg.result.Changed) > 0 {
+			summary = fmt.Sprintf("Applied %d changed path(s) to %s.", len(msg.result.Changed), msg.instance.DisplayWorkspace())
+		}
+		status := "Session paused."
+		if !msg.paused {
+			status = "Session was not paused and remains recoverable."
+		}
+		lines := []string{titleStyle.Render("Apply Complete"), "", summary, status}
+		if msg.saveErr != nil {
+			lines = append(lines, "", fmt.Sprintf("Persistence failed: %v", msg.saveErr))
+		}
+		if msg.pauseErr != nil {
+			lines = append(lines, "", fmt.Sprintf("Pause cleanup failed: %v", msg.pauseErr))
+		}
+		content = lipgloss.JoinVertical(lipgloss.Left, lines...)
 	}
 	m.textOverlay = overlay.NewTextOverlay(content)
 	m.state = stateHelp
+}
+
+func (m *home) actionPending(instance *session.Instance) bool {
+	_, ok := m.pendingActions[instance]
+	return ok
+}
+
+func (m *home) finishAction(instance *session.Instance, kind actionKind) {
+	if m.pendingActions[instance] == kind {
+		delete(m.pendingActions, instance)
+	}
+}
+
+func (m *home) confirmTargetAction(message string, instance *session.Instance, kind actionKind, action tea.Cmd) tea.Cmd {
+	wrapped := func() tea.Msg {
+		return action()
+	}
+	m.confirmAction(message, wrapped)
+	originalConfirm := m.confirmationOverlay.OnConfirm
+	m.confirmationOverlay.OnConfirm = func() {
+		if m.pendingActions == nil {
+			m.pendingActions = make(map[*session.Instance]actionKind)
+		}
+		if m.actionPending(instance) || !m.list.ContainsInstance(instance) {
+			m.confirmedAction = nil
+			m.state = stateDefault
+			return
+		}
+		m.pendingActions[instance] = kind
+		originalConfirm()
+	}
+	return nil
 }
 
 // confirmAction shows a confirmation modal and queues the action for Bubble Tea

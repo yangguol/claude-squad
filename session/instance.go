@@ -464,13 +464,23 @@ func (i *Instance) TmuxAlive() bool {
 	return i.tmuxSession.DoesSessionExist()
 }
 
-// Pause stops the tmux session and removes the worktree, preserving the branch
+// Pause stops the tmux session and removes the worktree, preserving the branch.
 func (i *Instance) Pause() error {
+	paused, err := i.PreparePause()
+	if paused {
+		i.SetStatus(Paused)
+	}
+	return err
+}
+
+// PreparePause performs pause backend work without changing model status. The
+// caller must apply Paused synchronously when paused is true.
+func (i *Instance) PreparePause() (paused bool, err error) {
 	if !i.started {
-		return fmt.Errorf("cannot pause instance that has not been started")
+		return false, fmt.Errorf("cannot pause instance that has not been started")
 	}
 	if i.Status == Paused {
-		return fmt.Errorf("instance is already paused")
+		return false, fmt.Errorf("instance is already paused")
 	}
 
 	var errs []error
@@ -481,7 +491,7 @@ func (i *Instance) Pause() error {
 	if valid, err := i.workspace.IsValid(); err != nil {
 		validationErr := fmt.Errorf("failed to validate workspace: %w", err)
 		log.ErrorLog.Print(validationErr)
-		return validationErr
+		return false, validationErr
 	} else if !valid {
 		log.WarningLog.Printf("worktree at %s is orphaned; skipping dirty check and remove",
 			i.workspace.WorkDir())
@@ -493,9 +503,8 @@ func (i *Instance) Pause() error {
 			errs = append(errs, fmt.Errorf("failed to prune git worktrees: %w", err))
 			log.ErrorLog.Print(err)
 		}
-		i.SetStatus(Paused)
 		_ = clipboard.WriteAll(i.workspace.BranchName())
-		return i.combineErrors(errs)
+		return true, i.combineErrors(errs)
 	}
 
 	// Check if there are any changes to commit
@@ -509,7 +518,7 @@ func (i *Instance) Pause() error {
 			errs = append(errs, fmt.Errorf("failed to commit changes: %w", err))
 			log.ErrorLog.Print(err)
 			// Return early if we can't commit changes to avoid corrupted state
-			return i.combineErrors(errs)
+			return false, i.combineErrors(errs)
 		}
 	}
 
@@ -523,22 +532,21 @@ func (i *Instance) Pause() error {
 	if err := i.workspace.Remove(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to remove workspace: %w", err))
 		log.ErrorLog.Print(err)
-		return i.combineErrors(errs)
+		return false, i.combineErrors(errs)
 	}
 	if err := i.workspace.Prune(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to prune workspace: %w", err))
 		log.ErrorLog.Print(err)
-		return i.combineErrors(errs)
+		return false, i.combineErrors(errs)
 	}
 
-	i.SetStatus(Paused)
 	_ = clipboard.WriteAll(i.workspace.BranchName())
 
 	if err := i.combineErrors(errs); err != nil {
 		log.ErrorLog.Print(err)
-		return err
+		return true, err
 	}
-	return nil
+	return true, nil
 }
 
 // Resume recreates the worktree and restarts the tmux session

@@ -279,33 +279,52 @@ func (l *List) Down() {
 	}
 }
 
-// Kill selects the next item in the list.
+// Kill terminates and removes the selected instance.
 func (l *List) Kill() {
-	if len(l.items) == 0 {
+	targetInstance := l.GetSelectedInstance()
+	if targetInstance == nil {
 		return
 	}
-	targetInstance := l.items[l.selectedIdx]
-
-	// Kill the tmux session
 	if err := targetInstance.Kill(); err != nil {
 		log.ErrorLog.Printf("could not kill instance: %v", err)
 	}
+	l.RemoveInstance(targetInstance)
+}
 
-	// If you delete the last one in the list, select the previous one.
-	if l.selectedIdx == len(l.items)-1 {
-		defer l.Up()
+// ContainsInstance reports whether target is still registered in the list.
+func (l *List) ContainsInstance(target *session.Instance) bool {
+	for _, instance := range l.items {
+		if instance == target {
+			return true
+		}
 	}
+	return false
+}
 
-	// Unregister the reponame.
-	repoName, err := targetInstance.RepoName()
-	if err != nil {
-		log.ErrorLog.Printf("could not get repo name: %v", err)
-	} else {
-		l.rmRepo(repoName)
+// RemoveInstance removes target without performing backend cleanup. Callers use
+// this after cleanup has completed and returned to the Bubble Tea event loop.
+func (l *List) RemoveInstance(target *session.Instance) bool {
+	for idx, instance := range l.items {
+		if instance != target {
+			continue
+		}
+
+		repoName, err := target.RepoName()
+		if err != nil {
+			log.ErrorLog.Printf("could not get repo name: %v", err)
+		} else {
+			l.rmRepo(repoName)
+		}
+
+		l.items = append(l.items[:idx], l.items[idx+1:]...)
+		if len(l.items) == 0 {
+			l.selectedIdx = 0
+		} else if l.selectedIdx >= len(l.items) {
+			l.selectedIdx = len(l.items) - 1
+		}
+		return true
 	}
-
-	// Since there's items after this, the selectedIdx can stay the same.
-	l.items = append(l.items[:l.selectedIdx], l.items[l.selectedIdx+1:]...)
+	return false
 }
 
 func (l *List) Attach() (chan struct{}, error) {

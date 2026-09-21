@@ -66,3 +66,29 @@ PASS with no output.
 ## Commit
 
 `8e44ee3 feat: add directory workspace actions to the TUI`
+
+## Fix Round 1
+
+### Status
+
+Fixed confirmed-action concurrency and ownership, corrected Apply persistence/pause semantics, made help capability-driven, and replaced stub-only coverage with command-to-message-to-Update flow tests.
+
+### Exact evidence
+
+- `go test ./app -run 'TestKillCommand|TestApply|TestGeneralHelp|TestDirectoryApply' -count=1 -v` — PASS. Covers real workspace Apply dispatch, success/no-op/conflict/error rendering, pre/post-pause saves, save and pause failures, stale selection, and duplicate Apply/Kill suppression.
+- `go test ./app ./ui ./keys -count=1` — PASS (`app` 24.637s, `ui` 7.264s; `keys` has no test files).
+- `go test -count=1 ./...` — PASS. All packages passed; `session/workspace` completed in 122.444s.
+- `git diff --check` — PASS with no output.
+
+### Fix details
+
+- Confirmed Apply/Kill commands now perform backend work only and return target-specific typed messages. List, terminal, status, and storage mutations happen synchronously in `Update` handlers.
+- Pending action tracking prevents duplicate Apply/Kill operations for one target. Result handlers retain the original target, so selection changes cannot pause or delete a different session.
+- Apply metadata is saved after source mutation and before pause cleanup, then paused status is saved after cleanup. Persistence failure stops cleanup and leaves the session available; pause failure is reported separately while retaining recoverable state.
+- Apply overlays distinguish source conflicts/errors from successful source mutation followed by persistence or pause-cleanup failures; successful no-op wording no longer implies changed files.
+- General and start help derive Push and Apply independently. Nil selection advertises neither push nor checkout/apply.
+- `Instance.PreparePause` separates backend pause cleanup from synchronous status mutation while preserving the existing `Pause` API behavior.
+
+### Concerns
+
+- A successful backend kill followed by persistence deletion failure intentionally leaves the in-memory entry visible and reports that it stopped but could not be removed from persisted state; this is recoverable on retry/restart.
