@@ -57,9 +57,11 @@ func TestDetectModeResolvesSymlink(t *testing.T) {
 	require.Equal(t, ModeDirectory, mode)
 }
 
-func TestNewPlainDirectoryReportsUnavailableBackend(t *testing.T) {
+func TestNewPlainDirectoryCreatesShadowWorkspace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	ws, branch, err := New(t.TempDir(), "feature", "")
-	require.Nil(t, ws)
-	require.Empty(t, branch)
-	require.ErrorIs(t, err, ErrDirectoryBackendUnavailable)
+	require.NoError(t, err)
+	require.NotNil(t, ws)
+	require.Equal(t, ModeDirectory, ws.Mode())
+	require.Equal(t, ws.BranchName(), branch)
 }

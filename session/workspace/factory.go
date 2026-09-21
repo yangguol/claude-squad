@@ -1,15 +1,12 @@
 package workspace
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"claude-squad/session/git"
 )
-
-var ErrDirectoryBackendUnavailable = errors.New("directory workspace backend is not yet available")
 
 func DetectMode(path string) (Mode, error) {
 	resolved, err := resolveDirectory(path)
@@ -30,7 +27,7 @@ func New(path, sessionName, branch string) (Workspace, string, error) {
 	if git.IsGitRepo(resolved) {
 		return NewGit(resolved, sessionName, branch)
 	}
-	return nil, "", fmt.Errorf("cannot create workspace for %q: %w", resolved, ErrDirectoryBackendUnavailable)
+	return NewShadow(resolved, sessionName)
 }
 
 func resolveDirectory(path string) (string, error) {

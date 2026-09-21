@@ -55,8 +55,26 @@ type GitData struct {
 	IsExistingBranch bool   `json:"is_existing_branch"`
 }
 
-// ShadowData is populated by the directory workspace implementation.
-type ShadowData struct{}
+type PolicyRuleData struct {
+	Pattern string     `json:"pattern"`
+	Class   EntryClass `json:"class"`
+	Negate  bool       `json:"negate,omitempty"`
+}
+
+type ShadowData struct {
+	ProjectID       string           `json:"project_id"`
+	SourcePath      string           `json:"source_path"`
+	RepoPath        string           `json:"repo_path"`
+	WorktreePath    string           `json:"worktree_path"`
+	SessionID       string           `json:"session_id"`
+	SessionName     string           `json:"session_name"`
+	BranchName      string           `json:"branch_name"`
+	BaselineCommit  string           `json:"baseline_commit"`
+	PolicySnapshot  []PolicyRuleData `json:"policy_snapshot"`
+	SharedLinks     []string         `json:"shared_links,omitempty"`
+	LastAppliedTree string           `json:"last_applied_tree,omitempty"`
+	LastAppliedAt   string           `json:"last_applied_at,omitempty"`
+}
 
 type Data struct {
 	Version int         `json:"version"`
