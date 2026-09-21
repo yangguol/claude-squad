@@ -1,11 +1,13 @@
 package workspace
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,15 @@ type applyEntry struct {
 	Mode          os.FileMode
 	Contents      []byte
 	SymlinkTarget string
+}
+
+var applyPlanAfterImportsHook func()
+
+var mergeTreeCommand = func(dir string, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	return cmd.CombinedOutput()
 }
 
 type applyPlan struct {
@@ -107,6 +118,15 @@ func (w *shadowWorkspace) planApply() (plan applyPlan, returnErr error) {
 	if err != nil {
 		return plan, err
 	}
+	if applyPlanAfterImportsHook != nil {
+		applyPlanAfterImportsHook()
+	}
+	if err := verifyApplySnapshot(w.data.SourcePath, policy, oursSnapshot, false, "source"); err != nil {
+		return plan, err
+	}
+	if err := verifyApplySnapshot(w.data.WorktreePath, policy, theirsSnapshot, true, "agent worktree"); err != nil {
+		return plan, err
+	}
 	plan.OursSnapshot, plan.OursCommit, plan.TheirsCommit = oursSnapshot, ours, theirs
 
 	mergedTree, conflictStages, err := w.mergeApplyCommits(ours, theirs)
@@ -118,6 +138,12 @@ func (w *shadowWorkspace) planApply() (plan applyPlan, returnErr error) {
 		if err != nil {
 			return plan, err
 		}
+		if err := verifyApplySnapshot(w.data.SourcePath, policy, oursSnapshot, false, "source"); err != nil {
+			return plan, err
+		}
+		if err := verifyApplySnapshot(w.data.WorktreePath, policy, theirsSnapshot, true, "agent worktree"); err != nil {
+			return plan, err
+		}
 		return plan, &ConflictError{Paths: paths}
 	}
 	plan.MergedTree = mergedTree
@@ -126,7 +152,27 @@ func (w *shadowWorkspace) planApply() (plan applyPlan, returnErr error) {
 	if err := w.buildApplyManifest(&plan); err != nil {
 		return plan, err
 	}
+	if err := verifyApplySnapshot(w.data.SourcePath, policy, oursSnapshot, false, "source"); err != nil {
+		return plan, err
+	}
+	if err := verifyApplySnapshot(w.data.WorktreePath, policy, theirsSnapshot, true, "agent worktree"); err != nil {
+		return plan, err
+	}
 	return plan, nil
+}
+
+func verifyApplySnapshot(root string, policy Policy, expected Snapshot, omitGit bool, label string) error {
+	current, err := Scan(root, policy)
+	if err != nil {
+		return fmt.Errorf("re-snapshot %s: %w", label, err)
+	}
+	if omitGit {
+		delete(current.Entries, ".git")
+	}
+	if !reflect.DeepEqual(expected, current) {
+		return fmt.Errorf("%s changed while planning apply", label)
+	}
+	return nil
 }
 
 func policyFromSnapshot(snapshot []PolicyRuleData) (Policy, error) {
@@ -173,68 +219,158 @@ func (w *shadowWorkspace) mergeApplyCommits(ours, theirs string) (string, []conf
 	if !validObjectID(ours) || !validObjectID(theirs) {
 		return "", nil, errors.New("invalid apply commit object ID")
 	}
-	cmd := exec.Command("git", "merge-tree", "--write-tree", ours, theirs)
-	cmd.Dir = w.data.RepoPath
-	cmd.Env = os.Environ()
-	output, commandErr := cmd.CombinedOutput()
-	lines := strings.Split(strings.TrimRight(string(output), "\n"), "\n")
-	if len(lines) == 0 || !validObjectID(strings.TrimSpace(lines[0])) {
-		return "", nil, fmt.Errorf("git merge-tree returned an invalid result: %s", strings.TrimSpace(string(output)))
+	output, commandErr := mergeTreeCommand(w.data.RepoPath, "merge-tree", "--write-tree", "-z", ours, theirs)
+	mergedTree, stages, parseErr := parseMergeTreeOutput(output)
+	if parseErr != nil {
+		return "", nil, fmt.Errorf("git merge-tree returned malformed output: %w", parseErr)
 	}
-	mergedTree := strings.TrimSpace(lines[0])
-	var stages []conflictStage
-	for _, line := range lines[1:] {
-		fields := strings.Fields(line)
-		if len(fields) < 4 || len(fields[0]) != 6 || (fields[2] != "1" && fields[2] != "2" && fields[2] != "3") {
-			continue
-		}
-		index := strings.IndexByte(line, '\t')
-		if index < 0 {
-			continue
-		}
-		name := line[index+1:]
-		if err := validateApplyPath(w.data.SourcePath, name); err != nil {
+	for _, item := range stages {
+		if err := validateApplyPath(w.data.SourcePath, item.path); err != nil {
 			return "", nil, err
 		}
-		stages = append(stages, conflictStage{mode: fields[0], object: fields[1], stage: fields[2], path: name})
 	}
-	if commandErr != nil && len(stages) == 0 {
-		return "", nil, fmt.Errorf("git merge-tree failed: %s (%w)", strings.TrimSpace(string(output)), commandErr)
+	if commandErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(commandErr, &exitErr) || exitErr.ExitCode() != 1 || len(stages) == 0 {
+			return "", nil, fmt.Errorf("git merge-tree failed: %w", commandErr)
+		}
+	} else if len(stages) != 0 {
+		return "", nil, errors.New("git merge-tree reported conflict stages with success status")
 	}
 	return mergedTree, stages, nil
+}
+
+func parseMergeTreeOutput(output []byte) (string, []conflictStage, error) {
+	records := bytes.Split(output, []byte{0})
+	if len(records) < 2 || len(records[len(records)-1]) != 0 || !validObjectID(string(records[0])) {
+		return "", nil, errors.New("missing tree or terminating NUL")
+	}
+	mergedTree := string(records[0])
+	index := 1
+	var stages []conflictStage
+	byPath := make(map[string]map[string]bool)
+	for index < len(records)-1 && len(records[index]) != 0 {
+		record := records[index]
+		index++
+		tab := bytes.IndexByte(record, '\t')
+		if tab < 0 {
+			return "", nil, errors.New("malformed conflict stage record")
+		}
+		fields := bytes.Split(record[:tab], []byte{' '})
+		if len(fields) != 3 || len(fields[0]) != 6 || !validGitMode(string(fields[0])) || !validObjectID(string(fields[1])) || (string(fields[2]) != "1" && string(fields[2]) != "2" && string(fields[2]) != "3") {
+			return "", nil, errors.New("invalid conflict stage record")
+		}
+		path := string(record[tab+1:])
+		if path == "" {
+			return "", nil, errors.New("empty conflict stage path")
+		}
+		stage := string(fields[2])
+		if byPath[path] == nil {
+			byPath[path] = make(map[string]bool)
+		}
+		if byPath[path][stage] {
+			return "", nil, errors.New("duplicate conflict stage")
+		}
+		byPath[path][stage] = true
+		stages = append(stages, conflictStage{mode: string(fields[0]), object: string(fields[1]), stage: stage, path: path})
+	}
+	if index == len(records)-1 {
+		if len(stages) != 0 {
+			return "", nil, errors.New("conflict stages missing informational section")
+		}
+		return mergedTree, stages, nil
+	}
+	if len(records[index]) != 0 {
+		return "", nil, errors.New("missing conflict section terminator")
+	}
+	index++
+	for index < len(records)-1 {
+		count, err := strconv.Atoi(string(records[index]))
+		if err != nil || count < 0 || index+count+2 >= len(records) {
+			return "", nil, errors.New("malformed informational message")
+		}
+		index++
+		for range count {
+			if len(records[index]) == 0 {
+				return "", nil, errors.New("empty informational path")
+			}
+			index++
+		}
+		if len(records[index]) == 0 || len(records[index+1]) == 0 {
+			return "", nil, errors.New("incomplete informational message")
+		}
+		index += 2
+	}
+	for _, set := range byPath {
+		if len(set) == 0 {
+			return "", nil, errors.New("empty conflict stage set")
+		}
+	}
+	return mergedTree, stages, nil
+}
+
+func validGitMode(value string) bool {
+	if len(value) != 6 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '7' {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *shadowWorkspace) conflictPaths(transactionDir string, stages []conflictStage) ([]string, error) {
 	indexPath := filepath.Join(transactionDir, "conflicts.index")
 	env := []string{"GIT_INDEX_FILE=" + indexPath}
-	var input strings.Builder
+	var input bytes.Buffer
+	expected := make(map[string]map[string]bool)
 	for _, item := range stages {
-		if !validObjectID(item.object) {
-			return nil, errors.New("merge conflict contains invalid object ID")
+		if !validObjectID(item.object) || !validGitMode(item.mode) {
+			return nil, errors.New("merge conflict contains invalid index data")
 		}
-		fmt.Fprintf(&input, "%s %s %s\t%s\n", item.mode, item.object, item.stage, item.path)
+		fmt.Fprintf(&input, "%s %s %s\t%s", item.mode, item.object, item.stage, item.path)
+		input.WriteByte(0)
+		if expected[item.path] == nil {
+			expected[item.path] = make(map[string]bool)
+		}
+		expected[item.path][item.stage] = true
 	}
-	if _, err := runGitInput(w.data.RepoPath, env, []byte(input.String()), "update-index", "--index-info"); err != nil {
+	if _, err := runGitInput(w.data.RepoPath, env, input.Bytes(), "update-index", "-z", "--index-info"); err != nil {
 		return nil, fmt.Errorf("build conflict index: %w", err)
 	}
 	output, err := runGit(w.data.RepoPath, env, "ls-files", "-u", "-z")
 	if err != nil {
 		return nil, fmt.Errorf("list merge conflicts: %w", err)
 	}
+	records := strings.Split(output, "\x00")
+	if len(records) == 0 || records[len(records)-1] != "" {
+		return nil, errors.New("git ls-files returned truncated conflict data")
+	}
+	actual := make(map[string]map[string]bool)
 	set := make(map[string]struct{})
-	for _, record := range strings.Split(output, "\x00") {
-		if record == "" {
-			continue
-		}
+	for _, record := range records[:len(records)-1] {
 		index := strings.IndexByte(record, '\t')
 		if index < 0 {
 			return nil, errors.New("git ls-files returned malformed conflict data")
+		}
+		fields := strings.Split(record[:index], " ")
+		if len(fields) != 3 || !validGitMode(fields[0]) || !validObjectID(fields[1]) || (fields[2] != "1" && fields[2] != "2" && fields[2] != "3") {
+			return nil, errors.New("git ls-files returned invalid conflict stage")
 		}
 		name := record[index+1:]
 		if err := validateApplyPath(w.data.SourcePath, name); err != nil {
 			return nil, err
 		}
+		if actual[name] == nil {
+			actual[name] = make(map[string]bool)
+		}
+		actual[name][fields[2]] = true
 		set[name] = struct{}{}
+	}
+	if !reflect.DeepEqual(expected, actual) {
+		return nil, errors.New("git conflict index did not preserve exact stages and paths")
 	}
 	paths := make([]string, 0, len(set))
 	for name := range set {

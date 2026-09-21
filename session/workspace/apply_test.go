@@ -2,7 +2,9 @@ package workspace
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -133,6 +135,72 @@ func TestApplyConflictTypesAreSortedAndLeaveSourceUntouched(t *testing.T) {
 			require.Equal(t, before, mustSnapshot(t, source))
 		})
 	}
+}
+
+func TestApplyConflictPreservesUnusualPathExactly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	name := "odd\tquoted\"line\nname-é"
+	writeApplyFile(t, source, name, "base\n", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, source, name, "source\n", 0o644)
+	writeApplyFile(t, workspace.WorkDir(), name, "agent\n", 0o644)
+
+	_, err := workspace.Apply()
+	var conflict *ConflictError
+	require.ErrorAs(t, err, &conflict)
+	require.Equal(t, []string{name}, conflict.Paths)
+}
+
+func TestParseMergeTreeOutputFailsClosed(t *testing.T) {
+	oid := "0123456789012345678901234567890123456789"
+	valid := []byte(oid + "\x00100644 " + oid + " 1\tpath\x00100644 " + oid + " 2\tpath\x00100644 " + oid + " 3\tpath\x00\x00")
+	tests := map[string][]byte{
+		"truncated":           valid[:len(valid)-1],
+		"unrecognized record": append(append([]byte(nil), valid[:len(valid)-1]...), []byte("unexpected\x00")...),
+		"incomplete stages":   []byte(oid + "\x00100644 " + oid + " 1\tpath"),
+		"malformed stage":     []byte(oid + "\x00100644 " + oid + " 4\tpath\x00\x00"),
+	}
+	for name, output := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := parseMergeTreeOutput(output)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestPlanApplyRejectsCompleteSnapshotRaces(t *testing.T) {
+	tests := map[string]func(string, string){
+		"source addition":   func(source, _ string) { writeApplyFile(t, source, "late", "late", 0o644) },
+		"worktree mutation": func(_, worktree string) { writeApplyFile(t, worktree, "tracked", "late", 0o644) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			source := t.TempDir()
+			writeApplyFile(t, source, "tracked", "base", 0o644)
+			workspace := newApplyWorkspace(t, source)
+			applyPlanAfterImportsHook = func() { mutate(source, workspace.WorkDir()) }
+			t.Cleanup(func() { applyPlanAfterImportsHook = nil })
+
+			_, err := workspace.planApply()
+			require.ErrorContains(t, err, "changed while planning")
+		})
+	}
+}
+
+func TestMergeApplyCommitsDoesNotAcceptFailedCommandWithStages(t *testing.T) {
+	original := mergeTreeCommand
+	mergeTreeCommand = func(string, ...string) ([]byte, error) {
+		oid := "0123456789012345678901234567890123456789"
+		return []byte(oid + "\x00100644 " + oid + " 1\tpath\x00100644 " + oid + " 2\tpath\x00100644 " + oid + " 3\tpath\x00\x00"), &exec.ExitError{}
+	}
+	t.Cleanup(func() { mergeTreeCommand = original })
+	workspace := &shadowWorkspace{data: ShadowData{RepoPath: t.TempDir(), SourcePath: t.TempDir()}}
+	oid := "0123456789012345678901234567890123456789"
+	_, _, err := workspace.mergeApplyCommits(oid, oid)
+	require.Error(t, err)
+	require.Contains(t, fmt.Sprint(err), "failed")
 }
 
 func newApplyWorkspace(t *testing.T, source string) *shadowWorkspace {
