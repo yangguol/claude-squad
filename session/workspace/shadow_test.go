@@ -135,9 +135,6 @@ func TestShadowSharedLinksAndLifecycle(t *testing.T) {
 	err = ws.PushChanges("push", false)
 	require.ErrorAs(t, err, &unsupported)
 	require.Equal(t, "push", unsupported.Operation)
-	_, err = ws.Apply()
-	require.ErrorAs(t, err, &unsupported)
-	require.Equal(t, "apply", unsupported.Operation)
 
 	require.NoError(t, ws.Remove())
 	valid, err = ws.IsValid()

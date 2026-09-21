@@ -274,10 +274,6 @@ func (w *shadowWorkspace) PushChanges(string, bool) error {
 	return &ErrUnsupported{Operation: "push"}
 }
 
-func (w *shadowWorkspace) Apply() (*ApplyResult, error) {
-	return nil, &ErrUnsupported{Operation: "apply"}
-}
-
 func (w *shadowWorkspace) Remove() error {
 	if err := validateShadowData(w.data); err != nil {
 		return err
@@ -463,7 +459,11 @@ func ensureShadowProject(projectPath, repoPath string, expected shadowProjectMet
 }
 
 func importSnapshot(repoPath, source string, snapshot Snapshot) (string, error) {
-	index, err := os.CreateTemp(filepath.Dir(repoPath), "index-*")
+	return importSnapshotIn(repoPath, source, snapshot, filepath.Dir(repoPath))
+}
+
+func importSnapshotIn(repoPath, source string, snapshot Snapshot, temporaryDirectory string) (string, error) {
+	index, err := os.CreateTemp(temporaryDirectory, "index-*")
 	if err != nil {
 		return "", fmt.Errorf("create temporary index: %w", err)
 	}
