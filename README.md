@@ -69,11 +69,36 @@ Flags:
   -p, --program string   Program to run in new instances (e.g. 'aider --model ollama_chat/gemma3:1b')
 ```
 
-Run the application with:
+Run the application from the project directory:
 
 ```bash
 cs
 ```
+
+Claude Squad detects the workspace mode automatically. Inside a Git repository it keeps the existing Git worktree and branch workflow. In any other directory it shows `Directory (isolated)` and gives each session an independent copy backed by data under `~/.claude-squad/shadow-projects/`; it does not create `.git` in your source directory.
+
+In directory mode, agent edits stay isolated until you select the session and press `c` to **Apply**. Apply performs a three-way merge against the session's starting snapshot and the current source. If the same content changed incompatibly, Claude Squad reports the conflicting paths and leaves the source unchanged; resolve the source or session edit before retrying. Push and branch selection remain Git-mode-only actions.
+
+Directory mode classifies files as included, excluded, shared, or generated. Included files are isolated and can be applied. Excluded and generated files are neither copied nor applied. Shared dependency directories are linked to the source to avoid expensive copies, so writes inside them are immediately visible to every session and are not isolated or applied. By default, `node_modules/`, `.venv/`, and `venv/` are shared; common build output, cache, editor, and OS-artifact paths are generated and omitted (`dist/`, `build/`, `target/`, `out/`, `.cache/`, Python caches, `.idea/`, `.vscode/`, `.DS_Store`, `Thumbs.db`, `Desktop.ini`, and `*.sw?`).
+
+To customize directory mode, create `.claude-squad-ignore` in the source root. It uses gitignore-style glob patterns, `/` for root-relative paths, a trailing `/` for directories, `#` for comments, and `!` to include a later exception. Patterns before a section are excluded; `[shared]` and `[generated]` change the category for following patterns. Later matching rules win.
+
+```gitignore
+# Excluded: not copied or applied
+.env
+/private/
+!/private/example.env
+
+[shared]
+vendor/
+
+[generated]
+coverage/
+*.tmp
+```
+
+Killing a session removes its isolated worktree. `cs reset` removes stored sessions and safely cleans unreferenced directory-mode shadow projects; it refuses unsafe or recoverable cleanup rather than deleting questionable state. The startup fallback logo also displays a subtle `ygl` mark when the terminal is wide enough.
+
 NOTE: The default program is `claude` and we recommend using the latest version.
 
 <br />
