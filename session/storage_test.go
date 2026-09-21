@@ -76,6 +76,19 @@ func TestStorageRejectsPresentMalformedWorkspaceInsteadOfLegacyFallback(t *testi
 	require.ErrorContains(t, err, `unsupported workspace mode ""`)
 }
 
+func TestStorageRejectsNullWorkspaceInsteadOfLegacyFallback(t *testing.T) {
+	state := &memoryInstanceStorage{instances: json.RawMessage(`[{
+		"title":"null-workspace","path":"/repo","branch":"feature","status":3,
+		"workspace":null,
+		"worktree":{"repo_path":"/repo","worktree_path":"/worktree","session_name":"legacy","branch_name":"feature","base_commit_sha":"base"}
+	}]`)}
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+
+	_, err = storage.LoadInstances()
+	require.ErrorContains(t, err, "workspace field must not be null")
+}
+
 type memoryInstanceStorage struct {
 	instances json.RawMessage
 }

@@ -10,6 +10,8 @@ import (
 
 // InstanceData represents the serializable data of an Instance
 type InstanceData struct {
+	workspacePresent bool
+
 	Title     string    `json:"title"`
 	Path      string    `json:"path"`
 	Branch    string    `json:"branch"`
@@ -24,6 +26,23 @@ type InstanceData struct {
 	Workspace *workspace.Data  `json:"workspace,omitempty"`
 	Worktree  *GitWorktreeData `json:"worktree,omitempty"`
 	DiffStats DiffStatsData    `json:"diff_stats"`
+}
+
+// UnmarshalJSON tracks whether workspace was present independently of its value.
+func (d *InstanceData) UnmarshalJSON(data []byte) error {
+	type instanceData InstanceData
+	var decoded instanceData
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, decoded.workspacePresent = fields["workspace"]
+	*d = InstanceData(decoded)
+	return nil
 }
 
 // GitWorktreeData represents the serializable data of a GitWorktree

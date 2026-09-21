@@ -105,6 +105,8 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 	var workspaceData workspace.Data
 	if data.Workspace != nil {
 		workspaceData = *data.Workspace
+	} else if data.workspacePresent {
+		return nil, fmt.Errorf("restore workspace: workspace field must not be null")
 	} else if data.Worktree != nil {
 		workspaceData = workspace.Data{
 			Version: workspace.CurrentVersion,
