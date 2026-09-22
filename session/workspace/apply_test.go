@@ -137,11 +137,14 @@ type failingApplyOps struct {
 	failRestorePath  string
 }
 
-func (f failingApplyOps) Link(oldpath, newpath string) error {
+func (f failingApplyOps) RenameNoReplace(oldpath, newpath string) error {
 	if filepath.Clean(newpath) == filepath.Clean(f.failRenameTarget) {
 		return errors.New("injected apply failure")
 	}
-	return f.fileOps.Link(oldpath, newpath)
+	if filepath.Clean(newpath) == filepath.Clean(f.failRestorePath) && (strings.HasPrefix(filepath.Base(oldpath), ".claude-squad-rollback-") || strings.HasPrefix(filepath.Base(oldpath), ".claude-squad-displaced-")) {
+		return errors.New("injected rollback failure")
+	}
+	return f.fileOps.RenameNoReplace(oldpath, newpath)
 }
 
 func (f failingApplyOps) Rename(oldpath, newpath string) error {
@@ -224,6 +227,95 @@ func TestApplyRejectsSourceChangeBetweenValidationAndMutation(t *testing.T) {
 	_, err := workspace.Apply()
 	require.Error(t, err)
 	require.Equal(t, "late", mustReadFile(t, filepath.Join(source, "file")))
+}
+
+func TestApplyPreservesReplacementAfterValidatedCapture(t *testing.T) {
+	tests := map[string]struct {
+		prepare func(*testing.T, string, *shadowWorkspace)
+		late    func(*testing.T, string)
+		assert  func(*testing.T, string)
+	}{
+		"regular-file-update": {
+			prepare: func(t *testing.T, source string, workspace *shadowWorkspace) {
+				writeApplyFile(t, source, "file", "before", 0o644)
+				writeApplyFile(t, workspace.WorkDir(), "file", "agent", 0o644)
+			},
+			late: func(t *testing.T, source string) {
+				writeApplyFile(t, source, "file", "late", 0o644)
+			},
+			assert: func(t *testing.T, source string) {
+				require.Equal(t, "late", mustReadFile(t, filepath.Join(source, "file")))
+			},
+		},
+		"directory-to-file": {
+			prepare: func(t *testing.T, source string, workspace *shadowWorkspace) {
+				writeApplyFile(t, source, "kind/child", "before", 0o644)
+				require.NoError(t, os.RemoveAll(filepath.Join(workspace.WorkDir(), "kind")))
+				writeApplyFile(t, workspace.WorkDir(), "kind", "agent", 0o644)
+			},
+			late: func(t *testing.T, source string) {
+				writeApplyFile(t, source, "kind/late-child", "late", 0o644)
+			},
+			assert: func(t *testing.T, source string) {
+				require.Equal(t, "late", mustReadFile(t, filepath.Join(source, "kind", "late-child")))
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			source := t.TempDir()
+			if name == "regular-file-update" {
+				writeApplyFile(t, source, "file", "before", 0o644)
+			} else {
+				writeApplyFile(t, source, "kind/child", "before", 0o644)
+			}
+			workspace := newApplyWorkspace(t, source)
+			if name == "regular-file-update" {
+				writeApplyFile(t, workspace.WorkDir(), "file", "agent", 0o644)
+			} else {
+				require.NoError(t, os.RemoveAll(filepath.Join(workspace.WorkDir(), "kind")))
+				writeApplyFile(t, workspace.WorkDir(), "kind", "agent", 0o644)
+			}
+			applyAfterCaptureValidationHook = func(string) {
+				applyAfterCaptureValidationHook = nil
+				test.late(t, source)
+			}
+			t.Cleanup(func() { applyAfterCaptureValidationHook = nil })
+
+			_, err := workspace.Apply()
+			require.Error(t, err)
+			test.assert(t, source)
+		})
+	}
+}
+
+func TestApplyNoReplacePreflightFailsBeforeSourceMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "agent", 0o644)
+	original := applyRenameNoReplace
+	applyRenameNoReplace = func(string, string) error { return errors.New("unsupported no-replace backend") }
+	t.Cleanup(func() { applyRenameNoReplace = original })
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "atomic no-replace rename is unavailable")
+	require.Equal(t, "before", mustReadFile(t, filepath.Join(source, "file")))
+}
+
+func TestRenameNoReplaceRefusesExistingDestination(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	destination := filepath.Join(parent, "destination")
+	require.NoError(t, os.WriteFile(source, []byte("source"), 0o600))
+	require.NoError(t, os.WriteFile(destination, []byte("destination"), 0o600))
+
+	err := platformRenameNoReplace(source, destination)
+	require.Error(t, err)
+	require.Equal(t, "source", mustReadFile(t, source))
+	require.Equal(t, "destination", mustReadFile(t, destination))
 }
 
 func TestApplyRejectsPostBackupCreateTargetDirectory(t *testing.T) {

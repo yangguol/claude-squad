@@ -57,16 +57,17 @@ const (
 )
 
 type transactionEntry struct {
-	Path              string      `json:"path"`
-	Operation         string      `json:"operation"`
-	Type              EntryType   `json:"type,omitempty"`
-	Mode              os.FileMode `json:"mode,omitempty"`
-	Payload           string      `json:"payload,omitempty"`
-	Target            string      `json:"target,omitempty"`
-	Backup            string      `json:"backup,omitempty"`
-	Displaced         string      `json:"displaced,omitempty"`
-	Expected          *Entry      `json:"expected,omitempty"`
-	ReplacesDirectory bool        `json:"replaces_directory,omitempty"`
+	Path              string           `json:"path"`
+	Operation         string           `json:"operation"`
+	Type              EntryType        `json:"type,omitempty"`
+	Mode              os.FileMode      `json:"mode,omitempty"`
+	Payload           string           `json:"payload,omitempty"`
+	Target            string           `json:"target,omitempty"`
+	Backup            string           `json:"backup,omitempty"`
+	Displaced         string           `json:"displaced,omitempty"`
+	Expected          *Entry           `json:"expected,omitempty"`
+	ExpectedTree      map[string]Entry `json:"expected_tree,omitempty"`
+	ReplacesDirectory bool             `json:"replaces_directory,omitempty"`
 }
 
 // Transaction describes durable recovery metadata for an apply operation.
@@ -85,10 +86,9 @@ type fileOps interface {
 	Open(string) (*os.File, error)
 	OpenFile(string, int, os.FileMode) (*os.File, error)
 	Readlink(string) (string, error)
-	ReadDir(string) ([]os.DirEntry, error)
 	Symlink(string, string) error
-	Link(string, string) error
 	Rename(string, string) error
+	RenameNoReplace(string, string) error
 	Remove(string) error
 	RemoveAll(string) error
 	Mkdir(string, os.FileMode) error
@@ -103,11 +103,12 @@ func (osFileOps) Open(name string) (*os.File, error)     { return os.Open(name) 
 func (osFileOps) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
 	return os.OpenFile(name, flag, mode)
 }
-func (osFileOps) Readlink(name string) (string, error)         { return os.Readlink(name) }
-func (osFileOps) ReadDir(name string) ([]os.DirEntry, error)   { return os.ReadDir(name) }
-func (osFileOps) Symlink(oldname, newname string) error        { return os.Symlink(oldname, newname) }
-func (osFileOps) Link(oldname, newname string) error           { return os.Link(oldname, newname) }
-func (osFileOps) Rename(oldpath, newpath string) error         { return os.Rename(oldpath, newpath) }
+func (osFileOps) Readlink(name string) (string, error)  { return os.Readlink(name) }
+func (osFileOps) Symlink(oldname, newname string) error { return os.Symlink(oldname, newname) }
+func (osFileOps) Rename(oldpath, newpath string) error  { return os.Rename(oldpath, newpath) }
+func (osFileOps) RenameNoReplace(oldpath, newpath string) error {
+	return platformRenameNoReplace(oldpath, newpath)
+}
 func (osFileOps) Remove(name string) error                     { return os.Remove(name) }
 func (osFileOps) RemoveAll(path string) error                  { return os.RemoveAll(path) }
 func (osFileOps) Mkdir(path string, mode os.FileMode) error    { return os.Mkdir(path, mode) }
@@ -119,6 +120,8 @@ var applyBeforeRevalidateHook func()
 var applyAfterBackupHook func(string)
 var applyBeforeMutationHook func(string)
 var applyAfterMutationValidationHook func(string)
+var applyAfterCaptureValidationHook func(string)
+var applyRenameNoReplace = func(oldpath, newpath string) error { return applyFS.RenameNoReplace(oldpath, newpath) }
 
 func (p applyPlan) ChangedPaths() []string {
 	paths := make([]string, 0, len(p.Creates)+len(p.Updates)+len(p.Deletes))
@@ -154,6 +157,10 @@ func (w *shadowWorkspace) Apply() (*ApplyResult, error) {
 		_ = os.RemoveAll(plan.TransactionDir)
 		return nil, err
 	}
+	if err := preflightNoReplace(transaction); err != nil {
+		_ = os.RemoveAll(plan.TransactionDir)
+		return nil, err
+	}
 	if err := w.executeTransaction(&transaction); err != nil {
 		return nil, err
 	}
@@ -165,16 +172,46 @@ func (w *shadowWorkspace) Apply() (*ApplyResult, error) {
 	return &ApplyResult{Changed: plan.ChangedPaths()}, nil
 }
 
-func cleanupCommittedTransaction(transaction Transaction) error {
+func preflightNoReplace(transaction Transaction) error {
+	parents := make(map[string]struct{})
 	for _, item := range transaction.Entries {
-		if item.Displaced == "" {
-			continue
+		parent := filepath.Dir(filepath.Join(transaction.SourcePath, filepath.FromSlash(item.Path)))
+		for {
+			info, err := applyFS.Lstat(parent)
+			if err == nil {
+				if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+					break
+				}
+				parent = filepath.Dir(parent)
+				continue
+			}
+			if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+				return fmt.Errorf("inspect atomic no-replace probe parent %q: %w", parent, err)
+			}
+			parent = filepath.Dir(parent)
 		}
-		displaced := filepath.Join(transaction.SourcePath, filepath.FromSlash(item.Displaced))
-		if err := applyFS.Remove(displaced); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
-			return fmt.Errorf("remove committed displaced source %q: %w", item.Path, err)
+		parents[parent] = struct{}{}
+	}
+	for parent := range parents {
+		probe, err := createExclusiveSibling(parent, ".claude-squad-rename-probe-", nil, 0o600)
+		if err != nil {
+			return fmt.Errorf("prepare atomic no-replace probe in %q: %w", parent, err)
+		}
+		destination, err := randomSiblingName(probe, ".claude-squad-rename-probe-target-")
+		if err != nil {
+			return errors.Join(err, removeCreatedTemp(probe))
+		}
+		if err := applyRenameNoReplace(probe, destination); err != nil {
+			return errors.Join(fmt.Errorf("atomic no-replace rename is unavailable in %q: %w", parent, err), removeCreatedTemp(probe), removeCreatedTemp(destination))
+		}
+		if err := removeCreatedTemp(destination); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func cleanupCommittedTransaction(transaction Transaction) error {
 	marker := transaction.Directory + ".cleanup.json"
 	markerTransaction := transaction
 	markerTransaction.Directory = ""
@@ -184,6 +221,15 @@ func cleanupCommittedTransaction(transaction Transaction) error {
 	}
 	if err := writeExclusiveFile(marker, contents, 0o600); err != nil {
 		return fmt.Errorf("write committed cleanup marker: %w", err)
+	}
+	for _, item := range transaction.Entries {
+		if item.Displaced == "" {
+			continue
+		}
+		displaced := filepath.Join(transaction.SourcePath, filepath.FromSlash(item.Displaced))
+		if err := applyFS.RemoveAll(displaced); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+			return fmt.Errorf("cleanup committed transaction displaced source %q: %w", item.Path, err)
+		}
 	}
 	if err := applyFS.RemoveAll(transaction.Directory); err != nil {
 		return fmt.Errorf("cleanup committed transaction %q: %w", transaction.Directory, err)
@@ -204,7 +250,19 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan) (Transaction, error
 	if err := applyFS.MkdirAll(backupRoot, 0o700); err != nil {
 		return transaction, fmt.Errorf("create transaction backup: %w", err)
 	}
+	replacedDirectories := make([]string, 0)
 	for _, name := range plan.ChangedPaths() {
+		if _, changed := plan.Creates[name]; changed && planReplacesDirectory(plan, name) {
+			replacedDirectories = append(replacedDirectories, name)
+		}
+		if _, changed := plan.Updates[name]; changed && planReplacesDirectory(plan, name) {
+			replacedDirectories = append(replacedDirectories, name)
+		}
+	}
+	for _, name := range plan.ChangedPaths() {
+		if pathBelowAny(name, replacedDirectories) {
+			continue
+		}
 		if err := validateApplyPath(w.data.SourcePath, name); err != nil {
 			return transaction, err
 		}
@@ -244,6 +302,13 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan) (Transaction, error
 			item.Expected = &expected
 		} else if item.Operation != "delete" && planReplacesDirectory(plan, name) {
 			item.ReplacesDirectory = true
+			item.Backup = filepath.ToSlash(filepath.Join("backup", name))
+			displaced, err := randomSiblingName(name, ".claude-squad-displaced-")
+			if err != nil {
+				return transaction, err
+			}
+			item.Displaced = displaced
+			item.ExpectedTree = snapshotSubtree(plan.OursSnapshot, name)
 		}
 		transaction.Entries = append(transaction.Entries, item)
 	}
@@ -355,6 +420,19 @@ func (w *shadowWorkspace) revalidateTouched(plan applyPlan) error {
 	return nil
 }
 
+func snapshotSubtree(snapshot Snapshot, name string) map[string]Entry {
+	result := make(map[string]Entry)
+	prefix := name + "/"
+	for path, entry := range snapshot.Entries {
+		if strings.HasPrefix(path, prefix) {
+			relative := strings.TrimPrefix(path, prefix)
+			entry.Path = relative
+			result[relative] = entry
+		}
+	}
+	return result
+}
+
 func planReplacesDirectory(plan applyPlan, name string) bool {
 	prefix := name + "/"
 	for path := range plan.OursSnapshot.Entries {
@@ -464,6 +542,12 @@ func (w *shadowWorkspace) revalidateTransactionEntry(transaction Transaction, it
 	}
 	if err != nil {
 		return err
+	}
+	if item.ReplacesDirectory {
+		if exists && actual.Type == EntryType("directory") {
+			return nil
+		}
+		return &ConflictError{Paths: []string{item.Path}}
 	}
 	if item.Backup == "" {
 		if exists {
@@ -581,8 +665,11 @@ func (w *shadowWorkspace) backupEntry(transaction Transaction, item *transaction
 		}
 		return applyFS.Symlink(target, backup)
 	}
+	if info.IsDir() {
+		return nil
+	}
 	if !info.Mode().IsRegular() {
-		return errors.New("source backup is not a regular file or symlink")
+		return errors.New("source backup is not a regular file, directory, or symlink")
 	}
 	contents, err := readOpenedRegularFileWithOps(source, info)
 	if err != nil {
@@ -606,24 +693,10 @@ func (w *shadowWorkspace) applyTransactionEntry(transaction Transaction, item tr
 	if err := ensureRealContainedPath(w.data.SourcePath, filepath.Dir(target), false, "apply path parent"); err != nil {
 		return createdDirs, false, err
 	}
-	if info, statErr := applyFS.Lstat(target); statErr == nil && info.IsDir() {
-		if !item.ReplacesDirectory {
-			entries, readErr := applyFS.ReadDir(target)
-			if readErr != nil {
-				return createdDirs, false, readErr
-			}
-			if len(entries) != 0 {
-				return createdDirs, false, fmt.Errorf("replacement directory %q is not empty", item.Path)
-			}
-			if err := applyFS.Remove(target); err != nil {
-				return createdDirs, false, err
-			}
-		}
-	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) && !errors.Is(statErr, syscall.ENOTDIR) {
-		return createdDirs, false, statErr
-	}
 	var temporary string
-	if item.Type != EntrySymlink {
+	if item.Type == EntrySymlink {
+		temporary, err = createExclusiveSymlinkSibling(filepath.Dir(target), ".claude-squad-apply-", item.Target)
+	} else {
 		payload := filepath.Join(transaction.Directory, filepath.FromSlash(item.Payload))
 		contents, readErr := os.ReadFile(payload)
 		if readErr != nil {
@@ -639,28 +712,7 @@ func (w *shadowWorkspace) applyTransactionEntry(transaction Transaction, item tr
 			return createdDirs, false, errors.Join(err, removeCreatedTemp(temporary))
 		}
 	}
-	if item.ReplacesDirectory {
-		for _, other := range transaction.Entries {
-			if other.Displaced == "" || !strings.HasPrefix(other.Path, item.Path+"/") {
-				continue
-			}
-			displaced := filepath.Join(w.data.SourcePath, filepath.FromSlash(other.Displaced))
-			if err := applyFS.Remove(displaced); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return createdDirs, false, errors.Join(err, removeCreatedTemp(temporary))
-			}
-		}
-		if err := applyFS.Remove(target); err != nil {
-			return createdDirs, false, errors.Join(err, removeCreatedTemp(temporary))
-		}
-	}
-	if item.Type == EntrySymlink {
-		err = applyFS.Symlink(item.Target, target)
-	} else {
-		err = applyFS.Link(temporary, target)
-		if err == nil {
-			err = removeCreatedTemp(temporary)
-		}
-	}
+	err = applyRenameNoReplace(temporary, target)
 	if err != nil {
 		return createdDirs, item.Backup != "", errors.Join(err, removeCreatedTemp(temporary))
 	}
@@ -675,32 +727,46 @@ func (w *shadowWorkspace) displaceExpectedSource(transaction Transaction, item t
 	if filepath.Dir(displaced) != filepath.Dir(target) {
 		return errors.New("transaction displacement is not a target sibling")
 	}
-	before, err := applyFS.Lstat(target)
-	if err != nil {
-		return err
-	}
 	if applyAfterMutationValidationHook != nil {
 		applyAfterMutationValidationHook(item.Path)
 	}
-	if err := applyFS.Link(target, displaced); err != nil {
+	if err := applyRenameNoReplace(target, displaced); err != nil {
 		return err
 	}
-	displacedInfo, displacedStatErr := applyFS.Lstat(displaced)
-	displacedEntry, exists, displacedErr := snapshotPath(displaced, item.Path)
-	if displacedStatErr != nil || !os.SameFile(before, displacedInfo) || displacedErr != nil || !exists || item.Expected == nil || !reflect.DeepEqual(displacedEntry, *item.Expected) {
-		return errors.Join(&ConflictError{Paths: []string{item.Path}}, removeCreatedTemp(displaced), displacedStatErr, displacedErr)
-	}
-	if err := applyFS.Remove(target); err != nil {
-		return errors.Join(err, removeCreatedTemp(displaced))
-	}
-	if _, err := applyFS.Lstat(target); !errors.Is(err, os.ErrNotExist) {
-		restoreErr := applyFS.Rename(displaced, target)
-		if err == nil {
-			err = &ConflictError{Paths: []string{item.Path}}
+	valid, validationErr := capturedEntryMatches(displaced, item)
+	if !valid || validationErr != nil {
+		restoreErr := applyRenameNoReplace(displaced, target)
+		if restoreErr == nil {
+			return errors.Join(&ConflictError{Paths: []string{item.Path}}, validationErr)
 		}
-		return errors.Join(err, restoreErr)
+		return errors.Join(&ConflictError{Paths: []string{item.Path}}, validationErr, fmt.Errorf("retain captured source at %q after restore refusal: %w", displaced, restoreErr))
+	}
+	if applyAfterCaptureValidationHook != nil {
+		applyAfterCaptureValidationHook(item.Path)
 	}
 	return nil
+}
+
+func capturedEntryMatches(displaced string, item transactionEntry) (bool, error) {
+	if item.Expected != nil {
+		actual, exists, err := snapshotPath(displaced, item.Path)
+		return err == nil && exists && reflect.DeepEqual(actual, *item.Expected), err
+	}
+	if item.ReplacesDirectory {
+		info, err := applyFS.Lstat(displaced)
+		if err != nil {
+			return false, err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return false, nil
+		}
+		actual, err := Scan(displaced, Policy{})
+		if err != nil {
+			return false, err
+		}
+		return reflect.DeepEqual(actual.Entries, item.ExpectedTree), nil
+	}
+	return false, errors.New("transaction entry is missing expected source state")
 }
 
 func (w *shadowWorkspace) createMissingParents(parent string) ([]string, error) {
@@ -738,24 +804,25 @@ func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied 
 			rollbackErr = errors.Join(rollbackErr, err)
 			continue
 		}
-		if err := w.revalidateAppliedEntry(*transaction, item, removedReplacementAncestors); err != nil {
+		capturedApplied, err := w.captureAppliedForRollback(*transaction, item, removedReplacementAncestors)
+		if err != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("refuse to overwrite post-apply change at %q: %w", item.Path, err))
-			continue
-		}
-		if err := applyFS.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-			rollbackErr = errors.Join(rollbackErr, err)
 			continue
 		}
 		if item.ReplacesDirectory {
 			removedReplacementAncestors = append(removedReplacementAncestors, item.Path)
 		}
 		if item.Backup == "" {
+			if capturedApplied != "" {
+				rollbackErr = errors.Join(rollbackErr, removeCreatedTemp(capturedApplied))
+			}
 			continue
 		}
 		backup := filepath.Join(transaction.Directory, filepath.FromSlash(item.Backup))
 		if item.Displaced != "" {
 			displaced := filepath.Join(w.data.SourcePath, filepath.FromSlash(item.Displaced))
-			if err := applyFS.Rename(displaced, target); err == nil {
+			if err := applyRenameNoReplace(displaced, target); err == nil {
+				rollbackErr = errors.Join(rollbackErr, removeCreatedTemp(capturedApplied))
 				continue
 			} else if !errors.Is(err, os.ErrNotExist) {
 				rollbackErr = errors.Join(rollbackErr, err)
@@ -786,14 +853,15 @@ func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied 
 			err = readErr
 		}
 		if err == nil {
-			err = applyFS.Rename(temporary, target)
+			err = applyRenameNoReplace(temporary, target)
 			if err != nil {
 				err = errors.Join(err, removeCreatedTemp(temporary))
 			}
 		}
 		rollbackErr = errors.Join(rollbackErr, err)
 	}
-	for index := len(createdDirs) - 1; index >= 0; index-- {
+	sort.Slice(createdDirs, func(i, j int) bool { return len(createdDirs[i]) > len(createdDirs[j]) })
+	for index := range createdDirs {
 		info, err := applyFS.Lstat(createdDirs[index])
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -819,36 +887,41 @@ func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied 
 	return rollbackErr
 }
 
-func (w *shadowWorkspace) revalidateAppliedEntry(transaction Transaction, item transactionEntry, removedReplacementAncestors []string) error {
-	actual, exists, err := snapshotOne(w.data.SourcePath, item.Path)
-	if errors.Is(err, syscall.ENOTDIR) && pathBelowAny(item.Path, removedReplacementAncestors) {
-		exists, err = false, nil
-	}
-	if err != nil {
-		return err
-	}
+func (w *shadowWorkspace) captureAppliedForRollback(transaction Transaction, item transactionEntry, removedReplacementAncestors []string) (string, error) {
+	target := filepath.Join(w.data.SourcePath, filepath.FromSlash(item.Path))
 	if item.Operation == "delete" {
-		if exists {
-			return &ConflictError{Paths: []string{item.Path}}
+		_, exists, err := snapshotOne(w.data.SourcePath, item.Path)
+		if errors.Is(err, syscall.ENOTDIR) && pathBelowAny(item.Path, removedReplacementAncestors) {
+			exists, err = false, nil
 		}
-		return nil
+		if err != nil || exists {
+			return "", errors.Join(err, &ConflictError{Paths: []string{item.Path}})
+		}
+		return "", nil
 	}
-	if !exists {
-		return &ConflictError{Paths: []string{item.Path}}
+	captured, err := randomSiblingName(item.Path, ".claude-squad-rollback-captured-")
+	if err != nil {
+		return "", err
+	}
+	captured = filepath.Join(w.data.SourcePath, filepath.FromSlash(captured))
+	if err := applyRenameNoReplace(target, captured); err != nil {
+		return "", err
 	}
 	expected := Entry{Path: item.Path, Type: item.Type, Mode: item.Mode.Perm(), SymlinkTarget: item.Target}
 	if item.Type == EntryRegular {
 		payload := filepath.Join(transaction.Directory, filepath.FromSlash(item.Payload))
-		payloadEntry, _, err := snapshotPath(payload, item.Path)
-		if err != nil {
-			return err
+		payloadEntry, _, snapshotErr := snapshotPath(payload, item.Path)
+		if snapshotErr != nil {
+			return captured, snapshotErr
 		}
 		expected.ContentHash = payloadEntry.ContentHash
 	}
-	if !reflect.DeepEqual(actual, expected) {
-		return &ConflictError{Paths: []string{item.Path}}
+	actual, exists, snapshotErr := snapshotPath(captured, item.Path)
+	if snapshotErr == nil && exists && reflect.DeepEqual(actual, expected) {
+		return captured, nil
 	}
-	return nil
+	restoreErr := applyRenameNoReplace(captured, target)
+	return captured, errors.Join(snapshotErr, restoreErr, &ConflictError{Paths: []string{item.Path}})
 }
 
 func pathBelowAny(name string, ancestors []string) bool {
