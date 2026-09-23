@@ -228,24 +228,28 @@ prepared
       -> cleanup-blocked
 ```
 
-Each manifest entry records:
+Entry phases are operation-specific:
 
 ```text
-pending
--> capture-intent
--> captured
--> publish-intent
--> published
--> rollback-capture-intent
--> rollback-captured
--> restored
+create: pending -> publish-intent -> published
+update/type transition:
+  pending -> capture-intent -> captured -> publish-intent -> published
+  -> rollback-capture-intent -> rollback-captured -> restored
+delete: pending -> capture-intent -> captured -> restored
+created parent directory:
+  pending -> publish-intent -> published -> rollback-capture-intent
+  -> rollback-captured -> restored
 ```
 
-The durable transition to `committed`, after all results have been published and revalidated, is the only commit point. A crash before it must never be interpreted as a successful Apply. Source-side temporary names are untrusted namespace entries even when randomly generated; no code may validate one and later call pathname-based `Remove` or `RemoveAll`. Cleanup first atomically captures a validated source-side entry into its predeclared transaction-private quarantine path, then recursively removes it only from that private location.
+The durable transition to `committed`, after all results have been published and revalidated, is the only commit point. A crash before it must never be interpreted as a successful Apply. The manifest records the applied tree and commit time before this transition and is authoritative if session storage was not saved before a crash. Recovery updates `LastAppliedTree` and `LastAppliedAt` when the session record exists; without one it still completes cleanup and reports an orphan committed transaction.
+
+Source-side temporary names are untrusted namespace entries even when randomly generated; no code may validate one and later call pathname-based `Remove` or `RemoveAll`. Cleanup first atomically captures a validated source-side entry into its predeclared transaction-private quarantine path, then recursively removes it only from that private location.
+
+Apply requires the source and shadow transaction root to be on the same filesystem so quarantine renames remain atomic. This is checked before source mutation. If they differ, Apply returns a precise unsupported-filesystem error while session creation, editing, and diff remain available.
 
 A successful apply pauses the session and records the applied source snapshot and time. It does not delete the session. Applying the same unchanged session again is a no-op. If the agent changes the session after resume, a subsequent apply performs a new three-way merge against the original session baseline and current source.
 
-The source root itself and files outside it are never deleted or overwritten. Symlink traversal is rejected during apply. The concurrency guarantee covers source namespace replacement. Claude Squad cannot prevent another process from modifying an inode through a writable descriptor that was opened before its pathname was atomically captured; such a change must be detected by subsequent identity/content validation and must not be reported as a successful Apply.
+The source root itself and files outside it are never deleted or overwritten. Symlink traversal is rejected during apply. The concurrency guarantee covers source namespace replacement. Claude Squad cannot prevent another process from modifying an inode through a writable descriptor that was opened before its pathname was atomically captured. Apply validates published results immediately before the durable `committed` transition; a descriptor write detected by that boundary prevents commit and triggers rollback. Writes after the durable commit point are new external source modifications and are not prevented or rolled back.
 
 ## Persistence and Compatibility
 
@@ -304,7 +308,9 @@ Partial resources are cleaned in reverse order. Existing `Instance.Start` cleanu
 
 Apply errors preserve the agent workspace. Conflict errors are typed and include sorted relative paths.
 
-Before creating or restoring a directory-mode session, Claude Squad scans the project's transaction directory. Manifest validation rejects symlinks, paths outside the canonical project/source roots, unknown versions or states, duplicate temporary names, and paths that cannot be reconstructed from trusted roots plus manifest-relative components. An invalid or ambiguous manifest fails closed as `recovery-blocked`; recovery does not guess or delete unknown entries.
+Before creating or restoring a directory-mode session, Claude Squad acquires a non-blocking project-level operating-system file lock and scans the project's transaction directory. Apply, automatic recovery, new-session baseline scanning, Resume, and reset transaction preflight use the same lock. Lock contention returns a precise operation-in-progress error immediately; lock files are never considered stale or deleted based on PID data, and the operating system releases ownership when a process exits.
+
+Manifest validation rejects symlinks, paths outside the canonical project/source roots, unknown versions or states, duplicate temporary names, and paths that cannot be reconstructed from trusted roots plus manifest-relative components. An invalid or ambiguous manifest produces an in-memory blocked report; untrusted manifest bytes are never rewritten merely to record a blocked state. Legacy incomplete manifests are also retained without mutation and reported for manual recovery. A transaction directory created before durable manifest publication can be removed automatically only after proving it is a non-symlinked direct child of the validated transaction root and that source mutation could not have begun.
 
 Recovery is automatic and idempotent:
 
@@ -313,10 +319,10 @@ Recovery is automatic and idempotent:
 - Original entries are restored only with atomic no-replace rename.
 - If an external writer has created content at a target needed for restoration, that content remains in place. The transaction becomes `recovery-blocked`, retains all recovery material, reports the conflict and retained paths, and requires manual resolution.
 - `committed` and `cleaning` transactions never roll back published results. They resume safe cleanup by atomically moving validated source-side temporary entries into transaction-private quarantine before deletion.
-- A cleanup identity mismatch or concurrent replacement becomes `cleanup-blocked`. The successful Apply remains committed, and all uncertain content is retained.
+- A cleanup identity mismatch or concurrent replacement becomes `cleanup-blocked`. The successful Apply remains committed, and all uncertain content is retained. Apply returns a successful result with a typed cleanup warning, and the application still saves the applied metadata and pauses the session while presenting the warning and retained paths.
 - Only durably `rolled-back` or `complete` transactions may remove their transaction metadata.
 
-Every recovery operation is re-entrant: another crash at any manifest transition or atomic rename must lead to the same safe rollback, cleanup, or blocked state on the next startup. A `recovery-blocked` project cannot create or restore sessions until resolved. Reset must report and preserve `recovery-blocked` and `cleanup-blocked` transactions rather than silently deleting them.
+Every recovery operation is re-entrant: another crash at any manifest transition or atomic rename must lead to the same safe rollback, cleanup, or blocked state on the next startup. A `recovery-blocked` project may restore persisted sessions only in read-only/viewable form; new sessions, Resume, and Apply are disabled until resolution. Reset must report and preserve `recovery-blocked` and `cleanup-blocked` transactions rather than silently deleting them.
 
 New transaction manifests use the durable state-machine schema above. Legacy incomplete manifests are not automatically inferred or mutated; they are retained and reported for manual recovery.
 
