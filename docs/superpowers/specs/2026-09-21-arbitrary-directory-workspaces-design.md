@@ -204,17 +204,48 @@ Conflicts are detected entirely in a transaction directory. The source directory
 
 When the merge is clean:
 
-1. Materialize the merged result in a transaction directory on the same filesystem when possible.
-2. Build an explicit manifest of creates, updates, deletes, modes, and symlink targets.
-3. Revalidate source files touched by the manifest against the `OURS` snapshot to close the scan-to-apply race.
-4. Back up only paths that will be changed or deleted.
-5. Apply files with temporary siblings and atomic rename; apply deletions only after backups exist.
-6. On failure, restore all touched paths from the backup manifest.
-7. Preserve ignored/shared/generated paths.
+1. Materialize the merged result and backups in a validated transaction directory on the same filesystem as the source. If the platform or filesystem cannot provide the required atomic no-replace rename semantics, fail before changing the source.
+2. Build a versioned write-ahead manifest containing every create, update, delete, mode, symlink target, source-side temporary name, private quarantine path, and expected content identity before any source mutation.
+3. Durably publish the manifest by writing and syncing a temporary file, atomically replacing the manifest, and syncing the transaction directory.
+4. Revalidate source files touched by the manifest against the `OURS` snapshot to close the scan-to-apply race.
+5. Drive every entry through a durable state machine. Each state transition is persisted and synced before the operation it authorizes.
+6. Capture an existing source entry with an atomic no-replace rename. This rename is the namespace linearization point. Validate the captured file, symlink, or directory tree after capture.
+7. Publish a staged result only with atomic no-replace rename into an absent target. A concurrently created target is preserved and causes rollback.
+8. On any failure before the durable commit point, roll back entries in reverse order. Restore original entries only with atomic no-replace rename.
+9. Preserve ignored/shared/generated paths.
+
+The transaction-level states are:
+
+```text
+prepared
+  -> applying
+    -> rolling-back
+      -> rolled-back
+      -> recovery-blocked
+  -> committed
+    -> cleaning
+      -> complete
+      -> cleanup-blocked
+```
+
+Each manifest entry records:
+
+```text
+pending
+-> capture-intent
+-> captured
+-> publish-intent
+-> published
+-> rollback-capture-intent
+-> rollback-captured
+-> restored
+```
+
+The durable transition to `committed`, after all results have been published and revalidated, is the only commit point. A crash before it must never be interpreted as a successful Apply. Source-side temporary names are untrusted namespace entries even when randomly generated; no code may validate one and later call pathname-based `Remove` or `RemoveAll`. Cleanup first atomically captures a validated source-side entry into its predeclared transaction-private quarantine path, then recursively removes it only from that private location.
 
 A successful apply pauses the session and records the applied source snapshot and time. It does not delete the session. Applying the same unchanged session again is a no-op. If the agent changes the session after resume, a subsequent apply performs a new three-way merge against the original session baseline and current source.
 
-The source root itself and files outside it are never deleted or overwritten. Symlink traversal is rejected during apply.
+The source root itself and files outside it are never deleted or overwritten. Symlink traversal is rejected during apply. The concurrency guarantee covers source namespace replacement. Claude Squad cannot prevent another process from modifying an inode through a writable descriptor that was opened before its pathname was atomically captured; such a change must be detected by subsequent identity/content validation and must not be reported as a successful Apply.
 
 ## Persistence and Compatibility
 
@@ -271,7 +302,25 @@ Session creation fails without registering a started session when:
 
 Partial resources are cleaned in reverse order. Existing `Instance.Start` cleanup behavior must be corrected as part of introducing the workspace lifecycle so setup failures do not leak worktrees.
 
-Apply errors preserve the agent workspace. Conflict errors are typed and include sorted relative paths. Rollback failures report both the original and rollback errors and retain transaction data for manual recovery. On next startup, incomplete transactions are detected and reported rather than discarded automatically.
+Apply errors preserve the agent workspace. Conflict errors are typed and include sorted relative paths.
+
+Before creating or restoring a directory-mode session, Claude Squad scans the project's transaction directory. Manifest validation rejects symlinks, paths outside the canonical project/source roots, unknown versions or states, duplicate temporary names, and paths that cannot be reconstructed from trusted roots plus manifest-relative components. An invalid or ambiguous manifest fails closed as `recovery-blocked`; recovery does not guess or delete unknown entries.
+
+Recovery is automatic and idempotent:
+
+- `prepared`, `applying`, and `rolling-back` transactions always resume reverse rollback.
+- Recovery combines the durable entry phase with actual target, captured, staged, and quarantine identities, because a crash can occur after an atomic filesystem operation but before its completion phase is persisted.
+- Original entries are restored only with atomic no-replace rename.
+- If an external writer has created content at a target needed for restoration, that content remains in place. The transaction becomes `recovery-blocked`, retains all recovery material, reports the conflict and retained paths, and requires manual resolution.
+- `committed` and `cleaning` transactions never roll back published results. They resume safe cleanup by atomically moving validated source-side temporary entries into transaction-private quarantine before deletion.
+- A cleanup identity mismatch or concurrent replacement becomes `cleanup-blocked`. The successful Apply remains committed, and all uncertain content is retained.
+- Only durably `rolled-back` or `complete` transactions may remove their transaction metadata.
+
+Every recovery operation is re-entrant: another crash at any manifest transition or atomic rename must lead to the same safe rollback, cleanup, or blocked state on the next startup. A `recovery-blocked` project cannot create or restore sessions until resolved. Reset must report and preserve `recovery-blocked` and `cleanup-blocked` transactions rather than silently deleting them.
+
+New transaction manifests use the durable state-machine schema above. Legacy incomplete manifests are not automatically inferred or mutated; they are retained and reported for manual recovery.
+
+Darwin uses `renameatx_np` with no-replace semantics, and Linux uses `renameat2` with `RENAME_NOREPLACE`. Other platforms and filesystems without the required semantics fail before the first source mutation.
 
 `cs reset` cleans native worktrees and shadow workspaces after validating containment. It must not touch source directories.
 
@@ -299,6 +348,12 @@ Using temporary directories and real Git commands:
 - Text, add/add, modify/delete, binary, and type conflicts leave the source unchanged.
 - Apply creates, updates, and deletes expected files while preserving ignored paths.
 - Injected mid-apply failure restores all touched source paths.
+- Deterministic crash injection before and after every durable manifest write, atomic capture, publication, restoration, and quarantine operation resumes automatic rollback or committed cleanup.
+- Recovery covers create, update, delete, regular-file/directory/symlink transitions, and repeated crashes during recovery itself.
+- A concurrent source replacement that blocks restoration remains unchanged and produces `recovery-blocked` with exact retained paths.
+- Replacing a source-side temporary entry before rollback or cleanup never deletes the replacement and produces a blocked state.
+- Malformed, symlinked, unknown-version, duplicate-path, and out-of-root manifests fail closed without source mutation.
+- Darwin and Linux run the same atomic no-replace operation contract; unsupported platforms fail before source mutation.
 - Reapplying an unchanged session is a no-op.
 - Git-mode tests continue to pass unchanged.
 
@@ -318,7 +373,8 @@ From a temporary directory with no `.git`:
 
 - Canonicalize and containment-check every internal cleanup path.
 - Never follow source symlinks while scanning or applying.
-- Never overwrite a source path that changed after the final pre-apply validation.
+- Never overwrite or delete a source namespace entry that changed after final validation; every destructive source operation must be bound to an atomic no-replace capture or publication step.
+- Never apply ordinary pathname-based `Remove` or `RemoveAll` to a source-side temporary entry after validating it; quarantine it atomically into transaction-private storage first.
 - Never mutate the source on merge conflict.
 - Never place shadow repository metadata inside the source directory.
 - Do not use force operations against user repositories in directory mode.
