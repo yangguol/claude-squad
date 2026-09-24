@@ -27,6 +27,7 @@ type applyEntry struct {
 	SymlinkTarget string
 }
 
+var applyPlanStartHook func()
 var applyPlanAfterImportsHook func()
 
 var mergeTreeCommand = func(dir string, args ...string) ([]byte, error) {
@@ -1044,6 +1045,9 @@ func FindIncompleteTransactions(root string) ([]Transaction, error) {
 }
 
 func (w *shadowWorkspace) planApply() (plan applyPlan, returnErr error) {
+	if applyPlanStartHook != nil {
+		applyPlanStartHook()
+	}
 	if err := validateShadowData(w.data); err != nil {
 		return plan, err
 	}

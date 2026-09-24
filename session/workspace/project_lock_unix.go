@@ -59,21 +59,22 @@ func platformVerifyDirectoryEntry(parent *os.File, name string, directory *os.Fi
 	return nil
 }
 
-func platformOpenProjectLockAt(shadowDirectory, lockDirectory *os.File, projectID string) (*os.File, *os.File, error) {
+func platformOpenProjectLockAt(shadowDirectory, lockDirectory *os.File, projectID string) (*os.File, error) {
 	coordinatorFD, err := unix.Openat(int(shadowDirectory.Fd()), "."+projectID+".lock-coordinator", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	coordinator := os.NewFile(uintptr(coordinatorFD), ".locks.coordinator")
+	if err := unix.Close(coordinatorFD); err != nil {
+		return nil, err
+	}
 	lockFD, err := unix.Openat(int(lockDirectory.Fd()), projectID+".lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
-		_ = coordinator.Close()
 		if errors.Is(err, unix.ELOOP) {
-			return nil, nil, fmt.Errorf("refuse symlink lock file: %w", err)
+			return nil, fmt.Errorf("refuse symlink lock file: %w", err)
 		}
-		return nil, nil, err
+		return nil, err
 	}
-	return os.NewFile(uintptr(lockFD), projectID+".lock"), coordinator, nil
+	return os.NewFile(uintptr(lockFD), projectID+".lock"), nil
 }
 
 func platformAcquireProjectLock(file *os.File) error {

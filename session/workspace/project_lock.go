@@ -40,29 +40,40 @@ func AcquireProjectLock(projectPath, operation string) (*ProjectLock, error) {
 		return nil, fmt.Errorf("open shadow projects directory: %w", err)
 	}
 	defer shadowDirectory.Close()
+	projectDirectory, err := platformOpenOrCreateDirectoryAt(shadowDirectory, projectID, 0o700)
+	if err != nil {
+		return nil, fmt.Errorf("open project directory: %w", err)
+	}
+	if err := platformVerifyDirectoryEntry(shadowDirectory, projectID, projectDirectory); err != nil {
+		_ = projectDirectory.Close()
+		return nil, fmt.Errorf("project directory changed: %w", err)
+	}
 	lockDirectory, err := platformOpenOrCreateDirectoryAt(shadowDirectory, ".locks", 0o700)
 	if err != nil {
+		_ = projectDirectory.Close()
 		return nil, fmt.Errorf("open project lock directory: %w", err)
 	}
 	defer lockDirectory.Close()
 	if err := platformVerifyDirectoryEntry(shadowDirectory, ".locks", lockDirectory); err != nil {
+		_ = projectDirectory.Close()
 		return nil, fmt.Errorf("project lock directory changed: %w", err)
 	}
 	if projectLockAfterDirectoryVerificationHook != nil {
 		projectLockAfterDirectoryVerificationHook()
 	}
-	file, coordinator, err := platformOpenProjectLockAt(shadowDirectory, lockDirectory, projectID)
+	file, err := platformOpenProjectLockAt(shadowDirectory, lockDirectory, projectID)
 	if err != nil {
+		_ = projectDirectory.Close()
 		return nil, fmt.Errorf("open project lock: %w", err)
 	}
-	if err := platformAcquireProjectLock(coordinator); err != nil {
-		closeErr := errors.Join(file.Close(), coordinator.Close())
+	if err := platformAcquireProjectLock(projectDirectory); err != nil {
+		closeErr := errors.Join(file.Close(), projectDirectory.Close())
 		if isProjectLockContention(err) {
 			return nil, errors.Join(&OperationInProgressError{ProjectID: projectID, Operation: operation}, closeErr)
 		}
 		return nil, errors.Join(fmt.Errorf("acquire project lock: %w", err), closeErr)
 	}
-	return &ProjectLock{file: file, coordinator: coordinator}, nil
+	return &ProjectLock{file: file, coordinator: projectDirectory}, nil
 }
 
 // Close releases the project lock.

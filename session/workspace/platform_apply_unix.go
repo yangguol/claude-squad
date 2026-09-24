@@ -55,7 +55,13 @@ func platformAtomicApplyPreflight(sourcePath, transactionRoot string) error {
 	if err := requireSameDevice(sourceDevice, uint64(transactionStat.Dev)); err != nil {
 		return err
 	}
-	return platformProbeAtomicNoReplace(transactionDirectory)
+	if err := platformProbeAtomicNoReplace(transactionDirectory); err != nil {
+		return err
+	}
+	if err := platformVerifyDirectoryEntry(projectDirectory, filepath.Base(transactionRoot), transactionDirectory); err != nil {
+		return fmt.Errorf("transaction root changed: %w", err)
+	}
+	return nil
 }
 
 func platformProbeAtomicNoReplace(directory *os.File) error {

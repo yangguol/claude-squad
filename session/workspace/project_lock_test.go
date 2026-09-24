@@ -88,6 +88,36 @@ func TestProjectLockRejectsSymlinkedLockFile(t *testing.T) {
 	require.Equal(t, "outside", mustReadFile(t, outside))
 }
 
+func TestProjectLockCoordinatorReplacementCannotSplitSerialization(t *testing.T) {
+	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
+	projectPath := filepath.Join(shadowProjects, "project")
+	first, err := AcquireProjectLock(projectPath, "apply")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = first.Close() })
+
+	coordinator := filepath.Join(shadowProjects, ".project.lock-coordinator")
+	parked := coordinator + ".parked"
+	require.NoError(t, os.Rename(coordinator, parked))
+	require.NoError(t, os.WriteFile(coordinator, nil, 0o600))
+
+	_, err = AcquireProjectLock(projectPath, "reset")
+	var inProgress *OperationInProgressError
+	require.ErrorAs(t, err, &inProgress, "replacing the coordinator pathname must not create a second lock domain")
+	require.Equal(t, "project", inProgress.ProjectID)
+	require.Equal(t, "reset", inProgress.Operation)
+}
+
+func TestProjectLocksForDistinctProjectsRemainIndependent(t *testing.T) {
+	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
+	first, err := AcquireProjectLock(filepath.Join(shadowProjects, "first"), "apply")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = first.Close() })
+
+	second, err := AcquireProjectLock(filepath.Join(shadowProjects, "second"), "apply")
+	require.NoError(t, err)
+	require.NoError(t, second.Close())
+}
+
 func TestProjectLockHandlesLockDirectorySubstitutionWithoutAliasEscape(t *testing.T) {
 	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
 	lockRoot := filepath.Join(shadowProjects, ".locks")
@@ -187,6 +217,79 @@ func TestApplyRejectsSymlinkedTransactionRootBeforeOutsideMutation(t *testing.T)
 	entries, readErr := os.ReadDir(outside)
 	require.NoError(t, readErr)
 	require.Empty(t, entries)
+}
+
+func TestAtomicApplyPreflightRejectsTransactionRootSubstitutionAfterProbe(t *testing.T) {
+	source := t.TempDir()
+	projectPath := t.TempDir()
+	transactionRoot := filepath.Join(projectPath, "transactions")
+	parked := filepath.Join(projectPath, "transactions-parked")
+	outside := t.TempDir()
+
+	originalHook := atomicApplyAfterTransactionRootVerificationHook
+	originalRename := platformAtomicRenameNoReplace
+	probeCalls := 0
+	atomicApplyAfterTransactionRootVerificationHook = func() {
+		atomicApplyAfterTransactionRootVerificationHook = nil
+		require.NoError(t, os.Rename(transactionRoot, parked))
+		require.NoError(t, os.Symlink(outside, transactionRoot))
+	}
+	platformAtomicRenameNoReplace = func(directoryFD int, source, destination string) error {
+		probeCalls++
+		return originalRename(directoryFD, source, destination)
+	}
+	t.Cleanup(func() {
+		atomicApplyAfterTransactionRootVerificationHook = originalHook
+		platformAtomicRenameNoReplace = originalRename
+	})
+
+	err := atomicApplyPreflight(source, transactionRoot)
+	require.ErrorContains(t, err, "transaction root changed")
+	require.Equal(t, 2, probeCalls, "substitution must be detected after all descriptor-relative probes")
+	outsideEntries, readErr := os.ReadDir(outside)
+	require.NoError(t, readErr)
+	require.Empty(t, outsideEntries)
+	parkedEntries, readErr := os.ReadDir(parked)
+	require.NoError(t, readErr)
+	require.Empty(t, parkedEntries)
+}
+
+func TestApplyRejectsTransactionRootSubstitutionBeforePlanning(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	before := mustSnapshot(t, source)
+
+	projectPath := filepath.Dir(workspace.data.RepoPath)
+	transactionRoot := filepath.Join(projectPath, "transactions")
+	parked := filepath.Join(projectPath, "transactions-parked")
+	outside := t.TempDir()
+	originalRootHook := atomicApplyAfterTransactionRootVerificationHook
+	originalPlanHook := applyPlanStartHook
+	planReached := false
+	atomicApplyAfterTransactionRootVerificationHook = func() {
+		atomicApplyAfterTransactionRootVerificationHook = nil
+		require.NoError(t, os.Rename(transactionRoot, parked))
+		require.NoError(t, os.Symlink(outside, transactionRoot))
+	}
+	applyPlanStartHook = func() { planReached = true }
+	t.Cleanup(func() {
+		atomicApplyAfterTransactionRootVerificationHook = originalRootHook
+		applyPlanStartHook = originalPlanHook
+	})
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "transaction root changed")
+	require.False(t, planReached, "planApply must not be reached after failed preflight")
+	require.Equal(t, before, mustSnapshot(t, source))
+	outsideEntries, readErr := os.ReadDir(outside)
+	require.NoError(t, readErr)
+	require.Empty(t, outsideEntries)
+	parkedEntries, readErr := os.ReadDir(parked)
+	require.NoError(t, readErr)
+	require.Empty(t, parkedEntries)
 }
 
 func TestApplyRejectsTransactionRootSubstitutionBeforeProbe(t *testing.T) {
