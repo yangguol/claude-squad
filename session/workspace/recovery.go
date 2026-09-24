@@ -2,8 +2,6 @@ package workspace
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +27,7 @@ type DiscoveredTransaction struct {
 func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 	projectPath = filepath.Clean(projectPath)
 	transactionRoot := filepath.Join(projectPath, "transactions")
-	if err := validateRecoveryDirectory(projectPath, projectPath, "project"); err != nil {
+	if err := validateCanonicalTrustedDirectory(projectPath, "project"); err != nil {
 		return nil, err
 	}
 	rootInfo, err := os.Lstat(transactionRoot)
@@ -49,9 +47,9 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open transaction root: %w", err)
 	}
-	entries, readErr := rootDirectory.ReadDir(-1)
-	closeErr := rootDirectory.Close()
-	if err := errors.Join(readErr, closeErr); err != nil {
+	defer rootDirectory.Close()
+	entries, err := rootDirectory.ReadDir(-1)
+	if err != nil {
 		return nil, fmt.Errorf("read transaction root: %w", err)
 	}
 	currentRootInfo, err := os.Lstat(transactionRoot)
@@ -61,11 +59,15 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	result := make([]DiscoveredTransaction, 0, len(entries))
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".cleanup.json") {
-			continue
-		}
 		directory := filepath.Join(transactionRoot, entry.Name())
 		discovered := DiscoveredTransaction{Directory: directory}
+		if strings.HasSuffix(entry.Name(), ".cleanup.json") {
+			if err := validateLegacyCleanupMarker(directory, entry); err != nil {
+				discovered.Invalid = err
+				result = append(result, discovered)
+			}
+			continue
+		}
 		info, statErr := os.Lstat(directory)
 		if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || entry.Type()&os.ModeSymlink != 0 {
 			discovered.Invalid = errorsJoinMessage(statErr, "transaction entry is not a real directory")
@@ -76,7 +78,10 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 		manifestInfo, manifestErr := os.Lstat(manifestPath)
 		if errors.Is(manifestErr, os.ErrNotExist) {
 			discovered.Orphan = true
-			if removeErr := removeOrphanTransaction(projectPath, directory); removeErr != nil {
+			quarantineName, nameErr := randomProbeName(".orphan-")
+			if nameErr != nil {
+				discovered.Invalid = nameErr
+			} else if removeErr := removeOrphanAt(rootDirectory, entry.Name(), quarantineName); removeErr != nil {
 				discovered.Invalid = removeErr
 			}
 			result = append(result, discovered)
@@ -152,6 +157,9 @@ func ReadManifestStrict(projectPath, transactionDir string) (TransactionManifest
 }
 
 func decodeManifestStrict(contents []byte) (TransactionManifest, error) {
+	if err := rejectDuplicateJSONMembers(contents); err != nil {
+		return TransactionManifest{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(contents))
 	decoder.DisallowUnknownFields()
 	var manifest TransactionManifest
@@ -168,7 +176,68 @@ func decodeManifestStrict(contents []byte) (TransactionManifest, error) {
 	return manifest, nil
 }
 
+func rejectDuplicateJSONMembers(contents []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	var parse func() error
+	parse = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, structured := token.(json.Delim)
+		if !structured {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("JSON object member name is not a string")
+				}
+				if _, exists := seen[key]; exists {
+					return fmt.Errorf("duplicate JSON object member %q", key)
+				}
+				seen[key] = struct{}{}
+				if err := parse(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		case '[':
+			for decoder.More() {
+				if err := parse(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		default:
+			return errors.New("unexpected JSON delimiter")
+		}
+	}
+	if err := parse(); err != nil {
+		return fmt.Errorf("decode transaction manifest structure: %w", err)
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return fmt.Errorf("decode transaction manifest trailing data: %w", err)
+	}
+	return nil
+}
+
 func manifestVersion(contents []byte) (int, error) {
+	if err := rejectDuplicateJSONMembers(contents); err != nil {
+		return 0, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(contents))
 	var envelope struct {
 		Version int `json:"version"`
@@ -188,6 +257,9 @@ func manifestVersion(contents []byte) (int, error) {
 func ValidateManifest(projectPath, transactionDir string, manifest TransactionManifest) error {
 	projectPath = filepath.Clean(projectPath)
 	transactionDir = filepath.Clean(transactionDir)
+	if err := validateCanonicalTrustedDirectory(projectPath, "project"); err != nil {
+		return err
+	}
 	if err := validateTransactionDirectory(projectPath, transactionDir); err != nil {
 		return err
 	}
@@ -197,6 +269,12 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 	}
 	projectID := filepath.Base(projectPath)
 	if err := validateProjectMetadata(metadata, projectID, metadata.SourcePath); err != nil {
+		return err
+	}
+	if projectID != shadowProjectID(metadata.SourcePath) {
+		return errors.New("shadow project metadata source identity mismatch")
+	}
+	if err := validateCanonicalTrustedDirectory(metadata.SourcePath, "source"); err != nil {
 		return err
 	}
 	if manifest.Version != CurrentTransactionVersion {
@@ -217,11 +295,11 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 	if !filepath.IsAbs(manifest.SourcePath) || filepath.Clean(manifest.SourcePath) != manifest.SourcePath {
 		return errors.New("transaction source path is not canonical")
 	}
-	if err := validateRecoveryDirectory(manifest.SourcePath, manifest.SourcePath, "source"); err != nil {
+	if err := validateCanonicalTrustedDirectory(manifest.SourcePath, "source"); err != nil {
 		return err
 	}
 
-	targets, temporaryPaths := map[string]bool{}, map[string]bool{}
+	sourcePaths, transactionPaths := map[string]bool{}, map[string]bool{}
 	for index, entry := range manifest.Entries {
 		if !validOperation(entry.Operation) || !validEntryPhase(entry.Phase) || !validCleanupPhase(entry.CleanupPhase) || !phaseAllowed(entry.Operation, entry.Phase) {
 			return fmt.Errorf("transaction entry %d has invalid operation or phase", index)
@@ -232,19 +310,26 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		if err := ensureReconstructiblePath(manifest.SourcePath, entry.Path, "target"); err != nil {
 			return fmt.Errorf("transaction entry %d: %w", index, err)
 		}
-		if targets[entry.Path] {
-			return fmt.Errorf("duplicate transaction target path %q", entry.Path)
+		targetIdentity := filepath.Clean(filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.Path)))
+		if sourcePaths[targetIdentity] {
+			return fmt.Errorf("duplicate transaction source path %q", entry.Path)
 		}
-		targets[entry.Path] = true
+		sourcePaths[targetIdentity] = true
 		for _, field := range []struct {
 			name, value string
 			root        string
 			sourceSide  bool
+			required    bool
 		}{
-			{"stage", entry.StagePath, transactionDir, false}, {"capture", entry.CaptureName, manifest.SourcePath, true},
-			{"rollback capture", entry.RollbackCaptureName, manifest.SourcePath, true}, {"quarantine", entry.QuarantinePath, transactionDir, false},
+			{"stage", entry.StagePath, transactionDir, false, entry.Operation == EntryOperationCreate || entry.Operation == EntryOperationUpdate},
+			{"capture", entry.CaptureName, manifest.SourcePath, true, entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationDelete},
+			{"rollback capture", entry.RollbackCaptureName, manifest.SourcePath, true, entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationCreatedParent},
+			{"quarantine", entry.QuarantinePath, transactionDir, false, true},
 		} {
 			if field.value == "" {
+				if field.required {
+					return fmt.Errorf("transaction entry %d is missing %s path", index, field.name)
+				}
 				continue
 			}
 			if err := validateRelativeManifestPath(field.value); err != nil {
@@ -256,10 +341,15 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			if err := ensureReconstructiblePath(field.root, field.value, field.name); err != nil {
 				return fmt.Errorf("transaction entry %d: %w", index, err)
 			}
-			if temporaryPaths[field.value] {
-				return fmt.Errorf("duplicate transaction temporary path %q", field.value)
+			identity := filepath.Clean(filepath.Join(field.root, filepath.FromSlash(field.value)))
+			namespace := transactionPaths
+			if field.sourceSide {
+				namespace = sourcePaths
 			}
-			temporaryPaths[field.value] = true
+			if namespace[identity] {
+				return fmt.Errorf("duplicate transaction %s namespace path %q", field.name, field.value)
+			}
+			namespace[identity] = true
 		}
 		if entry.Expected != nil && entry.Expected.Path != "" && entry.Expected.Path != entry.Path {
 			return fmt.Errorf("transaction entry %d expected path mismatch", index)
@@ -267,9 +357,22 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		if entry.Result != nil && entry.Result.Path != "" && entry.Result.Path != entry.Path {
 			return fmt.Errorf("transaction entry %d result path mismatch", index)
 		}
+		treePaths := make([]string, 0, len(entry.ExpectedTree))
 		for name, treeEntry := range entry.ExpectedTree {
-			if err := validateRelativeManifestPath(name); err != nil || (treeEntry.Path != "" && treeEntry.Path != name) {
+			if err := validateRelativeManifestPath(name); err != nil || treeEntry.Path != name {
 				return fmt.Errorf("transaction entry %d has invalid expected tree path %q", index, name)
+			}
+			if err := ensureReconstructiblePath(manifest.SourcePath, filepath.ToSlash(filepath.Join(filepath.FromSlash(entry.Path), filepath.FromSlash(name))), "expected tree"); err != nil {
+				return fmt.Errorf("transaction entry %d expected tree path %q: %w", index, name, err)
+			}
+			treePaths = append(treePaths, name)
+		}
+		sort.Strings(treePaths)
+		for treeIndex, name := range treePaths {
+			for _, other := range treePaths[treeIndex+1:] {
+				if strings.HasPrefix(other, name+"/") {
+					return fmt.Errorf("transaction entry %d expected tree paths %q and %q overlap", index, name, other)
+				}
 			}
 		}
 	}
@@ -391,6 +494,48 @@ func readProjectMetadataStrict(projectPath string) (shadowProjectMetadata, error
 	return metadata, nil
 }
 
+func validateCanonicalTrustedDirectory(path, label string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("%s path is not canonical", label)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve %s path: %w", label, err)
+	}
+	if filepath.Clean(resolved) != path {
+		return fmt.Errorf("%s path contains a symlinked component", label)
+	}
+	return validateRecoveryDirectory(path, path, label)
+}
+
+func validateLegacyCleanupMarker(path string, entry os.DirEntry) error {
+	info, err := os.Lstat(path)
+	if err != nil || !entry.Type().IsRegular() || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errorsJoinMessage(err, "legacy cleanup marker is not a real regular file")
+	}
+	contents, err := readStableRegularFile(path, info)
+	if err != nil {
+		return err
+	}
+	if err := rejectDuplicateJSONMembers(contents); err != nil {
+		return fmt.Errorf("invalid legacy cleanup marker: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	var transaction Transaction
+	if err := decoder.Decode(&transaction); err != nil {
+		return fmt.Errorf("invalid legacy cleanup marker: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("invalid legacy cleanup marker trailing JSON")
+	}
+	if transaction.Version != 1 || transaction.State != transactionCommitted || transaction.SourcePath == "" || transaction.SessionID == "" {
+		return errors.New("invalid legacy cleanup marker contents")
+	}
+	return nil
+}
+
 func validateTransactionDirectory(projectPath, transactionDir string) error {
 	root := filepath.Join(filepath.Clean(projectPath), "transactions")
 	if filepath.Dir(filepath.Clean(transactionDir)) != root {
@@ -438,54 +583,31 @@ func readStableRegularFile(path string, expected os.FileInfo) ([]byte, error) {
 	return contents, nil
 }
 
+var orphanBeforeQuarantineHook func()
+var orphanAfterQuarantineHook func(string)
+
 func removeOrphanTransaction(projectPath, transactionDir string) error {
 	root := filepath.Join(filepath.Clean(projectPath), "transactions")
 	if filepath.Dir(filepath.Clean(transactionDir)) != root {
 		return errors.New("orphan transaction is not a direct child of transaction root")
 	}
+	if err := validateCanonicalTrustedDirectory(projectPath, "project"); err != nil {
+		return err
+	}
 	if err := validateRecoveryDirectory(projectPath, root, "transaction root"); err != nil {
 		return err
 	}
-	rootInfo, err := os.Lstat(root)
+	rootDirectory, err := platformOpenTrustedDirectory(root)
 	if err != nil {
-		return fmt.Errorf("inspect transaction root: %w", err)
+		return fmt.Errorf("open transaction root: %w", err)
 	}
-	info, err := os.Lstat(transactionDir)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errorsJoinMessage(err, "orphan transaction is not a real directory")
+	defer rootDirectory.Close()
+	if orphanBeforeQuarantineHook != nil {
+		orphanBeforeQuarantineHook()
 	}
-	if err := ensureRealContainedPath(root, transactionDir, false, "orphan transaction"); err != nil {
+	quarantineName, err := randomProbeName(".orphan-")
+	if err != nil {
 		return err
 	}
-	manifestPath := filepath.Join(transactionDir, "manifest.json")
-	if _, err := os.Lstat(manifestPath); !errors.Is(err, os.ErrNotExist) {
-		return errorsJoinMessage(err, "orphan transaction acquired a manifest")
-	}
-	currentRootInfo, err := os.Lstat(root)
-	if err != nil || !os.SameFile(rootInfo, currentRootInfo) || !currentRootInfo.IsDir() || currentRootInfo.Mode()&os.ModeSymlink != 0 {
-		return errorsJoinMessage(err, "transaction root changed before orphan quarantine")
-	}
-	currentInfo, err := os.Lstat(transactionDir)
-	if err != nil || !os.SameFile(info, currentInfo) || !currentInfo.IsDir() || currentInfo.Mode()&os.ModeSymlink != 0 {
-		return errorsJoinMessage(err, "orphan transaction changed before quarantine")
-	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return err
-	}
-	quarantine := filepath.Join(root, ".orphan-"+hex.EncodeToString(nonce[:]))
-	if err := os.Rename(transactionDir, quarantine); err != nil {
-		return fmt.Errorf("quarantine orphan transaction: %w", err)
-	}
-	quarantined, err := os.Lstat(quarantine)
-	if err != nil || !quarantined.IsDir() || quarantined.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, quarantined) {
-		return errorsJoinMessage(err, "quarantined orphan transaction changed identity")
-	}
-	if _, err := os.Lstat(filepath.Join(quarantine, "manifest.json")); !errors.Is(err, os.ErrNotExist) {
-		return errorsJoinMessage(err, "quarantined orphan transaction contains a manifest")
-	}
-	if err := os.RemoveAll(quarantine); err != nil {
-		return fmt.Errorf("remove quarantined orphan transaction: %w", err)
-	}
-	return nil
+	return removeOrphanAt(rootDirectory, filepath.Base(transactionDir), quarantineName)
 }

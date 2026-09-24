@@ -11,10 +11,13 @@ import (
 
 func recoveryProject(t *testing.T) (string, string) {
 	t.Helper()
-	source := t.TempDir()
+	source, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
 	projectID := shadowProjectID(source)
 	project := filepath.Join(t.TempDir(), projectID)
 	require.NoError(t, os.MkdirAll(filepath.Join(project, "transactions"), 0o700))
+	project, err = filepath.EvalSymlinks(project)
+	require.NoError(t, err)
 	contents, err := json.Marshal(shadowProjectMetadata{Version: CurrentVersion, ProjectID: projectID, SourcePath: source})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(project, "metadata.json"), contents, 0o600))
@@ -225,6 +228,176 @@ func TestDiscoverySortsTransactionsAndIssuesDeterministically(t *testing.T) {
 	require.True(t, discovered[1].Legacy)
 	require.True(t, discovered[2].Orphan)
 	require.Error(t, discovered[3].Invalid)
+}
+
+func TestReadManifestStrictRejectsDuplicateMembersRecursively(t *testing.T) {
+	project, source := recoveryProject(t)
+	tests := map[string]string{
+		"top-level version":   `{"version":2,"version":2,"transaction_id":"tx","project_id":` + mustJSON(t, filepath.Base(project)) + `,"session_id":"session","source_path":` + mustJSON(t, source) + `,"state":"prepared","entries":[]}`,
+		"nested entry path":   `{"version":2,"transaction_id":"tx","project_id":` + mustJSON(t, filepath.Base(project)) + `,"session_id":"session","source_path":` + mustJSON(t, source) + `,"state":"prepared","entries":[{"path":"file","path":"other","operation":"update","phase":"pending","cleanup_phase":"pending"}]}`,
+		"expected tree entry": `{"version":2,"transaction_id":"tx","project_id":` + mustJSON(t, filepath.Base(project)) + `,"session_id":"session","source_path":` + mustJSON(t, source) + `,"state":"prepared","entries":[{"path":"dir","stage_path":"stage/dir","capture_name":".capture-dir","rollback_capture_name":".rollback-dir","quarantine_path":".quarantine-dir","operation":"update","phase":"pending","cleanup_phase":"pending","expected_tree":{"child":{"path":"child","path":"other","type":"regular","mode":420}}}]}`,
+	}
+	for name, contents := range tests {
+		t.Run(name, func(t *testing.T) {
+			directory := filepath.Join(project, "transactions", "tx")
+			require.NoError(t, os.Mkdir(directory, 0o700))
+			t.Cleanup(func() { require.NoError(t, os.RemoveAll(directory)) })
+			require.NoError(t, os.WriteFile(filepath.Join(directory, "manifest.json"), []byte(contents), 0o600))
+			_, err := ReadManifestStrict(project, directory)
+			require.ErrorContains(t, err, "duplicate JSON object member")
+		})
+	}
+}
+
+func TestValidateManifestUsesCanonicalTrustedRootsAndMetadataIdentity(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+
+	t.Run("project symlink alias", func(t *testing.T) {
+		alias := filepath.Join(t.TempDir(), filepath.Base(project))
+		require.NoError(t, os.Symlink(project, alias))
+		require.Error(t, ValidateManifest(alias, filepath.Join(alias, "transactions", "tx"), validRecoveryManifest(project, source, "tx")))
+	})
+	t.Run("source symlink in trusted metadata", func(t *testing.T) {
+		alias := filepath.Join(t.TempDir(), "source")
+		require.NoError(t, os.Symlink(source, alias))
+		id := shadowProjectID(alias)
+		badProject := filepath.Join(t.TempDir(), id)
+		require.NoError(t, os.MkdirAll(filepath.Join(badProject, "transactions", "tx"), 0o700))
+		metadata, err := json.Marshal(shadowProjectMetadata{Version: CurrentVersion, ProjectID: id, SourcePath: alias})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(badProject, "metadata.json"), metadata, 0o600))
+		require.Error(t, ValidateManifest(badProject, filepath.Join(badProject, "transactions", "tx"), validRecoveryManifest(badProject, alias, "tx")))
+	})
+	t.Run("metadata project ID hash mismatch", func(t *testing.T) {
+		metadata, err := json.Marshal(shadowProjectMetadata{Version: CurrentVersion, ProjectID: filepath.Base(project), SourcePath: t.TempDir()})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(project, "metadata.json"), metadata, 0o600))
+		require.Error(t, ValidateManifest(project, directory, validRecoveryManifest(project, source, "tx")))
+	})
+}
+
+func TestValidateManifestSeparatesNamespacesAndRejectsActualCollisions(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+
+	allowed := validRecoveryManifest(project, source, "tx")
+	allowed.Entries[0].StagePath = ".capture-file"
+	require.NoError(t, ValidateManifest(project, directory, allowed), "same relative string in source and transaction roots is not a collision")
+
+	for name, mutate := range map[string]func(*TransactionManifest){
+		"source target and capture":        func(m *TransactionManifest) { m.Entries[0].CaptureName = m.Entries[0].Path },
+		"transaction stage and quarantine": func(m *TransactionManifest) { m.Entries[0].QuarantinePath = m.Entries[0].StagePath },
+	} {
+		t.Run(name, func(t *testing.T) {
+			manifest := validRecoveryManifest(project, source, "tx")
+			mutate(&manifest)
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
+}
+
+func TestValidateManifestRequiresRecoveryPathsAndValidExpectedTree(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+
+	for name, clear := range map[string]func(*TransactionEntry){
+		"stage":            func(e *TransactionEntry) { e.StagePath = "" },
+		"capture":          func(e *TransactionEntry) { e.CaptureName = "" },
+		"rollback capture": func(e *TransactionEntry) { e.RollbackCaptureName = "" },
+		"quarantine":       func(e *TransactionEntry) { e.QuarantinePath = "" },
+	} {
+		t.Run("missing "+name, func(t *testing.T) {
+			manifest := validRecoveryManifest(project, source, "tx")
+			clear(&manifest.Entries[0])
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
+
+	for name, tree := range map[string]map[string]Entry{
+		"empty key":         {"": {Path: "", Type: EntryRegular}},
+		"path mismatch":     {"child": {Path: "other", Type: EntryRegular}},
+		"target escape":     {"../outside": {Path: "../outside", Type: EntryRegular}},
+		"overlapping paths": {"parent": {Path: "parent", Type: EntryRegular}, "parent/child": {Path: "parent/child", Type: EntryRegular}},
+	} {
+		t.Run("expected tree "+name, func(t *testing.T) {
+			manifest := validRecoveryManifest(project, source, "tx")
+			manifest.Entries[0].Path = "directory"
+			manifest.Entries[0].ExpectedTree = tree
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
+
+	require.NoError(t, os.Mkdir(filepath.Join(source, "directory"), 0o700))
+	require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(source, "directory", "linked")))
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.Entries[0].Path = "directory"
+	manifest.Entries[0].ExpectedTree = map[string]Entry{"linked/child": {Path: "linked/child", Type: EntryRegular}}
+	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestDiscoveryValidatesCleanupMarkerTypeAndContents(t *testing.T) {
+	for name, setup := range map[string]func(*testing.T, string){
+		"directory":              func(t *testing.T, path string) { require.NoError(t, os.Mkdir(path, 0o700)) },
+		"symlink":                func(t *testing.T, path string) { require.NoError(t, os.Symlink(t.TempDir(), path)) },
+		"malformed regular file": func(t *testing.T, path string) { require.NoError(t, os.WriteFile(path, []byte(`{}`), 0o600)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			project, _ := recoveryProject(t)
+			setup(t, filepath.Join(project, "transactions", "tx.cleanup.json"))
+			discovered, err := DiscoverTransactions(project)
+			require.NoError(t, err)
+			require.Len(t, discovered, 1)
+			require.Error(t, discovered[0].Invalid)
+		})
+	}
+}
+
+func TestOrphanCleanupBindsRootAcrossSubstitution(t *testing.T) {
+	project, _ := recoveryProject(t)
+	root := filepath.Join(project, "transactions")
+	orphan := filepath.Join(root, "orphan")
+	require.NoError(t, os.Mkdir(orphan, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(orphan, "owned"), []byte("owned"), 0o600))
+	movedRoot := filepath.Join(filepath.Dir(root), "transactions-moved")
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "unowned"), []byte("unowned"), 0o600))
+
+	orphanBeforeQuarantineHook = func() {
+		require.NoError(t, os.Rename(root, movedRoot))
+		require.NoError(t, os.Symlink(outside, root))
+	}
+	t.Cleanup(func() { orphanBeforeQuarantineHook = nil })
+	err := removeOrphanTransaction(project, orphan)
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(outside, "unowned"))
+	require.NoFileExists(t, filepath.Join(movedRoot, "orphan", "owned"))
+}
+
+func TestOrphanCleanupRetainsOwnedAndUnownedContentAfterQuarantineSubstitution(t *testing.T) {
+	project, _ := recoveryProject(t)
+	root := filepath.Join(project, "transactions")
+	orphan := filepath.Join(root, "orphan")
+	require.NoError(t, os.Mkdir(orphan, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(orphan, "owned"), []byte("owned"), 0o600))
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "unowned"), []byte("unowned"), 0o600))
+	var retained string
+
+	orphanAfterQuarantineHook = func(quarantine string) {
+		quarantine = filepath.Join(root, quarantine)
+		retained = quarantine + "-retained"
+		require.NoError(t, os.Rename(quarantine, retained))
+		require.NoError(t, os.Symlink(outside, quarantine))
+	}
+	t.Cleanup(func() { orphanAfterQuarantineHook = nil })
+	err := removeOrphanTransaction(project, orphan)
+	require.Error(t, err)
+	require.FileExists(t, filepath.Join(outside, "unowned"))
+	require.FileExists(t, filepath.Join(retained, "owned"))
 }
 
 func mustReadBytes(t *testing.T, path string) []byte {

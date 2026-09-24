@@ -96,3 +96,62 @@ Task changes and this report are committed together as `feat(workspace): validat
 
 - This task adds the strict discovery/classification API but does not replace the legacy v1 apply executor or wire automatic recovery into workspace lifecycle; those are explicitly assigned to later durable-recovery tasks.
 - Orphan cleanup is safe only for a directory with no manifest at discovery/revalidation time, matching the invariant that source mutation cannot begin before a durable v2 manifest exists.
+
+## Fix Round 1
+
+### Status
+
+Complete. Hardened Task 3 against the seven review findings while preserving byte-for-byte legacy/invalid classification, deterministic discovery order, and Task 2 lock/preflight behavior.
+
+### Covering Files and Exact Tests
+
+- `session/workspace/recovery_test.go`
+  - `TestReadManifestStrictRejectsDuplicateMembersRecursively`
+  - `TestValidateManifestUsesCanonicalTrustedRootsAndMetadataIdentity`
+  - `TestValidateManifestSeparatesNamespacesAndRejectsActualCollisions`
+  - `TestValidateManifestRequiresRecoveryPathsAndValidExpectedTree`
+  - `TestDiscoveryValidatesCleanupMarkerTypeAndContents`
+  - `TestOrphanCleanupBindsRootAcrossSubstitution`
+  - `TestOrphanCleanupRetainsOwnedAndUnownedContentAfterQuarantineSubstitution`
+- `session/workspace/recovery.go`
+- `session/workspace/recovery_orphan_unix.go`
+
+### RED
+
+After adding the deterministic regression tests first, the focused command failed to build as expected because the orphan substitution seams did not exist:
+
+```text
+session/workspace/recovery_test.go:369:2: undefined: orphanBeforeQuarantineHook
+session/workspace/recovery_test.go:390:2: undefined: orphanAfterQuarantineHook
+FAIL claude-squad/session/workspace [build failed]
+```
+
+### Fixes
+
+- Orphan quarantine now opens and retains a stable transaction-root descriptor, captures with descriptor-relative atomic no-replace rename, verifies inode identity through descriptors, and recursively unlinks only descriptor-bound private content without following symlinks. Any substitution or ambiguous entry fails closed and retains content.
+- Strict manifest structure scanning rejects duplicate JSON object members recursively before version or typed decoding.
+- Trusted project and source roots must be absolute canonical real paths; canonical macOS temporary paths remain valid after test fixtures resolve them through `EvalSymlinks`.
+- Metadata validation now requires the project directory ID to equal `shadowProjectID(metadata.SourcePath)` before trusting manifest source identity.
+- Collision validation compares canonical reconstructed identities in separate source and transaction namespaces. Target/capture/rollback collisions and stage/quarantine collisions are rejected, while equal relative strings in disjoint roots are allowed.
+- Recovery-required paths are enforced by operation; every recovery path is reconstructed from its trusted root. `ExpectedTree` keys must match embedded paths, remain beneath the target, avoid unsafe existing parents, and not overlap ancestor/descendant entries.
+- Cleanup markers are ignored only after stable regular-file and strict committed-v1 marker validation; directories, symlinks, and malformed marker bytes are reported invalid.
+
+### GREEN and Regressions
+
+```text
+go test ./session/workspace -run '^(TestReadManifestStrict|TestValidateManifest|TestInvalidManifest|TestLegacyIncomplete|TestOrphan|TestDiscovery)' -count=1
+ok  claude-squad/session/workspace  0.809s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  171.678s
+
+go test ./... -count=1
+PASS (all repository packages)
+
+git diff --check
+PASS
+```
+
+### Concerns
+
+- Descriptor-bound orphan deletion is implemented for the repository's supported atomic-recovery platforms (`darwin` and `linux`); unsupported platforms remain outside the existing durable-apply support contract.
