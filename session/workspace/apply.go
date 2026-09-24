@@ -81,10 +81,18 @@ type Transaction struct {
 	Entries    []transactionEntry `json:"entries"`
 }
 
+type fileHandle interface {
+	io.Reader
+	io.Writer
+	Stat() (os.FileInfo, error)
+	Sync() error
+	Close() error
+}
+
 type fileOps interface {
 	Lstat(string) (os.FileInfo, error)
-	Open(string) (*os.File, error)
-	OpenFile(string, int, os.FileMode) (*os.File, error)
+	Open(string) (fileHandle, error)
+	OpenFile(string, int, os.FileMode) (fileHandle, error)
 	Readlink(string) (string, error)
 	Symlink(string, string) error
 	Rename(string, string) error
@@ -99,8 +107,8 @@ type fileOps interface {
 type osFileOps struct{}
 
 func (osFileOps) Lstat(name string) (os.FileInfo, error) { return os.Lstat(name) }
-func (osFileOps) Open(name string) (*os.File, error)     { return os.Open(name) }
-func (osFileOps) OpenFile(name string, flag int, mode os.FileMode) (*os.File, error) {
+func (osFileOps) Open(name string) (fileHandle, error)   { return os.Open(name) }
+func (osFileOps) OpenFile(name string, flag int, mode os.FileMode) (fileHandle, error) {
 	return os.OpenFile(name, flag, mode)
 }
 func (osFileOps) Readlink(name string) (string, error)  { return os.Readlink(name) }
