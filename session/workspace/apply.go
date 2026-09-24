@@ -144,7 +144,26 @@ func (p applyPlan) ChangedPaths() []string {
 	return paths
 }
 
-func (w *shadowWorkspace) Apply() (*ApplyResult, error) {
+func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
+	if err := validateShadowData(w.data); err != nil {
+		return nil, err
+	}
+	if err := validateShadowIdentity(w.data, true); err != nil {
+		return nil, err
+	}
+	projectPath := filepath.Dir(w.data.RepoPath)
+	lock, err := AcquireProjectLock(projectPath, "apply")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		returnErr = errors.Join(returnErr, lock.Close())
+	}()
+	transactionRoot := filepath.Join(projectPath, "transactions")
+	if err := atomicApplyPreflight(w.data.SourcePath, transactionRoot); err != nil {
+		return nil, err
+	}
+
 	plan, err := w.planApply()
 	if err != nil {
 		return nil, err
