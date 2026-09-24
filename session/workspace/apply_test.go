@@ -296,9 +296,9 @@ func TestApplyNoReplacePreflightFailsBeforeSourceMutation(t *testing.T) {
 	writeApplyFile(t, source, "file", "before", 0o644)
 	workspace := newApplyWorkspace(t, source)
 	writeApplyFile(t, workspace.WorkDir(), "file", "agent", 0o644)
-	original := applyRenameNoReplace
-	applyRenameNoReplace = func(string, string) error { return errors.New("unsupported no-replace backend") }
-	t.Cleanup(func() { applyRenameNoReplace = original })
+	original := platformAtomicRenameNoReplace
+	platformAtomicRenameNoReplace = func(int, string, string) error { return errors.New("unsupported no-replace backend") }
+	t.Cleanup(func() { platformAtomicRenameNoReplace = original })
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "atomic no-replace rename is unavailable")

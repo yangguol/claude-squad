@@ -88,24 +88,46 @@ func TestProjectLockRejectsSymlinkedLockFile(t *testing.T) {
 	require.Equal(t, "outside", mustReadFile(t, outside))
 }
 
+func TestProjectLockHandlesLockDirectorySubstitutionWithoutAliasEscape(t *testing.T) {
+	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
+	lockRoot := filepath.Join(shadowProjects, ".locks")
+	parked := filepath.Join(shadowProjects, ".locks-parked")
+	outside := t.TempDir()
+	require.NoError(t, os.MkdirAll(lockRoot, 0o700))
+
+	original := projectLockAfterDirectoryVerificationHook
+	projectLockAfterDirectoryVerificationHook = func() {
+		projectLockAfterDirectoryVerificationHook = nil
+		require.NoError(t, os.Rename(lockRoot, parked))
+		require.NoError(t, os.Symlink(outside, lockRoot))
+	}
+	t.Cleanup(func() { projectLockAfterDirectoryVerificationHook = original })
+
+	lock, err := AcquireProjectLock(filepath.Join(shadowProjects, "project"), "apply")
+	require.NoError(t, err)
+	require.NoFileExists(t, filepath.Join(outside, "project.lock"))
+	require.FileExists(t, filepath.Join(parked, "project.lock"))
+
+	require.NoError(t, os.Remove(lockRoot))
+	require.NoError(t, os.Mkdir(lockRoot, 0o700))
+	_, err = AcquireProjectLock(filepath.Join(shadowProjects, "project"), "reset")
+	var inProgress *OperationInProgressError
+	require.ErrorAs(t, err, &inProgress, "the stable project coordinator must prevent a replacement directory from escaping serialization")
+	require.NoError(t, lock.Close())
+	second, err := AcquireProjectLock(filepath.Join(shadowProjects, "project"), "reset")
+	require.NoError(t, err)
+	require.NoError(t, second.Close())
+}
+
 func TestProbeAtomicNoReplaceExercisesCollisionAndPreservesDestination(t *testing.T) {
 	transactionRoot := t.TempDir()
-	original := applyRenameNoReplace
+	original := platformAtomicRenameNoReplace
 	calls := 0
-	applyRenameNoReplace = func(source, destination string) error {
+	platformAtomicRenameNoReplace = func(directoryFD int, source, destination string) error {
 		calls++
-		if calls == 1 {
-			_, err := os.Lstat(destination)
-			require.ErrorIs(t, err, os.ErrNotExist)
-			return original(source, destination)
-		}
-		require.Equal(t, "probe-owned destination", mustReadFile(t, destination))
-		err := original(source, destination)
-		require.Error(t, err)
-		require.Equal(t, "probe-owned destination", mustReadFile(t, destination))
-		return err
+		return original(directoryFD, source, destination)
 	}
-	t.Cleanup(func() { applyRenameNoReplace = original })
+	t.Cleanup(func() { platformAtomicRenameNoReplace = original })
 
 	require.NoError(t, ProbeAtomicNoReplace(transactionRoot))
 	require.Equal(t, 2, calls)
@@ -150,13 +172,13 @@ func TestApplyRejectsSymlinkedTransactionRootBeforeOutsideMutation(t *testing.T)
 	projectPath := filepath.Dir(workspace.data.RepoPath)
 	outside := t.TempDir()
 	require.NoError(t, os.Symlink(outside, filepath.Join(projectPath, "transactions")))
-	original := applyRenameNoReplace
+	original := platformAtomicRenameNoReplace
 	probeAttempted := false
-	applyRenameNoReplace = func(source, destination string) error {
+	platformAtomicRenameNoReplace = func(directoryFD int, source, destination string) error {
 		probeAttempted = true
-		return original(source, destination)
+		return original(directoryFD, source, destination)
 	}
-	t.Cleanup(func() { applyRenameNoReplace = original })
+	t.Cleanup(func() { platformAtomicRenameNoReplace = original })
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "symlink")
@@ -167,6 +189,36 @@ func TestApplyRejectsSymlinkedTransactionRootBeforeOutsideMutation(t *testing.T)
 	require.Empty(t, entries)
 }
 
+func TestApplyRejectsTransactionRootSubstitutionBeforeProbe(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	before := mustSnapshot(t, source)
+
+	projectPath := filepath.Dir(workspace.data.RepoPath)
+	transactionRoot := filepath.Join(projectPath, "transactions")
+	parked := filepath.Join(projectPath, "transactions-parked")
+	outside := t.TempDir()
+	original := atomicApplyAfterTransactionRootVerificationHook
+	atomicApplyAfterTransactionRootVerificationHook = func() {
+		require.NoError(t, os.Rename(transactionRoot, parked))
+		require.NoError(t, os.Symlink(outside, transactionRoot))
+	}
+	t.Cleanup(func() { atomicApplyAfterTransactionRootVerificationHook = original })
+
+	_, err := workspace.Apply()
+	require.Error(t, err)
+	require.Equal(t, before, mustSnapshot(t, source))
+	outsideEntries, readErr := os.ReadDir(outside)
+	require.NoError(t, readErr)
+	require.Empty(t, outsideEntries)
+	parkedEntries, readErr := os.ReadDir(parked)
+	require.NoError(t, readErr)
+	require.Empty(t, parkedEntries)
+}
+
 func TestAtomicNoReplacePreflightRunsBeforeManifestAndSourceMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := t.TempDir()
@@ -175,9 +227,9 @@ func TestAtomicNoReplacePreflightRunsBeforeManifestAndSourceMutation(t *testing.
 	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
 	before := mustSnapshot(t, source)
 
-	original := applyRenameNoReplace
-	applyRenameNoReplace = func(_, _ string) error { return errors.New("injected no-replace unavailable") }
-	t.Cleanup(func() { applyRenameNoReplace = original })
+	original := platformAtomicRenameNoReplace
+	platformAtomicRenameNoReplace = func(int, string, string) error { return errors.New("injected no-replace unavailable") }
+	t.Cleanup(func() { platformAtomicRenameNoReplace = original })
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "injected no-replace unavailable")
