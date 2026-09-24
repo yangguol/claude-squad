@@ -108,6 +108,15 @@ func alternateASCIIName(name string) string {
 
 func openManifestComponentAt(parent *os.File, name string) (*os.File, *manifestFileIdentity, error) {
 	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ELOOP) {
+		var binding unix.Stat_t
+		if statErr := unix.Fstatat(int(parent.Fd()), name, &binding, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
+			return nil, nil, statErr
+		}
+		if binding.Mode&unix.S_IFMT == unix.S_IFLNK {
+			return nil, &manifestFileIdentity{device: uint64(binding.Dev), inode: uint64(binding.Ino)}, nil
+		}
+	}
 	if err != nil {
 		return nil, nil, err
 	}

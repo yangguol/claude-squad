@@ -65,6 +65,9 @@ type TransactionEntry struct {
 	Expected            *Entry           `json:"expected,omitempty"`
 	Result              *Entry           `json:"result,omitempty"`
 	ExpectedTree        map[string]Entry `json:"expected_tree,omitempty"`
+	stageContents       []byte
+	stageSymlinkTarget  string
+	stageMode           os.FileMode
 }
 
 type TransactionManifest struct {

@@ -39,6 +39,7 @@ var mergeTreeCommand = func(dir string, args ...string) ([]byte, error) {
 
 type applyPlan struct {
 	TransactionDir string
+	SourcePath     string
 	OursCommit     string
 	TheirsCommit   string
 	MergedTree     string
@@ -173,11 +174,12 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 		_ = os.RemoveAll(plan.TransactionDir)
 		return &ApplyResult{}, nil
 	}
-	transaction, err := w.prepareTransaction(plan)
+	prepared, err := w.prepareTransaction(plan, time.Now().UTC())
 	if err != nil {
 		_ = os.RemoveAll(plan.TransactionDir)
 		return nil, err
 	}
+	transaction := legacyTransactionFromManifest(plan.TransactionDir, prepared)
 	if applyBeforeRevalidateHook != nil {
 		applyBeforeRevalidateHook()
 	}
@@ -268,16 +270,32 @@ func cleanupCommittedTransaction(transaction Transaction) error {
 	return nil
 }
 
-func (w *shadowWorkspace) prepareTransaction(plan applyPlan) (Transaction, error) {
-	transaction := Transaction{Directory: plan.TransactionDir, Version: 1, SessionID: w.data.SessionID, SourcePath: w.data.SourcePath, MergedTree: plan.MergedTree, State: transactionPrepared}
-	payloadRoot := filepath.Join(plan.TransactionDir, "payload")
-	backupRoot := filepath.Join(plan.TransactionDir, "backup")
-	if err := applyFS.MkdirAll(payloadRoot, 0o700); err != nil {
-		return transaction, fmt.Errorf("create transaction payload: %w", err)
+func (w *shadowWorkspace) prepareTransaction(plan applyPlan, now time.Time) (manifest TransactionManifest, returnErr error) {
+	defer func() {
+		if returnErr != nil {
+			returnErr = errors.Join(returnErr, applyFS.RemoveAll(plan.TransactionDir))
+		}
+	}()
+	manifest = TransactionManifest{
+		Version: CurrentTransactionVersion, TransactionID: filepath.Base(plan.TransactionDir),
+		ProjectID: w.data.ProjectID, SessionID: w.data.SessionID, SourcePath: w.data.SourcePath,
+		State: TransactionPrepared, AppliedTree: plan.MergedTree, AppliedAt: now.UTC().Format(time.RFC3339Nano),
 	}
-	if err := applyFS.MkdirAll(backupRoot, 0o700); err != nil {
-		return transaction, fmt.Errorf("create transaction backup: %w", err)
+	entries, err := preallocateTransactionEntries(plan)
+	if err != nil {
+		return manifest, err
 	}
+	manifest.Entries = entries
+	if err := stageTransactionResults(plan.TransactionDir, entries); err != nil {
+		return manifest, err
+	}
+	if err := WriteManifestDurable(manifest, plan.TransactionDir); err != nil {
+		return manifest, err
+	}
+	return manifest, nil
+}
+
+func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 	replacedDirectories := make([]string, 0)
 	for _, name := range plan.ChangedPaths() {
 		if _, changed := plan.Creates[name]; changed && planReplacesDirectory(plan, name) {
@@ -287,63 +305,212 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan) (Transaction, error
 			replacedDirectories = append(replacedDirectories, name)
 		}
 	}
+
+	entries := make([]TransactionEntry, 0, len(plan.ChangedPaths()))
+	createdParents := make(map[string]struct{})
+	var err error
 	for _, name := range plan.ChangedPaths() {
 		if pathBelowAny(name, replacedDirectories) {
 			continue
 		}
-		if err := validateApplyPath(w.data.SourcePath, name); err != nil {
-			return transaction, err
+		if err := validatePlannedApplyPath(plan.SourcePath, name); err != nil {
+			return nil, err
 		}
-		item := transactionEntry{Path: name}
-		entry, create := plan.Creates[name]
+		planned, create := plan.Creates[name]
 		if !create {
-			entry = plan.Updates[name]
+			planned = plan.Updates[name]
 		}
-		if create || entry.Type != "" {
+		item := TransactionEntry{Path: name, Phase: EntryPhasePending, CleanupPhase: CleanupPhasePending}
+		if create || planned.Type != "" {
 			if create {
-				item.Operation = "create"
+				item.Operation = EntryOperationCreate
 			} else {
-				item.Operation = "update"
+				item.Operation = EntryOperationUpdate
 			}
-			item.Type, item.Mode, item.Target = entry.Type, entry.Mode, entry.SymlinkTarget
-			item.Payload = filepath.ToSlash(filepath.Join("payload", name))
-			payload := filepath.Join(plan.TransactionDir, filepath.FromSlash(item.Payload))
-			if err := ensureRealContainedPath(plan.TransactionDir, filepath.Dir(payload), true, "transaction payload parent"); err != nil {
-				return transaction, err
+			item.StagePath, err = randomTransactionPath("stage")
+			if err != nil {
+				return nil, err
 			}
-			if err := applyFS.MkdirAll(filepath.Dir(payload), 0o700); err != nil {
-				return transaction, err
-			}
-			if err := writeExclusiveFile(payload, entry.Contents, 0o600); err != nil {
-				return transaction, fmt.Errorf("materialize %q: %w", name, err)
+			result := applyEntryIdentity(name, planned)
+			item.Result = &result
+			item.stageContents, item.stageSymlinkTarget, item.stageMode = planned.Contents, planned.SymlinkTarget, planned.Mode
+			for parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(name))); parent != "."; parent = filepath.ToSlash(filepath.Dir(filepath.FromSlash(parent))) {
+				if _, exists := plan.OursSnapshot.Entries[parent]; exists {
+					break
+				}
+				createdParents[parent] = struct{}{}
 			}
 		} else {
-			item.Operation = "delete"
+			item.Operation = EntryOperationDelete
 		}
 		if expected, exists := plan.OursSnapshot.Entries[name]; exists {
-			item.Backup = filepath.ToSlash(filepath.Join("backup", name))
-			displaced, err := randomSiblingName(name, ".claude-squad-displaced-")
+			item.Expected = cloneEntry(expected)
+			item.CaptureName, err = randomSourceSibling(name, ".claude-squad-displaced-")
 			if err != nil {
-				return transaction, err
+				return nil, err
 			}
-			item.Displaced = displaced
-			item.Expected = &expected
-		} else if item.Operation != "delete" && planReplacesDirectory(plan, name) {
-			item.ReplacesDirectory = true
-			item.Backup = filepath.ToSlash(filepath.Join("backup", name))
-			displaced, err := randomSiblingName(name, ".claude-squad-displaced-")
+			item.QuarantinePath, err = randomTransactionPath("quarantine")
 			if err != nil {
-				return transaction, err
+				return nil, err
 			}
-			item.Displaced = displaced
+		} else if item.Operation != EntryOperationDelete && planReplacesDirectory(plan, name) {
+			item.CaptureName, err = randomSourceSibling(name, ".claude-squad-displaced-")
+			if err != nil {
+				return nil, err
+			}
+			item.QuarantinePath, err = randomTransactionPath("quarantine")
+			if err != nil {
+				return nil, err
+			}
 			item.ExpectedTree = snapshotSubtree(plan.OursSnapshot, name)
 		}
+		if item.Operation == EntryOperationCreate || item.Operation == EntryOperationUpdate {
+			item.RollbackCaptureName, err = randomSourceSibling(name, ".claude-squad-rollback-")
+			if err != nil {
+				return nil, err
+			}
+		}
+		entries = append(entries, item)
+	}
+
+	parents := make([]string, 0, len(createdParents))
+	for parent := range createdParents {
+		parents = append(parents, parent)
+	}
+	sort.Slice(parents, func(i, j int) bool {
+		left, right := strings.Count(parents[i], "/"), strings.Count(parents[j], "/")
+		if left != right {
+			return left < right
+		}
+		return parents[i] < parents[j]
+	})
+	parentEntries := make([]TransactionEntry, 0, len(parents))
+	for _, parent := range parents {
+		result := Entry{Path: parent, Type: EntryType("directory"), Mode: 0o755}
+		rollbackName, err := randomSourceSibling(parent, ".claude-squad-rollback-")
+		if err != nil {
+			return nil, err
+		}
+		parentEntries = append(parentEntries, TransactionEntry{
+			Path: parent, Operation: EntryOperationCreatedParent, Phase: EntryPhasePending,
+			CleanupPhase: CleanupPhasePending, RollbackCaptureName: rollbackName, Result: &result,
+		})
+	}
+	return append(parentEntries, entries...), nil
+}
+
+func validatePlannedApplyPath(sourceRoot, name string) error {
+	if name == "" || filepath.IsAbs(name) || strings.ContainsRune(name, 0) || strings.Contains(name, "\\") || filepath.ToSlash(filepath.Clean(filepath.FromSlash(name))) != name {
+		return fmt.Errorf("unsafe apply path %q", name)
+	}
+	parts := strings.Split(name, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("unsafe apply path %q", name)
+		}
+	}
+	target := filepath.Join(sourceRoot, filepath.FromSlash(name))
+	if err := validateContained(sourceRoot, target, "apply path"); err != nil {
+		return err
+	}
+	return ensureRealContainedPath(sourceRoot, filepath.Dir(target), true, "apply path parent")
+}
+
+func applyEntryIdentity(path string, entry applyEntry) Entry {
+	identity := Entry{Path: path, Type: entry.Type, Mode: entry.Mode.Perm(), SymlinkTarget: entry.SymlinkTarget}
+	if entry.Type == EntryRegular {
+		hash := sha256.Sum256(entry.Contents)
+		identity.ContentHash = hex.EncodeToString(hash[:])
+	}
+	return identity
+}
+
+func cloneEntry(entry Entry) *Entry {
+	copy := entry
+	return &copy
+}
+
+func randomTransactionPath(category string) (string, error) {
+	var nonce [12]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(filepath.Join(category, hex.EncodeToString(nonce[:]))), nil
+}
+
+func randomSourceSibling(path, prefix string) (string, error) {
+	var nonce [12]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(filepath.Join(filepath.Dir(filepath.FromSlash(path)), prefix+hex.EncodeToString(nonce[:]))), nil
+}
+
+func stageTransactionResults(transactionDir string, entries []TransactionEntry) error {
+	createdRoots := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.StagePath == "" {
+			continue
+		}
+		stage := filepath.Join(transactionDir, filepath.FromSlash(entry.StagePath))
+		if err := ensureRealContainedPath(transactionDir, filepath.Dir(stage), true, "transaction stage parent"); err != nil {
+			return fmt.Errorf("validate stage for %q: %w", entry.Path, err)
+		}
+		if err := applyFS.MkdirAll(filepath.Dir(stage), 0o700); err != nil {
+			return fmt.Errorf("create transaction stage parent: %w", err)
+		}
+		createdRoots[filepath.Dir(stage)] = struct{}{}
+		if entry.Result != nil && entry.Result.Type == EntrySymlink {
+			if err := applyFS.Symlink(entry.stageSymlinkTarget, stage); err != nil {
+				return fmt.Errorf("stage symlink %q: %w", entry.Path, err)
+			}
+			continue
+		}
+		file, err := applyFS.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, entry.stageMode.Perm())
+		if err != nil {
+			return fmt.Errorf("stage regular file %q: %w", entry.Path, err)
+		}
+		written, writeErr := file.Write(entry.stageContents)
+		if writeErr == nil && written != len(entry.stageContents) {
+			writeErr = io.ErrShortWrite
+		}
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		if err := errors.Join(writeErr, file.Close()); err != nil {
+			return fmt.Errorf("stage regular file %q: %w", entry.Path, err)
+		}
+	}
+	for directory := range createdRoots {
+		if err := SyncDirectory(directory); err != nil {
+			return fmt.Errorf("sync transaction stage directory: %w", err)
+		}
+	}
+	if len(createdRoots) != 0 {
+		if err := SyncDirectory(transactionDir); err != nil {
+			return fmt.Errorf("sync transaction directory after staging: %w", err)
+		}
+	}
+	return nil
+}
+
+func legacyTransactionFromManifest(directory string, manifest TransactionManifest) Transaction {
+	transaction := Transaction{Directory: directory, Version: 1, SessionID: manifest.SessionID, SourcePath: manifest.SourcePath, MergedTree: manifest.AppliedTree, State: transactionPrepared}
+	for _, entry := range manifest.Entries {
+		if entry.Operation == EntryOperationCreatedParent {
+			continue
+		}
+		item := transactionEntry{Path: entry.Path, Operation: string(entry.Operation), Expected: entry.Expected, ExpectedTree: entry.ExpectedTree}
+		if entry.Result != nil {
+			item.Type, item.Mode, item.Target = entry.Result.Type, entry.Result.Mode, entry.Result.SymlinkTarget
+		}
+		item.Payload = entry.StagePath
+		item.Backup = entry.QuarantinePath
+		item.Displaced = entry.CaptureName
+		item.ReplacesDirectory = len(entry.ExpectedTree) != 0
 		transaction.Entries = append(transaction.Entries, item)
 	}
-	if err := writeTransactionManifest(transaction); err != nil {
-		return transaction, err
-	}
-	return transaction, nil
+	return transaction
 }
 
 func writeExclusiveFile(name string, contents []byte, mode os.FileMode) error {
@@ -1112,7 +1279,7 @@ func (w *shadowWorkspace) planApply() (plan applyPlan, returnErr error) {
 	if err := verifyApplySnapshot(w.data.WorktreePath, policy, theirsSnapshot, true, "agent worktree"); err != nil {
 		return plan, err
 	}
-	plan.OursSnapshot, plan.OursCommit, plan.TheirsCommit = oursSnapshot, ours, theirs
+	plan.SourcePath, plan.OursSnapshot, plan.OursCommit, plan.TheirsCommit = w.data.SourcePath, oursSnapshot, ours, theirs
 
 	mergedTree, conflictStages, err := w.mergeApplyCommits(ours, theirs)
 	if err != nil {

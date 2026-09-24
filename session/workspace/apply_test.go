@@ -1,14 +1,17 @@
 package workspace
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -612,6 +615,174 @@ func TestMergeApplyCommitsDoesNotAcceptFailedCommandWithStages(t *testing.T) {
 	_, _, err := workspace.mergeApplyCommits(oid, oid)
 	require.Error(t, err)
 	require.Contains(t, fmt.Sprint(err), "failed")
+}
+
+func preparationPlan(t *testing.T) (*shadowWorkspace, applyPlan, Snapshot) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "update", "before", 0o644)
+	writeApplyFile(t, source, "delete", "remove", 0o600)
+	workspace := newApplyWorkspace(t, source)
+	before := mustSnapshot(t, source)
+	transactionRoot := filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions")
+	require.NoError(t, os.MkdirAll(transactionRoot, 0o700))
+	transactionDir, err := os.MkdirTemp(transactionRoot, workspace.data.SessionID+"-")
+	require.NoError(t, err)
+	plan := applyPlan{
+		TransactionDir: transactionDir,
+		SourcePath:     workspace.data.SourcePath,
+		MergedTree:     strings.Repeat("a", 40),
+		OursSnapshot:   before,
+		Creates: map[string]applyEntry{
+			"new/deep/file": {Type: EntryRegular, Mode: 0o640, Contents: []byte("new")},
+			"link":          {Type: EntrySymlink, SymlinkTarget: "update"},
+		},
+		Updates: map[string]applyEntry{
+			"update": {Type: EntryRegular, Mode: 0o755, Contents: []byte("after")},
+		},
+		Deletes: []string{"delete"},
+	}
+	return workspace, plan, before
+}
+
+func TestPrepareTransactionPreallocatesEveryOperationAndCreatedParent(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	manifest, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+	require.Equal(t, CurrentTransactionVersion, manifest.Version)
+	require.Equal(t, TransactionPrepared, manifest.State)
+
+	byPath := make(map[string]TransactionEntry)
+	for _, entry := range manifest.Entries {
+		byPath[entry.Path] = entry
+	}
+	require.Equal(t, EntryOperationCreate, byPath["new/deep/file"].Operation)
+	require.Equal(t, EntryOperationCreate, byPath["link"].Operation)
+	require.Equal(t, EntryOperationUpdate, byPath["update"].Operation)
+	require.Equal(t, EntryOperationDelete, byPath["delete"].Operation)
+	require.Equal(t, EntryOperationCreatedParent, byPath["new"].Operation)
+	require.Equal(t, EntryOperationCreatedParent, byPath["new/deep"].Operation)
+	require.Less(t, slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" }), slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "new/deep" }))
+
+	for _, entry := range manifest.Entries {
+		require.Equal(t, EntryPhasePending, entry.Phase)
+		require.Equal(t, CleanupPhasePending, entry.CleanupPhase)
+		switch entry.Operation {
+		case EntryOperationCreate:
+			require.NotEmpty(t, entry.StagePath)
+			require.NotEmpty(t, entry.RollbackCaptureName)
+			require.NotNil(t, entry.Result)
+		case EntryOperationUpdate:
+			require.NotEmpty(t, entry.StagePath)
+			require.NotEmpty(t, entry.CaptureName)
+			require.NotEmpty(t, entry.RollbackCaptureName)
+			require.NotEmpty(t, entry.QuarantinePath)
+			require.NotNil(t, entry.Expected)
+			require.NotNil(t, entry.Result)
+		case EntryOperationDelete:
+			require.NotEmpty(t, entry.CaptureName)
+			require.NotEmpty(t, entry.QuarantinePath)
+			require.NotNil(t, entry.Expected)
+		case EntryOperationCreatedParent:
+			require.NotEmpty(t, entry.RollbackCaptureName)
+			require.Equal(t, EntryType("directory"), entry.Result.Type)
+		}
+	}
+}
+
+func TestPrepareTransactionPreallocatesUniqueSourceAndPrivatePaths(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	manifest, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+
+	sourceNames, privateNames := map[string]bool{}, map[string]bool{}
+	for _, entry := range manifest.Entries {
+		for _, name := range []string{entry.Path, entry.CaptureName, entry.RollbackCaptureName} {
+			if name == "" {
+				continue
+			}
+			require.False(t, sourceNames[name], name)
+			sourceNames[name] = true
+		}
+		for _, name := range []string{entry.StagePath, entry.QuarantinePath} {
+			if name == "" {
+				continue
+			}
+			require.False(t, privateNames[name], name)
+			privateNames[name] = true
+			require.NoError(t, validateContained(plan.TransactionDir, filepath.Join(plan.TransactionDir, filepath.FromSlash(name)), "private path"))
+		}
+	}
+	project := filepath.Dir(workspace.data.RepoPath)
+	require.NoError(t, ValidateManifest(project, plan.TransactionDir, manifest))
+}
+
+func TestPrepareTransactionDurablyStagesRegularFilesAndSymlinks(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	manifest, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+	byPath := make(map[string]TransactionEntry)
+	for _, entry := range manifest.Entries {
+		byPath[entry.Path] = entry
+	}
+	require.Equal(t, "new", mustReadFile(t, filepath.Join(plan.TransactionDir, filepath.FromSlash(byPath["new/deep/file"].StagePath))))
+	target, err := os.Readlink(filepath.Join(plan.TransactionDir, filepath.FromSlash(byPath["link"].StagePath)))
+	require.NoError(t, err)
+	require.Equal(t, "update", target)
+	require.FileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
+}
+
+func TestPreparedManifestContainsCompleteRollbackInformation(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	now := time.Unix(100, 200).UTC()
+	manifest, err := workspace.prepareTransaction(plan, now)
+	require.NoError(t, err)
+	require.Equal(t, plan.MergedTree, manifest.AppliedTree)
+	require.Equal(t, now.Format(time.RFC3339Nano), manifest.AppliedAt)
+	persisted, err := ReadManifestStrict(filepath.Dir(workspace.data.RepoPath), plan.TransactionDir)
+	require.NoError(t, err)
+	contents, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	var publicManifest TransactionManifest
+	require.NoError(t, json.Unmarshal(contents, &publicManifest))
+	require.Equal(t, publicManifest, persisted)
+}
+
+func TestPrepareTransactionDoesNotMutateSource(t *testing.T) {
+	workspace, plan, before := preparationPlan(t)
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+	require.Equal(t, before, mustSnapshot(t, workspace.data.SourcePath))
+	matches, err := filepath.Glob(filepath.Join(workspace.data.SourcePath, ".claude-squad-*"))
+	require.NoError(t, err)
+	require.Empty(t, matches)
+}
+
+func TestPrepareTransactionFailureLeavesSourceAndRemovesOwnedArtifacts(t *testing.T) {
+	workspace, plan, before := preparationPlan(t)
+	require.NoError(t, os.Mkdir(filepath.Join(plan.TransactionDir, "stage"), 0o700))
+	for index := range 100 {
+		name := fmt.Sprintf("collision-%d", index)
+		plan.Creates[name] = applyEntry{Type: EntryRegular, Mode: 0o600, Contents: []byte(name)}
+	}
+
+	original := applyFS
+	applyFS = failingStageOps{fileOps: original}
+	t.Cleanup(func() { applyFS = original })
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.ErrorContains(t, err, "injected stage failure")
+	require.Equal(t, before, mustSnapshot(t, workspace.data.SourcePath))
+	require.NoDirExists(t, plan.TransactionDir)
+}
+
+type failingStageOps struct{ fileOps }
+
+func (f failingStageOps) OpenFile(name string, flag int, mode os.FileMode) (fileHandle, error) {
+	if filepath.Base(filepath.Dir(name)) == "stage" {
+		return nil, errors.New("injected stage failure")
+	}
+	return f.fileOps.OpenFile(name, flag, mode)
 }
 
 func newApplyWorkspace(t *testing.T, source string) *shadowWorkspace {

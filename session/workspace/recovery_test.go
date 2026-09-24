@@ -518,6 +518,23 @@ func TestValidateManifestRejectsAncestorNamespaceOverlaps(t *testing.T) {
 	}
 }
 
+func TestManifestNamespaceComparisonUsesGoverningParentCaseBehavior(t *testing.T) {
+	ancestor := &manifestFileIdentity{device: 1, inode: 1, directory: true}
+	mount := &manifestFileIdentity{device: 2, inode: 2, directory: true}
+	left := manifestNamespacePath{components: []manifestPathComponent{
+		{name: "case-insensitive", identity: ancestor, caseInsensitive: true},
+		{name: "nested-mount", identity: mount, caseInsensitive: false},
+		{name: "Name", caseInsensitive: false},
+	}}
+	right := manifestNamespacePath{components: []manifestPathComponent{
+		{name: "CASE-INSENSITIVE", identity: ancestor, caseInsensitive: true},
+		{name: "nested-mount", identity: mount, caseInsensitive: false},
+		{name: "name", caseInsensitive: false},
+	}}
+
+	require.False(t, manifestComponentsOverlap(left, right), "an ancestor filesystem must not make unresolved names on a case-sensitive nested filesystem collide")
+}
+
 func TestValidateManifestRequiresOperationSpecificRecoveryFields(t *testing.T) {
 	project, source := recoveryProject(t)
 	directory := filepath.Join(project, "transactions", "tx")

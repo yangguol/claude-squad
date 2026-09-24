@@ -330,8 +330,10 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			return fmt.Errorf("transaction entry %d: %w", index, err)
 		}
 		targetIdentity := filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.Path))
-		if err := addManifestNamespacePath(&sourcePaths, targetIdentity); err != nil {
-			return fmt.Errorf("transaction entry %d target: %w", index, err)
+		if entry.Operation != EntryOperationCreatedParent {
+			if err := addManifestNamespacePath(&sourcePaths, targetIdentity); err != nil {
+				return fmt.Errorf("transaction entry %d target: %w", index, err)
+			}
 		}
 		for _, field := range []struct {
 			name, value string
@@ -419,14 +421,14 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 }
 
 type manifestNamespacePath struct {
-	path                    string
-	components              []manifestPathComponent
-	caseInsensitiveDetected bool
+	path       string
+	components []manifestPathComponent
 }
 
 type manifestPathComponent struct {
-	name     string
-	identity *manifestFileIdentity
+	name            string
+	identity        *manifestFileIdentity
+	caseInsensitive bool
 }
 
 func addManifestNamespacePath(paths *[]manifestNamespacePath, candidate string) error {
@@ -455,28 +457,35 @@ func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 		return manifestNamespacePath{}, fmt.Errorf("open namespace root %q: %w", root, err)
 	}
 	defer func() { _ = parent.Close() }()
-	caseInsensitiveDetected := false
+	caseInsensitive, parentDevice := false, uint64(0)
 	for index, name := range parts {
 		lookup, lookupErr := platformLookupManifestComponent(parent, name)
 		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
 			return manifestNamespacePath{}, lookupErr
 		}
-		caseInsensitiveDetected = caseInsensitiveDetected || lookup.caseInsensitive
 		if errors.Is(lookupErr, os.ErrNotExist) {
-			components = append(components, manifestPathComponent{name: name})
+			caseInsensitive = caseInsensitive || lookup.caseInsensitive
+			components = append(components, manifestPathComponent{name: name, caseInsensitive: caseInsensitive})
 			for _, remaining := range parts[index+1:] {
-				components = append(components, manifestPathComponent{name: remaining})
+				components = append(components, manifestPathComponent{name: remaining, caseInsensitive: caseInsensitive})
 			}
 			break
 		}
-		caseInsensitiveDetected = caseInsensitiveDetected || lookup.aliasDetected
 		opened, info, err := openManifestComponentAt(parent, lookup.actualName)
 		if err != nil {
 			return manifestNamespacePath{}, fmt.Errorf("open namespace component %q: %w", lookup.actualName, err)
 		}
-		components = append(components, manifestPathComponent{name: lookup.actualName, identity: info})
+		if parentDevice == 0 || parentDevice == info.device {
+			caseInsensitive = caseInsensitive || lookup.caseInsensitive || lookup.aliasDetected
+		} else {
+			caseInsensitive = lookup.caseInsensitive || lookup.aliasDetected
+		}
+		parentDevice = info.device
+		components = append(components, manifestPathComponent{name: lookup.actualName, identity: info, caseInsensitive: caseInsensitive})
 		if !info.directory && index < len(parts)-1 {
-			_ = opened.Close()
+			if opened != nil {
+				_ = opened.Close()
+			}
 			return manifestNamespacePath{}, fmt.Errorf("namespace component %q is not a directory", lookup.actualName)
 		}
 		if index < len(parts)-1 {
@@ -485,11 +494,13 @@ func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 				return manifestNamespacePath{}, err
 			}
 			parent = opened
-		} else if err := opened.Close(); err != nil {
-			return manifestNamespacePath{}, err
+		} else if opened != nil {
+			if err := opened.Close(); err != nil {
+				return manifestNamespacePath{}, err
+			}
 		}
 	}
-	return manifestNamespacePath{path: path, components: components, caseInsensitiveDetected: caseInsensitiveDetected}, nil
+	return manifestNamespacePath{path: path, components: components}, nil
 }
 
 func manifestComponentsOverlap(left, right manifestNamespacePath) bool {
@@ -497,7 +508,6 @@ func manifestComponentsOverlap(left, right manifestNamespacePath) bool {
 	if len(right.components) < limit {
 		limit = len(right.components)
 	}
-	caseInsensitive := left.caseInsensitiveDetected || right.caseInsensitiveDetected
 	for index := 0; index < limit; index++ {
 		leftComponent, rightComponent := left.components[index], right.components[index]
 		if leftComponent.identity != nil && rightComponent.identity != nil {
@@ -509,7 +519,7 @@ func manifestComponentsOverlap(left, right manifestNamespacePath) bool {
 		if leftComponent.name == rightComponent.name {
 			continue
 		}
-		if !caseInsensitive || !strings.EqualFold(leftComponent.name, rightComponent.name) {
+		if !(leftComponent.caseInsensitive || rightComponent.caseInsensitive) || !strings.EqualFold(leftComponent.name, rightComponent.name) {
 			return false
 		}
 	}
