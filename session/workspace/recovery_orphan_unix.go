@@ -39,54 +39,59 @@ type manifestFileIdentity struct {
 	directory bool
 }
 
-func platformLookupManifestComponent(directory *os.File, requested string) (string, bool, error) {
-	entries, err := directory.ReadDir(-1)
-	if err != nil {
-		return "", false, err
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	for _, entry := range entries {
-		if entry.Name() == requested {
-			return entry.Name(), false, nil
-		}
-	}
-	var requestedStat unix.Stat_t
-	if err := unix.Fstatat(int(directory.Fd()), requested, &requestedStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return "", false, os.ErrNotExist
-		}
-		return "", false, err
-	}
-	for _, entry := range entries {
-		var candidateStat unix.Stat_t
-		if err := unix.Fstatat(int(directory.Fd()), entry.Name(), &candidateStat, unix.AT_SYMLINK_NOFOLLOW); err == nil && sameOrphanIdentity(requestedStat, candidateStat) {
-			return entry.Name(), true, nil
-		}
-	}
-	return "", false, errors.New("namespace component identity was not found in parent")
+type manifestComponentLookup struct {
+	actualName      string
+	aliasDetected   bool
+	caseInsensitive bool
 }
 
-func platformDirectoryCaseInsensitive(directory *os.File) (bool, error) {
+func platformLookupManifestComponent(directory *os.File, requested string) (manifestComponentLookup, error) {
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
-		return false, err
+		return manifestComponentLookup{}, err
 	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	lookup := manifestComponentLookup{}
 	for _, entry := range entries {
+		if entry.Name() == requested {
+			lookup.actualName = entry.Name()
+		}
 		alternate := alternateASCIIName(entry.Name())
 		if alternate == entry.Name() {
 			continue
 		}
 		var original, alias unix.Stat_t
 		if err := unix.Fstatat(int(directory.Fd()), entry.Name(), &original, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return false, err
+			return manifestComponentLookup{}, err
 		}
 		if err := unix.Fstatat(int(directory.Fd()), alternate, &alias, unix.AT_SYMLINK_NOFOLLOW); err == nil && sameOrphanIdentity(original, alias) {
-			return true, nil
+			lookup.caseInsensitive = true
 		} else if err != nil && !errors.Is(err, unix.ENOENT) {
-			return false, err
+			return manifestComponentLookup{}, err
 		}
 	}
-	return false, nil
+	if lookup.actualName != "" {
+		return lookup, nil
+	}
+
+	var requestedStat unix.Stat_t
+	if err := unix.Fstatat(int(directory.Fd()), requested, &requestedStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return lookup, os.ErrNotExist
+		}
+		return manifestComponentLookup{}, err
+	}
+	for _, entry := range entries {
+		var candidateStat unix.Stat_t
+		if err := unix.Fstatat(int(directory.Fd()), entry.Name(), &candidateStat, unix.AT_SYMLINK_NOFOLLOW); err == nil && sameOrphanIdentity(requestedStat, candidateStat) {
+			lookup.actualName = entry.Name()
+			lookup.aliasDetected = true
+			lookup.caseInsensitive = true
+			return lookup, nil
+		}
+	}
+	return manifestComponentLookup{}, errors.New("namespace component identity was not found in parent")
 }
 
 func alternateASCIIName(name string) string {
@@ -102,7 +107,7 @@ func alternateASCIIName(name string) string {
 }
 
 func openManifestComponentAt(parent *os.File, name string) (*os.File, *manifestFileIdentity, error) {
-	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -120,7 +125,12 @@ func openManifestComponentAt(parent *os.File, name string) (*os.File, *manifestF
 		_ = component.Close()
 		return nil, nil, errors.Join(err, errors.New("namespace component changed while opening"))
 	}
-	return component, &manifestFileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), directory: stat.Mode&unix.S_IFMT == unix.S_IFDIR}, nil
+	fileType := stat.Mode & unix.S_IFMT
+	if fileType != unix.S_IFDIR && fileType != unix.S_IFREG {
+		_ = component.Close()
+		return nil, nil, errors.New("namespace component has unsupported file type")
+	}
+	return component, &manifestFileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), directory: fileType == unix.S_IFDIR}, nil
 }
 
 func openOrphanDirectoryAt(parent *os.File, name string) (*os.File, unix.Stat_t, error) {

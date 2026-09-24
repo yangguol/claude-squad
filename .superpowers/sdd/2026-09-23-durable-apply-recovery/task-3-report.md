@@ -298,3 +298,50 @@ PASS
 
 - Final removal of a retained orphan directory remains intentionally deferred: pathname-only unlink cannot safely guarantee that the checked directory is the one removed. Discovery now reports every retained tombstone explicitly instead of trusting forgeable in-entry evidence.
 - Darwin provides authoritative descriptor path spelling; Linux cannot portably provide the equivalent and retains the documented platform boundary.
+
+## Fix Round 5
+
+### Status
+
+Complete. Closed the final shared-directory-offset and blocking FIFO findings while preserving descriptor-bound identity checks, retained orphan classification, canonical roots, and Task 2 behavior.
+
+### RED
+
+```text
+go test ./session/workspace -run '^(TestValidateManifestRejectsTwoUnresolvedCaseEquivalentNamesWhereSupported|TestValidateManifestRejectsFinalFIFOWithoutBlocking)$' -count=1
+FAIL
+```
+
+`TestValidateManifestRejectsTwoUnresolvedCaseEquivalentNamesWhereSupported` was accepted unexpectedly, and `TestValidateManifestRejectsFinalFIFOWithoutBlocking` timed out after two seconds.
+
+### Fixes
+
+- Component lookup now performs one deterministic scan of the opened parent descriptor and returns exact spelling, case-equivalent identity, and demonstrated filesystem case behavior together. No independent scan relies on a consumed shared directory stream offset.
+- Namespace components are opened with `O_NONBLOCK|O_NOFOLLOW`, immediately identified using `fstat`, and rebound to the parent entry. Directories continue traversal, regular leaves retain identity, symlinks are not followed, and special files such as FIFOs are rejected without blocking.
+- Added focused coverage for two unresolved case-equivalent names beneath a case-insensitive parent and for prompt rejection of a final FIFO leaf.
+
+### GREEN and Regressions
+
+```text
+go test ./session/workspace -run '^(TestValidateManifestRejectsTwoUnresolvedCaseEquivalentNamesWhereSupported|TestValidateManifestRejectsFinalFIFOWithoutBlocking)$' -count=1
+ok  claude-squad/session/workspace  1.033s
+
+go test ./session/workspace -run '^(TestReadManifestStrict|TestValidateManifest|TestInvalidManifest|TestLegacyIncomplete|TestOrphan|TestDiscovery)' -count=1
+ok  claude-squad/session/workspace  2.243s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  192.543s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 167.397s)
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.016s
+
+git diff --check
+PASS
+```
+
+### Concerns
+
+- The case-equivalence regression is skipped on case-sensitive filesystems by design; Linux compilation verifies the shared implementation, while runtime case-insensitive behavior is exercised where the fixture filesystem supports it.

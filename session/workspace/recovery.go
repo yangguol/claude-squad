@@ -457,31 +457,27 @@ func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 	defer func() { _ = parent.Close() }()
 	caseInsensitiveDetected := false
 	for index, name := range parts {
-		actualName, aliasDetected, lookupErr := platformLookupManifestComponent(parent, name)
+		lookup, lookupErr := platformLookupManifestComponent(parent, name)
 		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
 			return manifestNamespacePath{}, lookupErr
 		}
+		caseInsensitiveDetected = caseInsensitiveDetected || lookup.caseInsensitive
 		if errors.Is(lookupErr, os.ErrNotExist) {
-			parentCaseInsensitive, err := platformDirectoryCaseInsensitive(parent)
-			if err != nil {
-				return manifestNamespacePath{}, err
-			}
-			caseInsensitiveDetected = caseInsensitiveDetected || parentCaseInsensitive
 			components = append(components, manifestPathComponent{name: name})
 			for _, remaining := range parts[index+1:] {
 				components = append(components, manifestPathComponent{name: remaining})
 			}
 			break
 		}
-		caseInsensitiveDetected = caseInsensitiveDetected || aliasDetected
-		opened, info, err := openManifestComponentAt(parent, actualName)
+		caseInsensitiveDetected = caseInsensitiveDetected || lookup.aliasDetected
+		opened, info, err := openManifestComponentAt(parent, lookup.actualName)
 		if err != nil {
-			return manifestNamespacePath{}, fmt.Errorf("open namespace component %q: %w", actualName, err)
+			return manifestNamespacePath{}, fmt.Errorf("open namespace component %q: %w", lookup.actualName, err)
 		}
-		components = append(components, manifestPathComponent{name: actualName, identity: info})
+		components = append(components, manifestPathComponent{name: lookup.actualName, identity: info})
 		if !info.directory && index < len(parts)-1 {
 			_ = opened.Close()
-			return manifestNamespacePath{}, fmt.Errorf("namespace component %q is not a directory", actualName)
+			return manifestNamespacePath{}, fmt.Errorf("namespace component %q is not a directory", lookup.actualName)
 		}
 		if index < len(parts)-1 {
 			if err := parent.Close(); err != nil {

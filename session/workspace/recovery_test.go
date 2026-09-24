@@ -632,6 +632,40 @@ func TestValidateManifestRejectsNonexistentCaseEquivalentLeavesWhereSupported(t 
 	require.Error(t, ValidateManifest(project, directory, manifest))
 }
 
+func TestValidateManifestRejectsTwoUnresolvedCaseEquivalentNamesWhereSupported(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	parent := filepath.Join(source, "CaseProbe")
+	require.NoError(t, os.Mkdir(parent, 0o700))
+	if _, err := os.Stat(filepath.Join(source, "caseprobe")); err != nil {
+		t.Skip("filesystem is case-sensitive")
+	}
+
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.Entries[0] = validRecoveryEntry("CaseProbe/Unresolved", EntryOperationCreate)
+	manifest.Entries = append(manifest.Entries, validRecoveryEntry("CaseProbe/unresolved", EntryOperationCreate))
+	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestValidateManifestRejectsFinalFIFOWithoutBlocking(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	require.NoError(t, makeFIFO(filepath.Join(source, "fifo")))
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.Entries[0] = validRecoveryEntry("fifo", EntryOperationUpdate)
+
+	done := make(chan error, 1)
+	go func() { done <- ValidateManifest(project, directory, manifest) }()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("manifest validation blocked opening a FIFO leaf")
+	}
+}
+
 func TestValidateManifestAppliesStoredSpellingToAllTrustedDirectories(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Darwin F_GETPATH spelling contract")
