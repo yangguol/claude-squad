@@ -25,12 +25,29 @@ type ProjectLock struct {
 // AcquireProjectLock acquires a project's advisory lock without waiting.
 func AcquireProjectLock(projectPath, operation string) (*ProjectLock, error) {
 	projectID := filepath.Base(filepath.Clean(projectPath))
-	lockRoot := filepath.Join(filepath.Dir(filepath.Clean(projectPath)), ".locks")
+	shadowProjects := filepath.Dir(filepath.Clean(projectPath))
+	if err := os.MkdirAll(shadowProjects, 0o700); err != nil {
+		return nil, fmt.Errorf("create shadow projects directory: %w", err)
+	}
+	shadowProjects, err := filepath.EvalSymlinks(shadowProjects)
+	if err != nil {
+		return nil, fmt.Errorf("resolve shadow projects directory: %w", err)
+	}
+	lockRoot := filepath.Join(shadowProjects, ".locks")
+	if err := ensureRealContainedPath(shadowProjects, lockRoot, true, "project lock directory"); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(lockRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create project lock directory: %w", err)
 	}
+	if err := ensureRealContainedPath(shadowProjects, lockRoot, false, "project lock directory"); err != nil {
+		return nil, err
+	}
 	lockPath := filepath.Join(lockRoot, projectID+".lock")
-	file, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err := ensureRealContainedPath(shadowProjects, lockPath, true, "project lock file"); err != nil {
+		return nil, err
+	}
+	file, err := platformOpenProjectLock(lockPath)
 	if err != nil {
 		return nil, fmt.Errorf("open project lock: %w", err)
 	}
