@@ -207,3 +207,48 @@ PASS
 ### Concerns
 
 - Successful orphan cleanup intentionally leaves one empty random `.orphan-*` directory in the transaction root. Removing that final directory by name would reintroduce the pathname-substitution race; later private-quarantine cleanup can reclaim it under the Task 7 trust model.
+
+## Fix Round 3
+
+### Status
+
+Complete. Closed the four open findings with focused tests written and observed failing before implementation.
+
+### RED
+
+```text
+go test ./session/workspace -run '^(TestValidateManifestRejectsMalformedEntryIdentities|TestDiscoverySkipsOnlyValidatedRetainedOrphanTombstones|TestValidateManifestRejectsNonexistentCaseEquivalentLeavesWhereSupported)$' -count=1
+FAIL
+```
+
+Failures showed malformed identities were accepted, retained orphan directories were rediscovered, and case-equivalent nonexistent leaves were not detected.
+
+### Fixes
+
+- Trusted roots retain the workspace-created canonical representation; Darwin additionally compares the open directory descriptor's `F_GETPATH` spelling. Linux documents the platform boundary and retains descriptor identity/no-follow validation without case-folding heuristics.
+- Namespace validation now traverses components descriptor-relatively without following symlinks, records stable device/inode identities, and compares nonexistent suffixes under verified parents. Case-equivalent spelling is used only after the filesystem has demonstrated case-insensitive lookup.
+- Expected, Result, and ExpectedTree identities now validate allowed types, permission-only modes, SHA-256 hashes, and mutually exclusive regular/symlink/directory fields.
+- Successful orphan cleanup writes and syncs a private descriptor-relative terminal marker. Discovery skips only exact random quarantine names containing that sole strictly validated marker; arbitrary similarly named directories remain orphans.
+
+### GREEN and Regressions
+
+```text
+go test ./session/workspace -run '^(TestReadManifestStrict|TestValidateManifest|TestInvalidManifest|TestLegacyIncomplete|TestOrphan|TestDiscovery)' -count=1
+ok  claude-squad/session/workspace  1.135s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  171.707s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 173.031s)
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.017s
+
+git diff --check
+PASS
+```
+
+### Concerns
+
+- Linux has no portable descriptor API exposing authoritative stored path spelling. The implementation therefore fails closed on detectable aliases and uses stable inode identities plus exact lexical names otherwise, as required by the ruling.

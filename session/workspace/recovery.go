@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -63,6 +64,18 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 	for _, entry := range entries {
 		directory := filepath.Join(transactionRoot, entry.Name())
 		discovered := DiscoveredTransaction{Directory: directory}
+		if strings.HasPrefix(entry.Name(), orphanQuarantinePrefix) {
+			skip, markerErr := retainedOrphanHasValidMarkerAt(rootDirectory, entry.Name())
+			if markerErr != nil {
+				discovered.Orphan = true
+				discovered.Invalid = markerErr
+				result = append(result, discovered)
+				continue
+			}
+			if skip {
+				continue
+			}
+		}
 		if strings.HasSuffix(entry.Name(), ".cleanup.json") {
 			if err := validateLegacyCleanupMarker(directory, entry); err != nil {
 				discovered.Invalid = err
@@ -305,7 +318,7 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		return err
 	}
 
-	sourcePaths, transactionPaths := []string{}, []string{}
+	sourcePaths, transactionPaths := []manifestNamespacePath{}, []manifestNamespacePath{}
 	for index, entry := range manifest.Entries {
 		if !validOperation(entry.Operation) || !validEntryPhase(entry.Phase) || !validCleanupPhase(entry.CleanupPhase) || !phaseAllowed(entry.Operation, entry.Phase) {
 			return fmt.Errorf("transaction entry %d has invalid operation or phase", index)
@@ -363,16 +376,30 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		if requireResult && entry.Result == nil {
 			return fmt.Errorf("transaction entry %d is missing result identity", index)
 		}
-		if entry.Expected != nil && entry.Expected.Path != entry.Path {
-			return fmt.Errorf("transaction entry %d expected path mismatch", index)
+		if entry.Expected != nil {
+			if entry.Expected.Path != entry.Path {
+				return fmt.Errorf("transaction entry %d expected path mismatch", index)
+			}
+			if err := validateEntryIdentity(*entry.Expected, true); err != nil {
+				return fmt.Errorf("transaction entry %d expected identity: %w", index, err)
+			}
 		}
-		if entry.Result != nil && entry.Result.Path != entry.Path {
-			return fmt.Errorf("transaction entry %d result path mismatch", index)
+		if entry.Result != nil {
+			if entry.Result.Path != entry.Path {
+				return fmt.Errorf("transaction entry %d result path mismatch", index)
+			}
+			allowDirectory := entry.Operation == EntryOperationCreatedParent
+			if err := validateEntryIdentity(*entry.Result, allowDirectory); err != nil {
+				return fmt.Errorf("transaction entry %d result identity: %w", index, err)
+			}
 		}
 		treePaths := make([]string, 0, len(entry.ExpectedTree))
 		for name, treeEntry := range entry.ExpectedTree {
 			if err := validateRelativeManifestPath(name); err != nil || treeEntry.Path != name {
 				return fmt.Errorf("transaction entry %d has invalid expected tree path %q", index, name)
+			}
+			if err := validateEntryIdentity(treeEntry, false); err != nil {
+				return fmt.Errorf("transaction entry %d expected tree identity %q: %w", index, name, err)
 			}
 			if err := ensureReconstructiblePath(manifest.SourcePath, filepath.ToSlash(filepath.Join(filepath.FromSlash(entry.Path), filepath.FromSlash(name))), "expected tree"); err != nil {
 				return fmt.Errorf("transaction entry %d expected tree path %q: %w", index, name, err)
@@ -391,18 +418,120 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 	return nil
 }
 
-func addManifestNamespacePath(paths *[]string, candidate string) error {
+type manifestNamespacePath struct {
+	path                    string
+	components              []manifestPathComponent
+	caseInsensitiveDetected bool
+}
+
+type manifestPathComponent struct {
+	name     string
+	identity *manifestFileIdentity
+}
+
+func addManifestNamespacePath(paths *[]manifestNamespacePath, candidate string) error {
+	resolved, err := resolveManifestNamespacePath(candidate)
+	if err != nil {
+		return err
+	}
 	for _, existing := range *paths {
-		if manifestPathsOverlap(existing, candidate) {
-			return fmt.Errorf("namespace path %q overlaps %q", candidate, existing)
-		}
-		left, leftErr := os.Stat(existing)
-		right, rightErr := os.Stat(candidate)
-		if leftErr == nil && rightErr == nil && os.SameFile(left, right) {
-			return fmt.Errorf("namespace path %q aliases %q", candidate, existing)
+		if manifestPathsOverlap(existing.path, candidate) || manifestComponentsOverlap(existing, resolved) {
+			return fmt.Errorf("namespace path %q overlaps or aliases %q", candidate, existing.path)
 		}
 	}
-	*paths = append(*paths, candidate)
+	*paths = append(*paths, resolved)
+	return nil
+}
+
+func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
+	volume := filepath.VolumeName(path)
+	root := volume + string(filepath.Separator)
+	parts := strings.Split(strings.TrimPrefix(path, root), string(filepath.Separator))
+	components := make([]manifestPathComponent, 0, len(parts))
+	parent, err := platformOpenTrustedDirectory(root)
+	if err != nil {
+		return manifestNamespacePath{}, fmt.Errorf("open namespace root %q: %w", root, err)
+	}
+	defer func() { _ = parent.Close() }()
+	caseInsensitiveDetected := false
+	for index, name := range parts {
+		actualName, info, lookupErr := platformLookupManifestComponent(parent, name)
+		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
+			return manifestNamespacePath{}, lookupErr
+		}
+		if errors.Is(lookupErr, os.ErrNotExist) {
+			components = append(components, manifestPathComponent{name: name})
+			for _, remaining := range parts[index+1:] {
+				components = append(components, manifestPathComponent{name: remaining})
+			}
+			break
+		}
+		caseInsensitiveDetected = caseInsensitiveDetected || actualName != name
+		components = append(components, manifestPathComponent{name: actualName, identity: info})
+		if !info.directory && index < len(parts)-1 {
+			return manifestNamespacePath{}, fmt.Errorf("namespace component %q is not a directory", actualName)
+		}
+		if index < len(parts)-1 {
+			next, _, err := openOrphanDirectoryAt(parent, actualName)
+			if err != nil {
+				return manifestNamespacePath{}, fmt.Errorf("open namespace component %q: %w", actualName, err)
+			}
+			if err := parent.Close(); err != nil {
+				_ = next.Close()
+				return manifestNamespacePath{}, err
+			}
+			parent = next
+		}
+	}
+	return manifestNamespacePath{path: path, components: components, caseInsensitiveDetected: caseInsensitiveDetected}, nil
+}
+
+func manifestComponentsOverlap(left, right manifestNamespacePath) bool {
+	limit := len(left.components)
+	if len(right.components) < limit {
+		limit = len(right.components)
+	}
+	caseInsensitive := left.caseInsensitiveDetected || right.caseInsensitiveDetected
+	for index := 0; index < limit; index++ {
+		leftComponent, rightComponent := left.components[index], right.components[index]
+		if leftComponent.identity != nil && rightComponent.identity != nil {
+			if *leftComponent.identity != *rightComponent.identity {
+				return false
+			}
+			continue
+		}
+		if leftComponent.name == rightComponent.name {
+			continue
+		}
+		if !caseInsensitive || !strings.EqualFold(leftComponent.name, rightComponent.name) {
+			return false
+		}
+	}
+	return true
+}
+
+var sha256IdentityPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func validateEntryIdentity(entry Entry, allowDirectory bool) error {
+	if entry.Mode != entry.Mode.Perm() {
+		return errors.New("mode contains non-permission bits")
+	}
+	switch entry.Type {
+	case EntryRegular:
+		if !sha256IdentityPattern.MatchString(entry.ContentHash) || entry.SymlinkTarget != "" {
+			return errors.New("regular entry requires a SHA-256 hash and forbids a symlink target")
+		}
+	case EntrySymlink:
+		if entry.ContentHash != "" || entry.SymlinkTarget == "" || strings.IndexByte(entry.SymlinkTarget, 0) >= 0 {
+			return errors.New("symlink entry requires a target and forbids a content hash")
+		}
+	case EntryType("directory"):
+		if !allowDirectory || entry.ContentHash != "" || entry.SymlinkTarget != "" {
+			return errors.New("directory identity is not allowed here")
+		}
+	default:
+		return fmt.Errorf("unknown entry type %q", entry.Type)
+	}
 	return nil
 }
 
@@ -541,7 +670,18 @@ func validateCanonicalTrustedDirectory(path, label string) error {
 	if filepath.Clean(resolved) != path {
 		return fmt.Errorf("%s path contains a symlinked component", label)
 	}
-	return validateRecoveryDirectory(path, path, label)
+	if err := validateRecoveryDirectory(path, path, label); err != nil {
+		return err
+	}
+	directory, err := platformOpenTrustedDirectory(path)
+	if err != nil {
+		return fmt.Errorf("open %s path: %w", label, err)
+	}
+	defer directory.Close()
+	if err := platformVerifyCanonicalDirectoryPath(directory, path); err != nil {
+		return fmt.Errorf("%s path is not the stored canonical path: %w", label, err)
+	}
+	return nil
 }
 
 func validateLegacyCleanupMarker(path string, entry os.DirEntry) error {

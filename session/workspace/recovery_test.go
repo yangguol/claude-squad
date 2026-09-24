@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -25,7 +26,7 @@ func recoveryProject(t *testing.T) (string, string) {
 }
 
 func recoveryIdentity(path string) *Entry {
-	return &Entry{Path: path, Type: EntryRegular, Mode: 0o600, ContentHash: "hash"}
+	return &Entry{Path: path, Type: EntryRegular, Mode: 0o600, ContentHash: strings.Repeat("a", 64)}
 }
 
 func validRecoveryEntry(path string, operation EntryOperation) TransactionEntry {
@@ -223,7 +224,8 @@ func TestOrphanPreManifestDirectoryIsQuarantinedAndRemoved(t *testing.T) {
 	require.Len(t, matches, 1)
 	entries, err := os.ReadDir(matches[0])
 	require.NoError(t, err)
-	require.Empty(t, entries)
+	require.Len(t, entries, 1)
+	require.Equal(t, orphanCleanupMarker, entries[0].Name())
 }
 
 func TestOrphanCleanupRejectsSymlinkAndNonDirectChild(t *testing.T) {
@@ -545,6 +547,82 @@ func TestValidateManifestRequiresOperationSpecificRecoveryFields(t *testing.T) {
 			require.Error(t, ValidateManifest(project, directory, manifest))
 		})
 	}
+}
+
+func TestValidateManifestRejectsMalformedEntryIdentities(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	tests := map[string]func(*Entry){
+		"unknown type":             func(e *Entry) { e.Type = "unknown" },
+		"regular missing hash":     func(e *Entry) { e.ContentHash = "" },
+		"regular malformed hash":   func(e *Entry) { e.ContentHash = "not-a-sha256" },
+		"regular symlink target":   func(e *Entry) { e.SymlinkTarget = "target" },
+		"symlink missing target":   func(e *Entry) { e.Type, e.ContentHash = EntrySymlink, "" },
+		"symlink content hash":     func(e *Entry) { e.Type, e.SymlinkTarget = EntrySymlink, "target" },
+		"type bits in mode":        func(e *Entry) { e.Mode = os.ModeDir | 0o700 },
+		"permissions out of range": func(e *Entry) { e.Mode = 0o1000 },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			manifest := validRecoveryManifest(project, source, "tx")
+			mutate(manifest.Entries[0].Expected)
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
+
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.Entries[0].ExpectedTree = map[string]Entry{
+		"child": {Path: "child", Type: EntryRegular, Mode: 0o600, ContentHash: "bad"},
+	}
+	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestDiscoverySkipsOnlyValidatedRetainedOrphanTombstones(t *testing.T) {
+	project, _ := recoveryProject(t)
+	root := filepath.Join(project, "transactions")
+	orphan := filepath.Join(root, "orphan")
+	require.NoError(t, os.Mkdir(orphan, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(orphan, "owned"), []byte("owned"), 0o600))
+
+	first, err := DiscoverTransactions(project)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.True(t, first[0].Orphan)
+
+	second, err := DiscoverTransactions(project)
+	require.NoError(t, err)
+	require.Empty(t, second)
+	matches, err := filepath.Glob(filepath.Join(root, ".orphan-*"))
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	fake := filepath.Join(root, ".orphan-user-created")
+	require.NoError(t, os.Mkdir(fake, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(fake, ".cleanup-complete"), []byte("not valid"), 0o600))
+	third, err := DiscoverTransactions(project)
+	require.NoError(t, err)
+	require.Len(t, third, 1)
+	require.True(t, third[0].Orphan)
+	require.NoError(t, third[0].Invalid)
+	require.NoDirExists(t, fake)
+}
+
+func TestValidateManifestRejectsNonexistentCaseEquivalentLeavesWhereSupported(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	probe := filepath.Join(source, "CaseProbe")
+	require.NoError(t, os.Mkdir(probe, 0o700))
+	_, err := os.Stat(filepath.Join(source, "caseprobe"))
+	if err != nil {
+		t.Skip("filesystem is case-sensitive")
+	}
+
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.Entries[0] = validRecoveryEntry("CaseProbe/First", EntryOperationCreate)
+	manifest.Entries = append(manifest.Entries, validRecoveryEntry("caseprobe/first", EntryOperationCreate))
+	require.Error(t, ValidateManifest(project, directory, manifest))
 }
 
 func mustReadBytes(t *testing.T, path string) []byte {
