@@ -155,3 +155,55 @@ PASS
 ### Concerns
 
 - Descriptor-bound orphan deletion is implemented for the repository's supported atomic-recovery platforms (`darwin` and `linux`); unsupported platforms remain outside the existing durable-apply support contract.
+
+## Fix Round 2
+
+### Status
+
+Complete. Closed the four remaining review findings with tests written and observed failing before implementation.
+
+### RED Evidence
+
+The new focused tests failed on the captured-private-inode manifest rule, lexical aliases, filesystem aliases, ancestor overlaps, and missing create/update/delete/created-parent fields. Representative failures were:
+
+```text
+TestOrphanCleanupAllowsWritesToCapturedPrivateInode: quarantined orphan transaction contains a manifest
+TestValidateManifestRejectsLexicalTrustedRootAliases: expected error but got nil
+TestValidateManifestRejectsAncestorNamespaceOverlaps: expected error but got nil
+TestValidateManifestRequiresOperationSpecificRecoveryFields/create_rollback_capture: expected error but got nil
+```
+
+### Fixes and Exact Coverage
+
+- `TestOrphanCleanupRetainsReplacementAtPrivateQuarantinePath` proves descriptor cleanup never unlinks a replacement at the quarantine pathname.
+- `TestOrphanCleanupManifestBeforeCaptureBlocksDeletion` proves a manifest installed before capture retains the source orphan.
+- `TestOrphanCleanupAllowsWritesToCapturedPrivateInode` proves post-capture writes belong to the owned private inode and may be removed.
+- `TestValidateManifestRejectsLexicalTrustedRootAliases` rejects project, transaction, and metadata source aliases before cleaning.
+- `TestValidateManifestRejectsFilesystemAliasesWhereSupported` uses `os.SameFile` and skips only when the fixture filesystem is case-sensitive.
+- `TestValidateManifestRejectsAncestorNamespaceOverlaps` covers source and transaction namespace ancestor/descendant collisions.
+- `TestValidateManifestRequiresOperationSpecificRecoveryFields` covers every required create, update, delete, and created-parent path or identity.
+
+Recursive orphan removal now begins only after atomic capture and a final pre-capture-manifest check. It remains bound to the retained directory descriptor; the empty private directory is intentionally retained because safely unlinking it would require resolving a replaceable pathname again. Namespace validation rejects lexical overlaps and existing device/inode aliases without case folding. Required recovery fields now match the Task 4/5 state machines.
+
+### GREEN and Regressions
+
+```text
+go test ./session/workspace -run '^(TestReadManifestStrict|TestValidateManifest|TestInvalidManifest|TestLegacyIncomplete|TestOrphan|TestDiscovery)' -count=1
+ok  claude-squad/session/workspace  0.903s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  165.321s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 173.996s)
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.014s
+
+git diff --check
+PASS
+```
+
+### Concerns
+
+- Successful orphan cleanup intentionally leaves one empty random `.orphan-*` directory in the transaction root. Removing that final directory by name would reintroduce the pathname-substitution race; later private-quarantine cleanup can reclaim it under the Task 7 trust model.

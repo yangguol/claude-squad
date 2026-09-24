@@ -24,11 +24,41 @@ func recoveryProject(t *testing.T) (string, string) {
 	return project, source
 }
 
+func recoveryIdentity(path string) *Entry {
+	return &Entry{Path: path, Type: EntryRegular, Mode: 0o600, ContentHash: "hash"}
+}
+
+func validRecoveryEntry(path string, operation EntryOperation) TransactionEntry {
+	entry := TransactionEntry{
+		Path: path, QuarantinePath: filepath.ToSlash(filepath.Join("quarantine", path)),
+		Operation: operation, Phase: EntryPhasePending, CleanupPhase: CleanupPhasePending,
+	}
+	switch operation {
+	case EntryOperationCreate:
+		entry.StagePath = filepath.ToSlash(filepath.Join("stage", path))
+		entry.RollbackCaptureName = filepath.ToSlash(filepath.Join(filepath.Dir(path), ".rollback-"+filepath.Base(path)))
+		entry.Result = recoveryIdentity(path)
+	case EntryOperationUpdate:
+		entry.StagePath = filepath.ToSlash(filepath.Join("stage", path))
+		entry.CaptureName = filepath.ToSlash(filepath.Join(filepath.Dir(path), ".capture-"+filepath.Base(path)))
+		entry.RollbackCaptureName = filepath.ToSlash(filepath.Join(filepath.Dir(path), ".rollback-"+filepath.Base(path)))
+		entry.Expected = recoveryIdentity(path)
+		entry.Result = recoveryIdentity(path)
+	case EntryOperationDelete:
+		entry.CaptureName = filepath.ToSlash(filepath.Join(filepath.Dir(path), ".capture-"+filepath.Base(path)))
+		entry.Expected = recoveryIdentity(path)
+	case EntryOperationCreatedParent:
+		entry.RollbackCaptureName = filepath.ToSlash(filepath.Join(filepath.Dir(path), ".rollback-"+filepath.Base(path)))
+		entry.Result = &Entry{Path: path, Type: EntryType("directory"), Mode: 0o700}
+	}
+	return entry
+}
+
 func validRecoveryManifest(project, source, id string) TransactionManifest {
 	return TransactionManifest{
 		Version: CurrentTransactionVersion, TransactionID: id, ProjectID: filepath.Base(project),
 		SessionID: "session", SourcePath: source, State: TransactionPrepared,
-		Entries: []TransactionEntry{{Path: "file", StagePath: "stage/file", CaptureName: ".capture-file", RollbackCaptureName: ".rollback-file", QuarantinePath: ".quarantine-file", Operation: EntryOperationUpdate, Phase: EntryPhasePending, CleanupPhase: CleanupPhasePending}},
+		Entries: []TransactionEntry{validRecoveryEntry("file", EntryOperationUpdate)},
 	}
 }
 
@@ -190,7 +220,10 @@ func TestOrphanPreManifestDirectoryIsQuarantinedAndRemoved(t *testing.T) {
 	require.NoDirExists(t, directory)
 	matches, err := filepath.Glob(filepath.Join(project, "transactions", ".orphan-*"))
 	require.NoError(t, err)
-	require.Empty(t, matches)
+	require.Len(t, matches, 1)
+	entries, err := os.ReadDir(matches[0])
+	require.NoError(t, err)
+	require.Empty(t, entries)
 }
 
 func TestOrphanCleanupRejectsSymlinkAndNonDirectChild(t *testing.T) {
@@ -377,27 +410,141 @@ func TestOrphanCleanupBindsRootAcrossSubstitution(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(movedRoot, "orphan", "owned"))
 }
 
-func TestOrphanCleanupRetainsOwnedAndUnownedContentAfterQuarantineSubstitution(t *testing.T) {
+func TestOrphanCleanupRetainsReplacementAtPrivateQuarantinePath(t *testing.T) {
 	project, _ := recoveryProject(t)
 	root := filepath.Join(project, "transactions")
 	orphan := filepath.Join(root, "orphan")
 	require.NoError(t, os.Mkdir(orphan, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(orphan, "owned"), []byte("owned"), 0o600))
-	outside := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(outside, "unowned"), []byte("unowned"), 0o600))
-	var retained string
+	var replacement string
 
 	orphanAfterQuarantineHook = func(quarantine string) {
 		quarantine = filepath.Join(root, quarantine)
-		retained = quarantine + "-retained"
+		retained := quarantine + "-captured"
 		require.NoError(t, os.Rename(quarantine, retained))
-		require.NoError(t, os.Symlink(outside, quarantine))
+		require.NoError(t, os.Mkdir(quarantine, 0o700))
+		replacement = filepath.Join(quarantine, "replacement")
+		require.NoError(t, os.WriteFile(replacement, []byte("replacement"), 0o600))
 	}
 	t.Cleanup(func() { orphanAfterQuarantineHook = nil })
 	err := removeOrphanTransaction(project, orphan)
 	require.Error(t, err)
-	require.FileExists(t, filepath.Join(outside, "unowned"))
-	require.FileExists(t, filepath.Join(retained, "owned"))
+	require.FileExists(t, replacement)
+}
+
+func TestOrphanCleanupManifestBeforeCaptureBlocksDeletion(t *testing.T) {
+	project, _ := recoveryProject(t)
+	orphan := filepath.Join(project, "transactions", "orphan")
+	require.NoError(t, os.Mkdir(orphan, 0o700))
+	manifest := filepath.Join(orphan, "manifest.json")
+	orphanBeforeQuarantineHook = func() {
+		require.NoError(t, os.WriteFile(manifest, []byte(`{"version":2}`), 0o600))
+	}
+	t.Cleanup(func() { orphanBeforeQuarantineHook = nil })
+	require.Error(t, removeOrphanTransaction(project, orphan))
+	require.FileExists(t, manifest)
+	require.DirExists(t, orphan)
+}
+
+func TestOrphanCleanupAllowsWritesToCapturedPrivateInode(t *testing.T) {
+	project, _ := recoveryProject(t)
+	root := filepath.Join(project, "transactions")
+	orphan := filepath.Join(root, "orphan")
+	require.NoError(t, os.Mkdir(orphan, 0o700))
+	orphanAfterQuarantineHook = func(quarantine string) {
+		require.NoError(t, os.WriteFile(filepath.Join(root, quarantine, "manifest.json"), []byte("owned"), 0o600))
+	}
+	t.Cleanup(func() { orphanAfterQuarantineHook = nil })
+	require.NoError(t, removeOrphanTransaction(project, orphan))
+	require.NoDirExists(t, orphan)
+}
+
+func TestValidateManifestRejectsLexicalTrustedRootAliases(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	require.Error(t, ValidateManifest(project+string(filepath.Separator)+".", directory, validRecoveryManifest(project, source, "tx")))
+	require.Error(t, ValidateManifest(project, directory+string(filepath.Separator)+".", validRecoveryManifest(project, source, "tx")))
+
+	metadata := shadowProjectMetadata{Version: CurrentVersion, ProjectID: filepath.Base(project), SourcePath: source + string(filepath.Separator) + "."}
+	contents, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(project, "metadata.json"), contents, 0o600))
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.SourcePath = metadata.SourcePath
+	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestValidateManifestRejectsFilesystemAliasesWhereSupported(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "existing"), []byte("x"), 0o600))
+	alias := filepath.Join(source, "EXISTING")
+	first, err := os.Stat(filepath.Join(source, "existing"))
+	require.NoError(t, err)
+	second, err := os.Stat(alias)
+	if err != nil || !os.SameFile(first, second) {
+		t.Skip("filesystem is case-sensitive")
+	}
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.Entries[0] = validRecoveryEntry("existing", EntryOperationUpdate)
+	manifest.Entries = append(manifest.Entries, validRecoveryEntry("EXISTING", EntryOperationUpdate))
+	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestValidateManifestRejectsAncestorNamespaceOverlaps(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	for name, mutate := range map[string]func(*TransactionManifest){
+		"source targets": func(m *TransactionManifest) {
+			m.Entries = append(m.Entries, validRecoveryEntry("file/child", EntryOperationCreate))
+		},
+		"transaction paths": func(m *TransactionManifest) {
+			m.Entries[0].QuarantinePath = "stage/file/child"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			manifest := validRecoveryManifest(project, source, "tx")
+			mutate(&manifest)
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
+}
+
+func TestValidateManifestRequiresOperationSpecificRecoveryFields(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	tests := []struct {
+		name      string
+		operation EntryOperation
+		clear     func(*TransactionEntry)
+	}{
+		{"create stage", EntryOperationCreate, func(e *TransactionEntry) { e.StagePath = "" }},
+		{"create rollback capture", EntryOperationCreate, func(e *TransactionEntry) { e.RollbackCaptureName = "" }},
+		{"create result", EntryOperationCreate, func(e *TransactionEntry) { e.Result = nil }},
+		{"update stage", EntryOperationUpdate, func(e *TransactionEntry) { e.StagePath = "" }},
+		{"update capture", EntryOperationUpdate, func(e *TransactionEntry) { e.CaptureName = "" }},
+		{"update rollback capture", EntryOperationUpdate, func(e *TransactionEntry) { e.RollbackCaptureName = "" }},
+		{"update quarantine", EntryOperationUpdate, func(e *TransactionEntry) { e.QuarantinePath = "" }},
+		{"update expected", EntryOperationUpdate, func(e *TransactionEntry) { e.Expected = nil }},
+		{"update result", EntryOperationUpdate, func(e *TransactionEntry) { e.Result = nil }},
+		{"delete capture", EntryOperationDelete, func(e *TransactionEntry) { e.CaptureName = "" }},
+		{"delete quarantine", EntryOperationDelete, func(e *TransactionEntry) { e.QuarantinePath = "" }},
+		{"delete expected", EntryOperationDelete, func(e *TransactionEntry) { e.Expected = nil }},
+		{"created parent rollback capture", EntryOperationCreatedParent, func(e *TransactionEntry) { e.RollbackCaptureName = "" }},
+		{"created parent result", EntryOperationCreatedParent, func(e *TransactionEntry) { e.Result = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := validRecoveryManifest(project, source, "tx")
+			manifest.Entries[0] = validRecoveryEntry("file", test.operation)
+			test.clear(&manifest.Entries[0])
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
 }
 
 func mustReadBytes(t *testing.T, path string) []byte {

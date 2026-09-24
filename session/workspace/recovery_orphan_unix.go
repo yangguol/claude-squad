@@ -124,24 +124,29 @@ func removeOrphanAt(root *os.File, originalName, quarantineName string) error {
 	if err := platformAtomicRenameNoReplace(int(root.Fd()), originalName, quarantineName); err != nil {
 		return fmt.Errorf("quarantine orphan transaction: %w", err)
 	}
-	if orphanAfterQuarantineHook != nil {
-		orphanAfterQuarantineHook(quarantineName)
-	}
 	if err := verifyOrphanDirectoryEntry(root, quarantineName, identity); err != nil {
 		return fmt.Errorf("quarantined orphan transaction changed identity: %w", err)
 	}
+	// This check follows the atomic capture and precedes the test seam: a
+	// manifest installed in the source entry before capture must retain the
+	// captured directory. Once captured, the private inode and new writes into
+	// it are transaction-owned cleanup material.
 	absent, err = orphanEntryAbsentAt(orphan, "manifest.json")
 	if err != nil || !absent {
-		return errors.Join(err, errors.New("quarantined orphan transaction contains a manifest"))
+		return errors.Join(err, errors.New("orphan transaction acquired a manifest before capture"))
+	}
+	if orphanAfterQuarantineHook != nil {
+		orphanAfterQuarantineHook(quarantineName)
 	}
 	if err := removeOrphanDirectoryContents(orphan); err != nil {
 		return fmt.Errorf("remove quarantined orphan contents: %w", err)
 	}
+	// The recursive removal is descriptor-bound, but unlinkat of the directory
+	// itself would resolve quarantineName again and could remove a replacement
+	// installed after an identity check. Retain the now-empty captured directory;
+	// the untrusted source name has already been removed atomically.
 	if err := verifyOrphanDirectoryEntry(root, quarantineName, identity); err != nil {
-		return fmt.Errorf("quarantined orphan transaction changed before removal: %w", err)
-	}
-	if err := unix.Unlinkat(int(root.Fd()), quarantineName, unix.AT_REMOVEDIR); err != nil {
-		return fmt.Errorf("remove quarantined orphan transaction: %w", err)
+		return fmt.Errorf("retain replaced quarantine pathname: %w", err)
 	}
 	return nil
 }

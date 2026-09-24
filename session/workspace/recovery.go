@@ -25,7 +25,9 @@ type DiscoveredTransaction struct {
 // DiscoverTransactions classifies direct children of a validated transaction
 // root. Invalid and legacy manifests are retained unchanged.
 func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
-	projectPath = filepath.Clean(projectPath)
+	if filepath.Clean(projectPath) != projectPath {
+		return nil, errors.New("project path is not canonical")
+	}
 	transactionRoot := filepath.Join(projectPath, "transactions")
 	if err := validateCanonicalTrustedDirectory(projectPath, "project"); err != nil {
 		return nil, err
@@ -255,8 +257,12 @@ func manifestVersion(contents []byte) (int, error) {
 // ValidateManifest verifies that a v2 manifest can only reconstruct paths from
 // the trusted project, transaction, and source roots.
 func ValidateManifest(projectPath, transactionDir string, manifest TransactionManifest) error {
-	projectPath = filepath.Clean(projectPath)
-	transactionDir = filepath.Clean(transactionDir)
+	if filepath.Clean(projectPath) != projectPath {
+		return errors.New("project path is not canonical")
+	}
+	if filepath.Clean(transactionDir) != transactionDir {
+		return errors.New("transaction path is not canonical")
+	}
 	if err := validateCanonicalTrustedDirectory(projectPath, "project"); err != nil {
 		return err
 	}
@@ -299,7 +305,7 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		return err
 	}
 
-	sourcePaths, transactionPaths := map[string]bool{}, map[string]bool{}
+	sourcePaths, transactionPaths := []string{}, []string{}
 	for index, entry := range manifest.Entries {
 		if !validOperation(entry.Operation) || !validEntryPhase(entry.Phase) || !validCleanupPhase(entry.CleanupPhase) || !phaseAllowed(entry.Operation, entry.Phase) {
 			return fmt.Errorf("transaction entry %d has invalid operation or phase", index)
@@ -310,11 +316,10 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		if err := ensureReconstructiblePath(manifest.SourcePath, entry.Path, "target"); err != nil {
 			return fmt.Errorf("transaction entry %d: %w", index, err)
 		}
-		targetIdentity := filepath.Clean(filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.Path)))
-		if sourcePaths[targetIdentity] {
-			return fmt.Errorf("duplicate transaction source path %q", entry.Path)
+		targetIdentity := filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.Path))
+		if err := addManifestNamespacePath(&sourcePaths, targetIdentity); err != nil {
+			return fmt.Errorf("transaction entry %d target: %w", index, err)
 		}
-		sourcePaths[targetIdentity] = true
 		for _, field := range []struct {
 			name, value string
 			root        string
@@ -323,8 +328,8 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		}{
 			{"stage", entry.StagePath, transactionDir, false, entry.Operation == EntryOperationCreate || entry.Operation == EntryOperationUpdate},
 			{"capture", entry.CaptureName, manifest.SourcePath, true, entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationDelete},
-			{"rollback capture", entry.RollbackCaptureName, manifest.SourcePath, true, entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationCreatedParent},
-			{"quarantine", entry.QuarantinePath, transactionDir, false, true},
+			{"rollback capture", entry.RollbackCaptureName, manifest.SourcePath, true, entry.Operation == EntryOperationCreate || entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationCreatedParent},
+			{"quarantine", entry.QuarantinePath, transactionDir, false, entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationDelete},
 		} {
 			if field.value == "" {
 				if field.required {
@@ -341,20 +346,27 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			if err := ensureReconstructiblePath(field.root, field.value, field.name); err != nil {
 				return fmt.Errorf("transaction entry %d: %w", index, err)
 			}
-			identity := filepath.Clean(filepath.Join(field.root, filepath.FromSlash(field.value)))
-			namespace := transactionPaths
+			identity := filepath.Join(field.root, filepath.FromSlash(field.value))
+			namespace := &transactionPaths
 			if field.sourceSide {
-				namespace = sourcePaths
+				namespace = &sourcePaths
 			}
-			if namespace[identity] {
-				return fmt.Errorf("duplicate transaction %s namespace path %q", field.name, field.value)
+			if err := addManifestNamespacePath(namespace, identity); err != nil {
+				return fmt.Errorf("transaction entry %d %s: %w", index, field.name, err)
 			}
-			namespace[identity] = true
 		}
-		if entry.Expected != nil && entry.Expected.Path != "" && entry.Expected.Path != entry.Path {
+		requireExpected := entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationDelete
+		requireResult := entry.Operation == EntryOperationCreate || entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationCreatedParent
+		if requireExpected && entry.Expected == nil {
+			return fmt.Errorf("transaction entry %d is missing expected identity", index)
+		}
+		if requireResult && entry.Result == nil {
+			return fmt.Errorf("transaction entry %d is missing result identity", index)
+		}
+		if entry.Expected != nil && entry.Expected.Path != entry.Path {
 			return fmt.Errorf("transaction entry %d expected path mismatch", index)
 		}
-		if entry.Result != nil && entry.Result.Path != "" && entry.Result.Path != entry.Path {
+		if entry.Result != nil && entry.Result.Path != entry.Path {
 			return fmt.Errorf("transaction entry %d result path mismatch", index)
 		}
 		treePaths := make([]string, 0, len(entry.ExpectedTree))
@@ -377,6 +389,30 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		}
 	}
 	return nil
+}
+
+func addManifestNamespacePath(paths *[]string, candidate string) error {
+	for _, existing := range *paths {
+		if manifestPathsOverlap(existing, candidate) {
+			return fmt.Errorf("namespace path %q overlaps %q", candidate, existing)
+		}
+		left, leftErr := os.Stat(existing)
+		right, rightErr := os.Stat(candidate)
+		if leftErr == nil && rightErr == nil && os.SameFile(left, right) {
+			return fmt.Errorf("namespace path %q aliases %q", candidate, existing)
+		}
+	}
+	*paths = append(*paths, candidate)
+	return nil
+}
+
+func manifestPathsOverlap(left, right string) bool {
+	left, right = filepath.Clean(left), filepath.Clean(right)
+	if left == right {
+		return true
+	}
+	separator := string(filepath.Separator)
+	return strings.HasPrefix(left, right+separator) || strings.HasPrefix(right, left+separator)
 }
 
 func validTransactionState(state TransactionState) bool {
