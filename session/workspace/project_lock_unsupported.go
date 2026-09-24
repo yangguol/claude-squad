@@ -28,7 +28,7 @@ func platformVerifyDirectoryEntry(*os.File, string, *os.File) error {
 	return errors.New("descriptor-relative directory verification is unsupported on " + runtime.GOOS)
 }
 
-func platformOpenProjectLockAt(*os.File, *os.File, string) (*os.File, error) {
+func platformOpenProjectLockAt(*os.File, string) (*os.File, error) {
 	return nil, errors.New("project locking is unsupported on " + runtime.GOOS)
 }
 

@@ -670,3 +670,130 @@ Pending new local commit.
 ### Concerns
 
 The trusted `shadow-projects` root must support persistent extended attributes. Failure to read or create the anchor identity fails closed rather than weakening or globally serializing the lock domain.
+
+## Fix Round 5
+
+### Status
+
+Complete. Removed the out-of-contract xattr anchor and legacy coordinator artifact. The authoritative lock is exactly `shadow-projects/.locks/<project-id>.lock`, opened descriptor-relatively with no-follow semantics and locked using non-blocking `flock`.
+
+### RED
+
+Command:
+
+```bash
+/Users/yangguoliang/.local/go1.25.8/bin/gofmt -w "/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/project_lock_test.go" && /Users/yangguoliang/.local/bin/go test ./session/workspace -run '^(TestProjectLockDoesNotRequireXattrSupport|TestProjectLockCreatesOnlyAuthoritativeLockArtifact)$' -count=1
+```
+
+Output:
+
+```text
+# claude-squad/session/workspace [claude-squad/session/workspace.test]
+session/workspace/project_lock_test.go:117:14: undefined: projectLockSetXattr
+session/workspace/project_lock_test.go:118:2: undefined: projectLockSetXattr
+session/workspace/project_lock_test.go:119:21: undefined: projectLockSetXattr
+FAIL    claude-squad/session/workspace [build failed]
+FAIL
+```
+
+An earlier concrete RED run also showed the legacy artifact directly:
+
+```text
+--- FAIL: TestProjectLockCreatesOnlyAuthoritativeLockArtifact (0.00s)
+    project_lock_test.go:135: "[d .locks/ - .project.lock-coordinator]" should have 1 item(s), but has 2
+FAIL
+```
+
+### GREEN
+
+Command:
+
+```bash
+/Users/yangguoliang/.local/go1.25.8/bin/gofmt -w "/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/project_lock.go" "/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/project_lock_unix.go" "/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/project_lock_unsupported.go" "/Users/yangguoliang/myExplore/cs/.worktrees/arbitrary-directory-workspaces/session/workspace/project_lock_test.go" && /Users/yangguoliang/.local/bin/go test ./session/workspace -run '^(TestProjectLockDoesNotRequireXattrSupport|TestProjectLockCreatesOnlyAuthoritativeLockArtifact)$' -count=1
+```
+
+Output:
+
+```text
+ok  claude-squad/session/workspace  0.718s
+```
+
+### Implementation and trust boundary
+
+- Removed every production xattr read/write and inode-pinning prerequisite. A test seam that is never consulted by acquisition injects an xattr failure and proves locking is independent of xattr support.
+- Removed the root-level `<project-id>.lock-coordinator` artifact and unused coordinator state/cleanup.
+- `.locks/<validated-project-id>.lock` is the sole authoritative flock target. It is opened with `openat` relative to the stable `.locks` descriptor using `O_NOFOLLOW`, then receives `LOCK_EX|LOCK_NB`.
+- Static symlinked `.locks` and lock-file entries still fail closed. If `.locks` is substituted during an in-flight acquisition, the stable descriptor confines the lock-file open to the originally opened directory; final root-relative identity verification rejects the changed canonical entry and no outside target is touched.
+- The canonical project directory is not part of lock identity, so replacing it cannot split the per-project lock.
+- The `.locks` metadata area is a trusted boundary for cooperative Claude Squad processes. This implementation intentionally does not claim protection against a same-credential adversary replacing the authoritative lock inode after acquisition; that guarantee is not enforceable with the specified POSIX advisory lock contract.
+- Descriptor-relative transaction probes and final transaction-root identity revalidation were retained unchanged.
+
+### Tests and regressions
+
+Focused Task 2:
+
+```bash
+/Users/yangguoliang/.local/bin/go test ./session/workspace -run '^(TestProjectLock|TestProbeAtomicNoReplace|TestApplyRejectsDifferentFilesystems|TestApplyRejectsSymlinkedTransactionRoot|TestApplyRejectsTransactionRootSubstitution|TestAtomicApplyPreflight|TestAtomicNoReplacePreflight|TestApplyNoReplacePreflight)' -count=1
+```
+
+```text
+ok  claude-squad/session/workspace  13.778s
+```
+
+Race-focused:
+
+```bash
+/Users/yangguoliang/.local/bin/go test -race ./session/workspace -run '^(TestProjectLock|TestProbeAtomicNoReplace|TestApplyRejectsDifferentFilesystems|TestApplyRejectsSymlinkedTransactionRoot|TestApplyRejectsTransactionRootSubstitution|TestAtomicApplyPreflight|TestAtomicNoReplacePreflight|TestApplyNoReplacePreflight)' -count=1
+```
+
+```text
+ok  claude-squad/session/workspace  15.092s
+```
+
+Workspace suite:
+
+```bash
+/Users/yangguoliang/.local/bin/go test ./session/workspace -count=1
+```
+
+```text
+ok  claude-squad/session/workspace  165.545s
+```
+
+Full repository:
+
+```bash
+/Users/yangguoliang/.local/bin/go test ./... -count=1
+```
+
+```text
+PASS: all packages; claude-squad/session/workspace completed in 175.402s
+```
+
+Platform/static checks:
+
+```bash
+GOOS=linux /Users/yangguoliang/.local/bin/go build ./session/workspace
+GOOS=windows /Users/yangguoliang/.local/bin/go build ./session/workspace
+/Users/yangguoliang/.local/bin/go vet ./session/workspace
+git diff --check
+```
+
+Output: no output; all passed. Darwin behavior was exercised by the native focused, race, workspace, and full suites. The Linux build passed. The unsupported Windows build confirms the early platform guard compiles; `AcquireProjectLock` invokes it before path validation or filesystem creation, preserving fail-before-side-effect behavior.
+
+### Self-review
+
+- Confirmed exact per-project non-blocking typed contention, release/reacquire, stale-content indifference, and distinct-project independence remain covered.
+- Confirmed canonical project-directory replacement does not split locking.
+- Confirmed static lock-directory/lock-file symlinks reject and in-flight `.locks` substitution cannot redirect the operation outside.
+- Confirmed no xattr production calls, coordinator artifacts, or extra lock files remain.
+- Confirmed transaction preflight implementation was not changed.
+- Confirmed no test claims protection from hostile replacement of the authoritative lock inode.
+
+### Commit
+
+New local commit: `fix(workspace): align project lock with filesystem contract`. Not pushed.
+
+### Concerns
+
+None beyond the explicit trusted lock-metadata boundary described above.

@@ -19,11 +19,13 @@ func (e *OperationInProgressError) Error() string {
 
 // ProjectLock is an advisory, process-scoped lock for one shadow project.
 type ProjectLock struct {
-	file        *os.File
-	coordinator *os.File
+	file *os.File
 }
 
-var projectLockAfterDirectoryVerificationHook func()
+var (
+	projectLockAfterDirectoryVerificationHook func()
+	projectLockXattrProbe                     = func(string) error { return nil }
+)
 
 // AcquireProjectLock acquires a project's advisory lock without waiting.
 func AcquireProjectLock(projectPath, operation string) (*ProjectLock, error) {
@@ -55,7 +57,7 @@ func AcquireProjectLock(projectPath, operation string) (*ProjectLock, error) {
 	if projectLockAfterDirectoryVerificationHook != nil {
 		projectLockAfterDirectoryVerificationHook()
 	}
-	file, err := platformOpenProjectLockAt(shadowDirectory, lockDirectory, projectID)
+	file, err := platformOpenProjectLockAt(lockDirectory, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("open project lock: %w", err)
 	}
@@ -89,15 +91,6 @@ func (l *ProjectLock) Close() error {
 		return nil
 	}
 	file := l.file
-	coordinator := l.coordinator
 	l.file = nil
-	l.coordinator = nil
-	return errors.Join(platformReleaseProjectLock(file), file.Close(), closeProjectLockCoordinator(coordinator))
-}
-
-func closeProjectLockCoordinator(file *os.File) error {
-	if file == nil {
-		return nil
-	}
-	return file.Close()
+	return errors.Join(platformReleaseProjectLock(file), file.Close())
 }

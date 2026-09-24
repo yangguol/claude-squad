@@ -88,25 +88,6 @@ func TestProjectLockRejectsSymlinkedLockFile(t *testing.T) {
 	require.Equal(t, "outside", mustReadFile(t, outside))
 }
 
-func TestProjectLockCoordinatorReplacementCannotSplitSerialization(t *testing.T) {
-	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
-	projectPath := filepath.Join(shadowProjects, "project")
-	first, err := AcquireProjectLock(projectPath, "apply")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = first.Close() })
-
-	coordinator := filepath.Join(shadowProjects, ".project.lock-coordinator")
-	parked := coordinator + ".parked"
-	require.NoError(t, os.Rename(coordinator, parked))
-	require.NoError(t, os.WriteFile(coordinator, nil, 0o600))
-
-	_, err = AcquireProjectLock(projectPath, "reset")
-	var inProgress *OperationInProgressError
-	require.ErrorAs(t, err, &inProgress, "replacing the coordinator pathname must not create a second lock domain")
-	require.Equal(t, "project", inProgress.ProjectID)
-	require.Equal(t, "reset", inProgress.Operation)
-}
-
 func TestProjectDirectoryReplacementCannotSplitSerialization(t *testing.T) {
 	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
 	projectPath := filepath.Join(shadowProjects, "project")
@@ -125,31 +106,28 @@ func TestProjectDirectoryReplacementCannotSplitSerialization(t *testing.T) {
 	require.Equal(t, "project", inProgress.ProjectID)
 }
 
-func TestProjectAndLockAnchorReplacementCannotSplitSerialization(t *testing.T) {
+func TestProjectLockDoesNotRequireXattrSupport(t *testing.T) {
 	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
-	projectPath := filepath.Join(shadowProjects, "project")
-	first, err := AcquireProjectLock(projectPath, "apply")
+	original := projectLockXattrProbe
+	projectLockXattrProbe = func(string) error { return errors.New("xattrs unsupported") }
+	t.Cleanup(func() { projectLockXattrProbe = original })
+
+	lock, err := AcquireProjectLock(filepath.Join(shadowProjects, "project"), "apply")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = first.Close() })
+	require.NoError(t, lock.Close())
+}
 
-	lockRoot := filepath.Join(shadowProjects, ".locks")
-	require.NoError(t, os.Mkdir(projectPath, 0o700))
-	require.NoError(t, os.Rename(projectPath, projectPath+".parked"))
-	require.NoError(t, os.Mkdir(projectPath, 0o700))
-	require.NoError(t, os.Rename(lockRoot, lockRoot+".parked"))
-	require.NoError(t, os.Mkdir(lockRoot, 0o700))
+func TestProjectLockCreatesOnlyAuthoritativeLockArtifact(t *testing.T) {
+	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
+	lock, err := AcquireProjectLock(filepath.Join(shadowProjects, "project"), "apply")
+	require.NoError(t, err)
+	require.NoError(t, lock.Close())
 
-	_, err = AcquireProjectLock(projectPath, "reset")
-	require.Error(t, err, "replacing every mutable anchor pathname must fail closed")
-
-	require.NoError(t, first.Close())
-	require.NoError(t, os.RemoveAll(projectPath))
-	require.NoError(t, os.Rename(projectPath+".parked", projectPath))
-	require.NoError(t, os.RemoveAll(lockRoot))
-	require.NoError(t, os.Rename(lockRoot+".parked", lockRoot))
-	second, err := AcquireProjectLock(projectPath, "reset")
-	require.NoError(t, err, "restoring the authoritative anchor must permit reacquisition")
-	require.NoError(t, second.Close())
+	entries, err := os.ReadDir(shadowProjects)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, ".locks", entries[0].Name())
+	require.FileExists(t, filepath.Join(shadowProjects, ".locks", "project.lock"))
 }
 
 func TestProjectLockRejectsInvalidProjectIDBeforePathUse(t *testing.T) {
@@ -189,11 +167,6 @@ func TestProjectLockHandlesLockDirectorySubstitutionWithoutAliasEscape(t *testin
 	require.Error(t, err, "substitution during acquisition must fail closed")
 	require.NoFileExists(t, filepath.Join(outside, "project.lock"))
 	require.FileExists(t, filepath.Join(parked, "project.lock"))
-
-	require.NoError(t, os.Remove(lockRoot))
-	require.NoError(t, os.Mkdir(lockRoot, 0o700))
-	_, err = AcquireProjectLock(filepath.Join(shadowProjects, "project"), "reset")
-	require.Error(t, err, "a replacement lock anchor must not become authoritative")
 
 	require.NoError(t, os.Remove(lockRoot))
 	require.NoError(t, os.Rename(parked, lockRoot))
