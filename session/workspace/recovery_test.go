@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func recoveryProject(t *testing.T) (string, string) {
@@ -592,7 +595,9 @@ func TestDiscoverySkipsOnlyValidatedRetainedOrphanTombstones(t *testing.T) {
 
 	second, err := DiscoverTransactions(project)
 	require.NoError(t, err)
-	require.Empty(t, second)
+	require.Len(t, second, 1)
+	require.True(t, second[0].Orphan)
+	require.Error(t, second[0].Invalid)
 	matches, err := filepath.Glob(filepath.Join(root, ".orphan-*"))
 	require.NoError(t, err)
 	require.Len(t, matches, 1)
@@ -602,10 +607,12 @@ func TestDiscoverySkipsOnlyValidatedRetainedOrphanTombstones(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(fake, ".cleanup-complete"), []byte("not valid"), 0o600))
 	third, err := DiscoverTransactions(project)
 	require.NoError(t, err)
-	require.Len(t, third, 1)
-	require.True(t, third[0].Orphan)
-	require.NoError(t, third[0].Invalid)
-	require.NoDirExists(t, fake)
+	require.Len(t, third, 2)
+	for _, transaction := range third {
+		require.True(t, transaction.Orphan)
+		require.Error(t, transaction.Invalid)
+	}
+	require.DirExists(t, fake)
 }
 
 func TestValidateManifestRejectsNonexistentCaseEquivalentLeavesWhereSupported(t *testing.T) {
@@ -623,6 +630,126 @@ func TestValidateManifestRejectsNonexistentCaseEquivalentLeavesWhereSupported(t 
 	manifest.Entries[0] = validRecoveryEntry("CaseProbe/First", EntryOperationCreate)
 	manifest.Entries = append(manifest.Entries, validRecoveryEntry("caseprobe/first", EntryOperationCreate))
 	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestValidateManifestAppliesStoredSpellingToAllTrustedDirectories(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin F_GETPATH spelling contract")
+	}
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	manifest := validRecoveryManifest(project, source, "tx")
+
+	for name, canonical := range map[string]string{
+		"project":               project,
+		"transaction root":      filepath.Join(project, "transactions"),
+		"transaction directory": directory,
+		"metadata source":       source,
+	} {
+		t.Run(name, func(t *testing.T) {
+			alias := swapASCIIBaseCase(canonical)
+			if alias == canonical {
+				t.Skip("path has no ASCII letter")
+			}
+			info, err := os.Stat(alias)
+			if err != nil {
+				t.Skip("fixture filesystem is case-sensitive")
+			}
+			canonicalInfo, err := os.Stat(canonical)
+			require.NoError(t, err)
+			require.True(t, os.SameFile(canonicalInfo, info))
+
+			switch name {
+			case "project":
+				require.Error(t, ValidateManifest(alias, filepath.Join(alias, "transactions", "tx"), manifest))
+			case "transaction root":
+				aliasedDirectory := filepath.Join(project, filepath.Base(alias), "tx")
+				require.Error(t, ValidateManifest(project, aliasedDirectory, manifest))
+			case "transaction directory":
+				require.Error(t, ValidateManifest(project, alias, manifest))
+			case "metadata source":
+				mutated := manifest
+				mutated.SourcePath = alias
+				require.Error(t, ValidateManifest(project, directory, mutated))
+			}
+		})
+	}
+}
+
+func TestValidateManifestBindsNamespaceIdentityToOpenedComponent(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	require.NoError(t, os.Mkdir(filepath.Join(source, "parent"), 0o700))
+	manifest := validRecoveryManifest(project, source, "tx")
+	manifest.Entries[0] = validRecoveryEntry("parent/one", EntryOperationCreate)
+	manifest.Entries = append(manifest.Entries, validRecoveryEntry("parent/two", EntryOperationCreate))
+
+	original := manifestComponentAfterOpenHook
+	manifestComponentAfterOpenHook = func(name string) {
+		if name != "parent" {
+			return
+		}
+		manifestComponentAfterOpenHook = nil
+		require.NoError(t, os.Rename(filepath.Join(source, "parent"), filepath.Join(source, "old-parent")))
+		require.NoError(t, os.Mkdir(filepath.Join(source, "parent"), 0o700))
+	}
+	t.Cleanup(func() { manifestComponentAfterOpenHook = original })
+	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestDiscoveryClassifiesForgedRetainedOrphansAndFIFOWithoutBlocking(t *testing.T) {
+	project, _ := recoveryProject(t)
+	root := filepath.Join(project, "transactions")
+	forgedNames := []string{
+		".orphan-0123456789abcdef0123456789abcdef",
+		".orphan-ABCDEF0123456789ABCDEF0123456789",
+	}
+	for _, name := range forgedNames {
+		directory := filepath.Join(root, name)
+		require.NoError(t, os.Mkdir(directory, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(directory, ".cleanup-complete"), []byte(orphanCleanupContents), 0o600))
+	}
+	fifoDirectory := filepath.Join(root, ".orphan-fedcba9876543210fedcba9876543210")
+	require.NoError(t, os.Mkdir(fifoDirectory, 0o700))
+	require.NoError(t, makeFIFO(filepath.Join(fifoDirectory, ".cleanup-complete")))
+
+	done := make(chan struct{})
+	var discovered []DiscoveredTransaction
+	var err error
+	go func() {
+		discovered, err = DiscoverTransactions(project)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discovery blocked reading a FIFO marker")
+	}
+	require.NoError(t, err)
+	require.Len(t, discovered, 3)
+	for _, transaction := range discovered {
+		require.True(t, transaction.Orphan)
+		require.Error(t, transaction.Invalid, "retained entries must be explicitly classified")
+	}
+}
+
+func makeFIFO(path string) error {
+	return unix.Mkfifo(path, 0o600)
+}
+
+func swapASCIIBaseCase(path string) string {
+	directory, base := filepath.Split(path)
+	for index, character := range base {
+		if character >= 'a' && character <= 'z' {
+			return filepath.Join(directory, base[:index]+string(character-'a'+'A')+base[index+1:])
+		}
+		if character >= 'A' && character <= 'Z' {
+			return filepath.Join(directory, base[:index]+string(character-'A'+'a')+base[index+1:])
+		}
+	}
+	return path
 }
 
 func mustReadBytes(t *testing.T, path string) []byte {

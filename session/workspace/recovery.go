@@ -43,7 +43,7 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("transaction root is not a real directory")
 	}
-	if err := ensureRealContainedPath(projectPath, transactionRoot, false, "transaction root"); err != nil {
+	if err := validateCanonicalTrustedDirectory(transactionRoot, "transaction root"); err != nil {
 		return nil, err
 	}
 	rootDirectory, err := platformOpenTrustedDirectory(transactionRoot)
@@ -65,16 +65,16 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 		directory := filepath.Join(transactionRoot, entry.Name())
 		discovered := DiscoveredTransaction{Directory: directory}
 		if strings.HasPrefix(entry.Name(), orphanQuarantinePrefix) {
-			skip, markerErr := retainedOrphanHasValidMarkerAt(rootDirectory, entry.Name())
-			if markerErr != nil {
-				discovered.Orphan = true
+			discovered.Orphan = true
+			if !isRetainedOrphanName(entry.Name()) {
+				discovered.Invalid = errors.New("invalid retained orphan quarantine name")
+			} else if markerErr := validateRetainedOrphanMarkerAt(rootDirectory, entry.Name()); markerErr != nil {
 				discovered.Invalid = markerErr
-				result = append(result, discovered)
-				continue
+			} else {
+				discovered.Invalid = errors.New("retained orphan cleanup tombstone requires explicit recovery")
 			}
-			if skip {
-				continue
-			}
+			result = append(result, discovered)
+			continue
 		}
 		if strings.HasSuffix(entry.Name(), ".cleanup.json") {
 			if err := validateLegacyCleanupMarker(directory, entry); err != nil {
@@ -443,6 +443,8 @@ func addManifestNamespacePath(paths *[]manifestNamespacePath, candidate string) 
 	return nil
 }
 
+var manifestComponentAfterOpenHook func(string)
+
 func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 	volume := filepath.VolumeName(path)
 	root := volume + string(filepath.Separator)
@@ -455,32 +457,40 @@ func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 	defer func() { _ = parent.Close() }()
 	caseInsensitiveDetected := false
 	for index, name := range parts {
-		actualName, info, lookupErr := platformLookupManifestComponent(parent, name)
+		actualName, aliasDetected, lookupErr := platformLookupManifestComponent(parent, name)
 		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
 			return manifestNamespacePath{}, lookupErr
 		}
 		if errors.Is(lookupErr, os.ErrNotExist) {
+			parentCaseInsensitive, err := platformDirectoryCaseInsensitive(parent)
+			if err != nil {
+				return manifestNamespacePath{}, err
+			}
+			caseInsensitiveDetected = caseInsensitiveDetected || parentCaseInsensitive
 			components = append(components, manifestPathComponent{name: name})
 			for _, remaining := range parts[index+1:] {
 				components = append(components, manifestPathComponent{name: remaining})
 			}
 			break
 		}
-		caseInsensitiveDetected = caseInsensitiveDetected || actualName != name
+		caseInsensitiveDetected = caseInsensitiveDetected || aliasDetected
+		opened, info, err := openManifestComponentAt(parent, actualName)
+		if err != nil {
+			return manifestNamespacePath{}, fmt.Errorf("open namespace component %q: %w", actualName, err)
+		}
 		components = append(components, manifestPathComponent{name: actualName, identity: info})
 		if !info.directory && index < len(parts)-1 {
+			_ = opened.Close()
 			return manifestNamespacePath{}, fmt.Errorf("namespace component %q is not a directory", actualName)
 		}
 		if index < len(parts)-1 {
-			next, _, err := openOrphanDirectoryAt(parent, actualName)
-			if err != nil {
-				return manifestNamespacePath{}, fmt.Errorf("open namespace component %q: %w", actualName, err)
-			}
 			if err := parent.Close(); err != nil {
-				_ = next.Close()
+				_ = opened.Close()
 				return manifestNamespacePath{}, err
 			}
-			parent = next
+			parent = opened
+		} else if err := opened.Close(); err != nil {
+			return manifestNamespacePath{}, err
 		}
 	}
 	return manifestNamespacePath{path: path, components: components, caseInsensitiveDetected: caseInsensitiveDetected}, nil
@@ -717,10 +727,10 @@ func validateTransactionDirectory(projectPath, transactionDir string) error {
 	if filepath.Dir(filepath.Clean(transactionDir)) != root {
 		return errors.New("transaction directory is not a direct child of transaction root")
 	}
-	if err := validateRecoveryDirectory(projectPath, root, "transaction root"); err != nil {
+	if err := validateCanonicalTrustedDirectory(root, "transaction root"); err != nil {
 		return err
 	}
-	return validateRecoveryDirectory(root, transactionDir, "transaction directory")
+	return validateCanonicalTrustedDirectory(transactionDir, "transaction directory")
 }
 
 func validateRecoveryDirectory(root, path, label string) error {

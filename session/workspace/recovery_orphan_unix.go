@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,43 +39,88 @@ type manifestFileIdentity struct {
 	directory bool
 }
 
-func platformLookupManifestComponent(directory *os.File, requested string) (string, *manifestFileIdentity, error) {
+func platformLookupManifestComponent(directory *os.File, requested string) (string, bool, error) {
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
-		return "", nil, err
+		return "", false, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	var matched string
 	for _, entry := range entries {
 		if entry.Name() == requested {
-			matched = entry.Name()
-			break
+			return entry.Name(), false, nil
 		}
 	}
-	if matched == "" {
-		var requestedStat unix.Stat_t
-		if err := unix.Fstatat(int(directory.Fd()), requested, &requestedStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				return "", nil, os.ErrNotExist
-			}
-			return "", nil, err
+	var requestedStat unix.Stat_t
+	if err := unix.Fstatat(int(directory.Fd()), requested, &requestedStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return "", false, os.ErrNotExist
 		}
-		for _, entry := range entries {
-			var candidateStat unix.Stat_t
-			if err := unix.Fstatat(int(directory.Fd()), entry.Name(), &candidateStat, unix.AT_SYMLINK_NOFOLLOW); err == nil && sameOrphanIdentity(requestedStat, candidateStat) {
-				matched = entry.Name()
-				break
-			}
-		}
-		if matched == "" {
-			return "", nil, errors.New("namespace component identity was not found in parent")
+		return "", false, err
+	}
+	for _, entry := range entries {
+		var candidateStat unix.Stat_t
+		if err := unix.Fstatat(int(directory.Fd()), entry.Name(), &candidateStat, unix.AT_SYMLINK_NOFOLLOW); err == nil && sameOrphanIdentity(requestedStat, candidateStat) {
+			return entry.Name(), true, nil
 		}
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstatat(int(directory.Fd()), matched, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return "", nil, err
+	return "", false, errors.New("namespace component identity was not found in parent")
+}
+
+func platformDirectoryCaseInsensitive(directory *os.File) (bool, error) {
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return false, err
 	}
-	return matched, &manifestFileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), directory: stat.Mode&unix.S_IFMT == unix.S_IFDIR}, nil
+	for _, entry := range entries {
+		alternate := alternateASCIIName(entry.Name())
+		if alternate == entry.Name() {
+			continue
+		}
+		var original, alias unix.Stat_t
+		if err := unix.Fstatat(int(directory.Fd()), entry.Name(), &original, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return false, err
+		}
+		if err := unix.Fstatat(int(directory.Fd()), alternate, &alias, unix.AT_SYMLINK_NOFOLLOW); err == nil && sameOrphanIdentity(original, alias) {
+			return true, nil
+		} else if err != nil && !errors.Is(err, unix.ENOENT) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func alternateASCIIName(name string) string {
+	for index, character := range name {
+		if character >= 'a' && character <= 'z' {
+			return name[:index] + string(character-'a'+'A') + name[index+1:]
+		}
+		if character >= 'A' && character <= 'Z' {
+			return name[:index] + string(character-'A'+'a') + name[index+1:]
+		}
+	}
+	return name
+}
+
+func openManifestComponentAt(parent *os.File, name string) (*os.File, *manifestFileIdentity, error) {
+	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	component := os.NewFile(uintptr(fd), name)
+	if manifestComponentAfterOpenHook != nil {
+		manifestComponentAfterOpenHook(name)
+	}
+	stat, err := orphanOpenedInfo(component)
+	if err != nil {
+		_ = component.Close()
+		return nil, nil, err
+	}
+	binding, err := orphanEntryInfoAt(parent, name)
+	if err != nil || !sameOrphanIdentity(binding, stat) {
+		_ = component.Close()
+		return nil, nil, errors.Join(err, errors.New("namespace component changed while opening"))
+	}
+	return component, &manifestFileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino), directory: stat.Mode&unix.S_IFMT == unix.S_IFDIR}, nil
 }
 
 func openOrphanDirectoryAt(parent *os.File, name string) (*os.File, unix.Stat_t, error) {
@@ -125,39 +169,54 @@ const (
 	orphanCleanupContents  = "claude-squad orphan cleanup v1\n"
 )
 
-func retainedOrphanHasValidMarkerAt(root *os.File, name string) (bool, error) {
-	if len(name) != len(orphanQuarantinePrefix)+32 || !strings.HasPrefix(name, orphanQuarantinePrefix) {
-		return false, nil
+func isRetainedOrphanName(name string) bool {
+	if len(name) != len(orphanQuarantinePrefix)+32 || name[:len(orphanQuarantinePrefix)] != orphanQuarantinePrefix {
+		return false
 	}
-	if _, err := hex.DecodeString(strings.TrimPrefix(name, orphanQuarantinePrefix)); err != nil {
-		return false, nil
+	suffix := name[len(orphanQuarantinePrefix):]
+	if _, err := hex.DecodeString(suffix); err != nil {
+		return false
 	}
+	for _, character := range suffix {
+		if character >= 'A' && character <= 'F' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateRetainedOrphanMarkerAt(root *os.File, name string) error {
 	directory, _, err := openOrphanDirectoryAt(root, name)
 	if err != nil {
-		return false, fmt.Errorf("inspect retained orphan: %w", err)
+		return fmt.Errorf("inspect retained orphan: %w", err)
 	}
 	defer directory.Close()
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if len(entries) != 1 || entries[0].Name() != orphanCleanupMarker {
-		return false, errors.New("retained orphan marker directory has unexpected contents")
+		return errors.New("retained orphan marker directory has unexpected contents")
 	}
-	fd, err := unix.Openat(int(directory.Fd()), orphanCleanupMarker, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Openat(int(directory.Fd()), orphanCleanupMarker, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return false, err
+		return err
 	}
 	marker := os.NewFile(uintptr(fd), orphanCleanupMarker)
+	stat, statErr := orphanOpenedInfo(marker)
+	if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = marker.Close()
+		return errors.Join(statErr, errors.New("retained orphan marker is not a regular file"))
+	}
 	contents, readErr := io.ReadAll(marker)
 	closeErr := marker.Close()
 	if err := errors.Join(readErr, closeErr); err != nil {
-		return false, err
+		return err
 	}
 	if string(contents) != orphanCleanupContents {
-		return false, errors.New("retained orphan marker has invalid contents")
+		return errors.New("retained orphan marker has invalid contents")
 	}
-	return true, nil
+	return nil
 }
 
 func writeOrphanCleanupMarker(directory *os.File) error {

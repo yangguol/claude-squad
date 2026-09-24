@@ -252,3 +252,49 @@ PASS
 ### Concerns
 
 - Linux has no portable descriptor API exposing authoritative stored path spelling. The implementation therefore fails closed on detectable aliases and uses stable inode identities plus exact lexical names otherwise, as required by the ruling.
+
+## Fix Round 4
+
+### Status
+
+Complete. Closed the remaining canonical-spelling, namespace traversal, unresolved case-sensitivity, and forged tombstone findings with deterministic tests first.
+
+### RED
+
+```text
+go test ./session/workspace -run '^(TestValidateManifestAppliesStoredSpellingToAllTrustedDirectories|TestValidateManifestBindsNamespaceIdentityToOpenedComponent|TestDiscoveryClassifiesForgedRetainedOrphansAndFIFOWithoutBlocking)$' -count=1
+FAIL (build failed: undefined manifestComponentBeforeOpenHook)
+```
+
+After introducing the seam but before completing the fixes, focused failures showed transaction-root aliases still passed and namespace parent substitution was not rejected.
+
+### Fixes and Rationale
+
+- Canonical trusted-directory validation now covers the transaction root and caller transaction directory as well as project and metadata source paths. Darwin applies `F_GETPATH` spelling checks to each; Linux retains its documented descriptor/no-follow boundary.
+- Namespace traversal opens each existing component no-follow, derives identity with `fstat` from that exact descriptor, and revalidates the parent/name binding after open. It no longer combines `fstatat` identity with a separately opened object.
+- On the first missing component, case sensitivity is inferred non-mutatingly from existing entries in that actual parent. Unresolved suffix comparisons case-fold only when that parent demonstrates case-insensitive lookup.
+- Retained `.orphan-<hex>` entries are never silently skipped based on forgeable marker content. Exact lowercase names and sole-entry regular markers are validated with `O_NONBLOCK|O_NOFOLLOW`, but even valid tombstones are returned as explicit orphan/invalid classifications for manual recovery. Malformed and uppercase lookalikes are retained and classified rather than deleted.
+
+### GREEN and Regressions
+
+```text
+go test ./session/workspace -run '^(TestReadManifestStrict|TestValidateManifest|TestInvalidManifest|TestLegacyIncomplete|TestOrphan|TestDiscovery)' -count=1
+ok  claude-squad/session/workspace  1.016s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  170.639s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 175.602s)
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.014s
+
+git diff --check
+PASS
+```
+
+### Concerns
+
+- Final removal of a retained orphan directory remains intentionally deferred: pathname-only unlink cannot safely guarantee that the checked directory is the one removed. Discovery now reports every retained tombstone explicitly instead of trusting forgeable in-entry evidence.
+- Darwin provides authoritative descriptor path spelling; Linux cannot portably provide the equivalent and retains the documented platform boundary.
