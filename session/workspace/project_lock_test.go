@@ -107,6 +107,58 @@ func TestProjectLockCoordinatorReplacementCannotSplitSerialization(t *testing.T)
 	require.Equal(t, "reset", inProgress.Operation)
 }
 
+func TestProjectDirectoryReplacementCannotSplitSerialization(t *testing.T) {
+	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
+	projectPath := filepath.Join(shadowProjects, "project")
+	first, err := AcquireProjectLock(projectPath, "apply")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = first.Close() })
+
+	require.NoError(t, os.Mkdir(projectPath, 0o700))
+	parked := projectPath + ".parked"
+	require.NoError(t, os.Rename(projectPath, parked))
+	require.NoError(t, os.Mkdir(projectPath, 0o700))
+
+	_, err = AcquireProjectLock(projectPath, "resume")
+	var inProgress *OperationInProgressError
+	require.ErrorAs(t, err, &inProgress, "replacing the canonical project directory must not create a second lock domain")
+	require.Equal(t, "project", inProgress.ProjectID)
+}
+
+func TestProjectAndLockAnchorReplacementCannotSplitSerialization(t *testing.T) {
+	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
+	projectPath := filepath.Join(shadowProjects, "project")
+	first, err := AcquireProjectLock(projectPath, "apply")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = first.Close() })
+
+	lockRoot := filepath.Join(shadowProjects, ".locks")
+	require.NoError(t, os.Mkdir(projectPath, 0o700))
+	require.NoError(t, os.Rename(projectPath, projectPath+".parked"))
+	require.NoError(t, os.Mkdir(projectPath, 0o700))
+	require.NoError(t, os.Rename(lockRoot, lockRoot+".parked"))
+	require.NoError(t, os.Mkdir(lockRoot, 0o700))
+
+	_, err = AcquireProjectLock(projectPath, "reset")
+	require.Error(t, err, "replacing every mutable anchor pathname must fail closed")
+
+	require.NoError(t, first.Close())
+	require.NoError(t, os.RemoveAll(projectPath))
+	require.NoError(t, os.Rename(projectPath+".parked", projectPath))
+	require.NoError(t, os.RemoveAll(lockRoot))
+	require.NoError(t, os.Rename(lockRoot+".parked", lockRoot))
+	second, err := AcquireProjectLock(projectPath, "reset")
+	require.NoError(t, err, "restoring the authoritative anchor must permit reacquisition")
+	require.NoError(t, second.Close())
+}
+
+func TestProjectLockRejectsInvalidProjectIDBeforePathUse(t *testing.T) {
+	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
+	_, err := AcquireProjectLock(filepath.Join(shadowProjects, ".locks"), "apply")
+	require.ErrorContains(t, err, "invalid project ID")
+	require.NoDirExists(t, shadowProjects)
+}
+
 func TestProjectLocksForDistinctProjectsRemainIndependent(t *testing.T) {
 	shadowProjects := filepath.Join(t.TempDir(), shadowProjectsDirectory)
 	first, err := AcquireProjectLock(filepath.Join(shadowProjects, "first"), "apply")
@@ -133,17 +185,18 @@ func TestProjectLockHandlesLockDirectorySubstitutionWithoutAliasEscape(t *testin
 	}
 	t.Cleanup(func() { projectLockAfterDirectoryVerificationHook = original })
 
-	lock, err := AcquireProjectLock(filepath.Join(shadowProjects, "project"), "apply")
-	require.NoError(t, err)
+	_, err := AcquireProjectLock(filepath.Join(shadowProjects, "project"), "apply")
+	require.Error(t, err, "substitution during acquisition must fail closed")
 	require.NoFileExists(t, filepath.Join(outside, "project.lock"))
 	require.FileExists(t, filepath.Join(parked, "project.lock"))
 
 	require.NoError(t, os.Remove(lockRoot))
 	require.NoError(t, os.Mkdir(lockRoot, 0o700))
 	_, err = AcquireProjectLock(filepath.Join(shadowProjects, "project"), "reset")
-	var inProgress *OperationInProgressError
-	require.ErrorAs(t, err, &inProgress, "the stable project coordinator must prevent a replacement directory from escaping serialization")
-	require.NoError(t, lock.Close())
+	require.Error(t, err, "a replacement lock anchor must not become authoritative")
+
+	require.NoError(t, os.Remove(lockRoot))
+	require.NoError(t, os.Rename(parked, lockRoot))
 	second, err := AcquireProjectLock(filepath.Join(shadowProjects, "project"), "reset")
 	require.NoError(t, err)
 	require.NoError(t, second.Close())

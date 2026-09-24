@@ -16,6 +16,10 @@ func platformOpenTrustedDirectory(string) (*os.File, error) {
 	return nil, errors.New("trusted directory traversal is unsupported on " + runtime.GOOS)
 }
 
+func platformOpenOrCreateLockDirectoryAt(*os.File) (*os.File, error) {
+	return nil, errors.New("project locking is unsupported on " + runtime.GOOS)
+}
+
 func platformOpenOrCreateDirectoryAt(*os.File, string, uint32) (*os.File, error) {
 	return nil, errors.New("descriptor-relative directory creation is unsupported on " + runtime.GOOS)
 }
