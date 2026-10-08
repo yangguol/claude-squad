@@ -75,3 +75,57 @@ Committed as `feat(workspace): preallocate complete apply WAL`; final hash is re
 
 - Forward execution still uses the legacy in-process executor after v2 preparation. It can overwrite the v2 manifest with v1 state during execution; replacing that behavior with durable v2 phases is explicitly Task 5.
 - The nested-filesystem regression directly exercises the per-component comparison model because reliably creating a case-sensitive nested mount is not portable in unit tests.
+
+## Fix Round 1
+
+### RED evidence
+
+The interrupted worker's regression tests were already present when this work was taken over; no inaccessible prior command output is claimed. Their failure modes are recoverable from the pre-fix diff against `58cfc25`: the compatibility adapter called the v1 manifest writer after backup, existing directories absent from `Snapshot.Entries` were classified as created, and replacement-directory trees came only from the file/symlink snapshot. The inherited tests that expose those defects are:
+
+- `TestApplyKeepsCompleteV2ManifestAuthoritativeDuringLegacyExecution`
+- `TestPrepareTransactionDoesNotRecordExistingParentsAsCreated`
+- `TestPreparedReplacementDirectoryTreeIncludesDirectoriesModesAndEmptyDirectories`
+
+Additional focused tests added during takeover cover validation-before-publication, deterministic source/private collision retries, exclusive transaction-directory collision retry, and the actual namespace resolver seam.
+
+A first fresh workspace regression run also exposed three integration failures, subsequently corrected:
+
+```text
+TestApplyRollbackFailureRetainsIncompleteTransaction: expected applying, actual prepared
+TestApplyDirectoryToFileAndFileToTree/file-to-tree: rollback path below a pre-replacement file returned ENOTDIR
+TestValidateManifestRejectsNonexistentCaseEquivalentLeavesWhereSupported and TestValidateManifestRejectsTwoUnresolvedCaseEquivalentNamesWhereSupported: expected validation errors were absent
+```
+
+### Corrections
+
+- The legacy executor now keeps the complete prepared v2 manifest authoritative and stores mutable compatibility state only in memory. Its retained failed transaction therefore remains v2 `prepared`; durable forward phases remain Task 5.
+- Transaction directories use cryptographically random IDs, exclusive direct-child creation, collision retry, and parent-directory sync.
+- Parent preallocation inspects the live source safely, so existing empty directories are not recorded as created.
+- Source and transaction-private names are cryptographically generated, checked absent, reserved against in-manifest duplicates, and retried without creating source placeholders.
+- Prepared manifests are strictly validated before durable publication.
+- Replacement-directory identities include directories, empty directories, modes, regular files, and symlinks. Validation allows legitimate descendant operations beneath a path that this transaction replaces while retaining overlap checks elsewhere.
+- Namespace case behavior is recomputed from each newly entered directory; unresolved components inherit their actual current parent behavior. The regression now drives `resolveManifestNamespacePath` through its lookup seam.
+- Preparation failures leave source state unchanged and remove only the owned transaction directory.
+
+### Fresh GREEN evidence
+
+```text
+go test ./session/workspace -run '^(TestPrepareTransaction|TestPreparedManifest|TestApplyKeepsCompleteV2ManifestAuthoritativeDuringLegacyExecution|TestPreallocationRetriesOccupiedSourceAndPrivateNames|TestExclusiveTransactionDirectoryRetriesCollision|TestManifestNamespaceComparisonUsesGoverningParentCaseBehavior)' -count=1
+ok  claude-squad/session/workspace  19.211s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  178.457s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 185.012s)
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.014s
+
+git diff --check
+PASS
+```
+
+### Remaining concern
+
+Durable v2 phase transitions and crash recovery are intentionally deferred to Task 5. During current legacy execution the authoritative manifest remains at `prepared`, even after source mutation; this round prevents schema destruction but does not claim crash-safe forward progress.

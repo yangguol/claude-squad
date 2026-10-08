@@ -326,11 +326,13 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		if err := validateRelativeManifestPath(entry.Path); err != nil {
 			return fmt.Errorf("transaction entry %d target: %w", index, err)
 		}
-		if err := ensureReconstructiblePath(manifest.SourcePath, entry.Path, "target"); err != nil {
-			return fmt.Errorf("transaction entry %d: %w", index, err)
+		if !manifestTargetParentWillBeReplaced(manifest, entry.Path) {
+			if err := ensureReconstructiblePath(manifest.SourcePath, entry.Path, "target"); err != nil {
+				return fmt.Errorf("transaction entry %d: %w", index, err)
+			}
 		}
 		targetIdentity := filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.Path))
-		if entry.Operation != EntryOperationCreatedParent {
+		if entry.Operation != EntryOperationCreatedParent && !manifestTargetParentWillBeReplaced(manifest, entry.Path) {
 			if err := addManifestNamespacePath(&sourcePaths, targetIdentity); err != nil {
 				return fmt.Errorf("transaction entry %d target: %w", index, err)
 			}
@@ -358,16 +360,20 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			if field.sourceSide && filepath.Dir(filepath.Join(manifest.SourcePath, filepath.FromSlash(field.value))) != filepath.Dir(filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.Path))) {
 				return fmt.Errorf("transaction entry %d %s is not a target sibling", index, field.name)
 			}
-			if err := ensureReconstructiblePath(field.root, field.value, field.name); err != nil {
-				return fmt.Errorf("transaction entry %d: %w", index, err)
+			if !(field.sourceSide && manifestTargetParentWillBeReplaced(manifest, entry.Path)) {
+				if err := ensureReconstructiblePath(field.root, field.value, field.name); err != nil {
+					return fmt.Errorf("transaction entry %d: %w", index, err)
+				}
 			}
 			identity := filepath.Join(field.root, filepath.FromSlash(field.value))
 			namespace := &transactionPaths
 			if field.sourceSide {
 				namespace = &sourcePaths
 			}
-			if err := addManifestNamespacePath(namespace, identity); err != nil {
-				return fmt.Errorf("transaction entry %d %s: %w", index, field.name, err)
+			if !(field.sourceSide && manifestTargetParentWillBeReplaced(manifest, entry.Path)) {
+				if err := addManifestNamespacePath(namespace, identity); err != nil {
+					return fmt.Errorf("transaction entry %d %s: %w", index, field.name, err)
+				}
 			}
 		}
 		requireExpected := entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationDelete
@@ -400,7 +406,7 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			if err := validateRelativeManifestPath(name); err != nil || treeEntry.Path != name {
 				return fmt.Errorf("transaction entry %d has invalid expected tree path %q", index, name)
 			}
-			if err := validateEntryIdentity(treeEntry, false); err != nil {
+			if err := validateEntryIdentity(treeEntry, true); err != nil {
 				return fmt.Errorf("transaction entry %d expected tree identity %q: %w", index, name, err)
 			}
 			if err := ensureReconstructiblePath(manifest.SourcePath, filepath.ToSlash(filepath.Join(filepath.FromSlash(entry.Path), filepath.FromSlash(name))), "expected tree"); err != nil {
@@ -411,13 +417,22 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		sort.Strings(treePaths)
 		for treeIndex, name := range treePaths {
 			for _, other := range treePaths[treeIndex+1:] {
-				if strings.HasPrefix(other, name+"/") {
-					return fmt.Errorf("transaction entry %d expected tree paths %q and %q overlap", index, name, other)
+				if strings.HasPrefix(other, name+"/") && entry.ExpectedTree[name].Type != EntryType("directory") {
+					return fmt.Errorf("transaction entry %d expected tree paths %q and %q overlap below a non-directory", index, name, other)
 				}
 			}
 		}
 	}
 	return nil
+}
+
+func manifestTargetParentWillBeReplaced(manifest TransactionManifest, path string) bool {
+	for _, candidate := range manifest.Entries {
+		if candidate.Path != path && candidate.Operation != EntryOperationCreatedParent && strings.HasPrefix(path, candidate.Path+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 type manifestNamespacePath struct {
@@ -446,6 +461,7 @@ func addManifestNamespacePath(paths *[]manifestNamespacePath, candidate string) 
 }
 
 var manifestComponentAfterOpenHook func(string)
+var lookupManifestComponent = platformLookupManifestComponent
 
 func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 	volume := filepath.VolumeName(path)
@@ -457,9 +473,9 @@ func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 		return manifestNamespacePath{}, fmt.Errorf("open namespace root %q: %w", root, err)
 	}
 	defer func() { _ = parent.Close() }()
-	caseInsensitive, parentDevice := false, uint64(0)
+	caseInsensitive := false
 	for index, name := range parts {
-		lookup, lookupErr := platformLookupManifestComponent(parent, name)
+		lookup, lookupErr := lookupManifestComponent(parent, name)
 		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
 			return manifestNamespacePath{}, lookupErr
 		}
@@ -475,18 +491,16 @@ func resolveManifestNamespacePath(path string) (manifestNamespacePath, error) {
 		if err != nil {
 			return manifestNamespacePath{}, fmt.Errorf("open namespace component %q: %w", lookup.actualName, err)
 		}
-		if parentDevice == 0 || parentDevice == info.device {
-			caseInsensitive = caseInsensitive || lookup.caseInsensitive || lookup.aliasDetected
-		} else {
-			caseInsensitive = lookup.caseInsensitive || lookup.aliasDetected
-		}
-		parentDevice = info.device
+		caseInsensitive = lookup.caseInsensitive || lookup.aliasDetected
 		components = append(components, manifestPathComponent{name: lookup.actualName, identity: info, caseInsensitive: caseInsensitive})
 		if !info.directory && index < len(parts)-1 {
 			if opened != nil {
 				_ = opened.Close()
 			}
-			return manifestNamespacePath{}, fmt.Errorf("namespace component %q is not a directory", lookup.actualName)
+			for _, remaining := range parts[index+1:] {
+				components = append(components, manifestPathComponent{name: remaining, caseInsensitive: caseInsensitive})
+			}
+			break
 		}
 		if index < len(parts)-1 {
 			if err := parent.Close(); err != nil {

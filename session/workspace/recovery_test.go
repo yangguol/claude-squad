@@ -519,20 +519,28 @@ func TestValidateManifestRejectsAncestorNamespaceOverlaps(t *testing.T) {
 }
 
 func TestManifestNamespaceComparisonUsesGoverningParentCaseBehavior(t *testing.T) {
-	ancestor := &manifestFileIdentity{device: 1, inode: 1, directory: true}
-	mount := &manifestFileIdentity{device: 2, inode: 2, directory: true}
-	left := manifestNamespacePath{components: []manifestPathComponent{
-		{name: "case-insensitive", identity: ancestor, caseInsensitive: true},
-		{name: "nested-mount", identity: mount, caseInsensitive: false},
-		{name: "Name", caseInsensitive: false},
-	}}
-	right := manifestNamespacePath{components: []manifestPathComponent{
-		{name: "CASE-INSENSITIVE", identity: ancestor, caseInsensitive: true},
-		{name: "nested-mount", identity: mount, caseInsensitive: false},
-		{name: "name", caseInsensitive: false},
-	}}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, os.Mkdir(filepath.Join(root, "mount"), 0o700))
+	originalLookup := lookupManifestComponent
+	lookupManifestComponent = func(directory *os.File, requested string) (manifestComponentLookup, error) {
+		lookup, err := originalLookup(directory, requested)
+		if requested == "mount" {
+			lookup.caseInsensitive = false
+		}
+		if requested == "Name" {
+			lookup.caseInsensitive = false
+		}
+		return lookup, err
+	}
+	t.Cleanup(func() { lookupManifestComponent = originalLookup })
 
-	require.False(t, manifestComponentsOverlap(left, right), "an ancestor filesystem must not make unresolved names on a case-sensitive nested filesystem collide")
+	resolved, err := resolveManifestNamespacePath(filepath.Join(root, "mount", "Name"))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(resolved.components), 3)
+	components := resolved.components[len(resolved.components)-3:]
+	require.False(t, components[1].caseInsensitive)
+	require.False(t, components[2].caseInsensitive, "the unresolved leaf must use the newly entered directory filesystem's behavior")
 }
 
 func TestValidateManifestRequiresOperationSpecificRecoveryFields(t *testing.T) {

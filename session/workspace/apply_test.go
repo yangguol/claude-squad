@@ -1,6 +1,8 @@
 package workspace
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -196,7 +198,7 @@ func TestApplyRollbackFailureRetainsIncompleteTransaction(t *testing.T) {
 	transactions, findErr := FindIncompleteTransactions(filepath.Dir(workspace.data.RepoPath))
 	require.NoError(t, findErr)
 	require.Len(t, transactions, 1)
-	require.Equal(t, transactionApplying, transactions[0].State)
+	require.Equal(t, transactionPrepared, transactions[0].State)
 	require.DirExists(t, transactions[0].Directory)
 }
 
@@ -757,6 +759,126 @@ func TestPrepareTransactionDoesNotMutateSource(t *testing.T) {
 	matches, err := filepath.Glob(filepath.Join(workspace.data.SourcePath, ".claude-squad-*"))
 	require.NoError(t, err)
 	require.Empty(t, matches)
+}
+
+func TestApplyKeepsCompleteV2ManifestAuthoritativeDuringLegacyExecution(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	applyAfterBackupHook = func(directory string) {
+		manifest, err := ReadManifestStrict(filepath.Dir(workspace.data.RepoPath), directory)
+		require.NoError(t, err)
+		require.Equal(t, CurrentTransactionVersion, manifest.Version)
+		require.NotEmpty(t, manifest.Entries)
+	}
+	t.Cleanup(func() { applyAfterBackupHook = nil })
+
+	_, err := workspace.Apply()
+	require.NoError(t, err)
+}
+
+func TestPrepareTransactionValidatesBeforePublishingManifest(t *testing.T) {
+	workspace, plan, before := preparationPlan(t)
+	workspace.data.SessionID = ""
+
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.ErrorContains(t, err, "validate prepared transaction manifest")
+	require.Equal(t, before, mustSnapshot(t, workspace.data.SourcePath))
+	require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
+	require.NoDirExists(t, plan.TransactionDir)
+}
+
+func TestPreallocationRetriesOccupiedSourceAndPrivateNames(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	plan.Creates = map[string]applyEntry{"new": {Type: EntryRegular, Mode: 0o600, Contents: []byte("new")}}
+	plan.Updates = nil
+	plan.Deletes = nil
+	occupiedNonce := bytes.Repeat([]byte{0x11}, 12)
+	availableNonce := bytes.Repeat([]byte{0x22}, 12)
+	require.NoError(t, os.WriteFile(filepath.Join(workspace.data.SourcePath, ".claude-squad-rollback-"+hex.EncodeToString(occupiedNonce)), []byte("occupied"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(plan.TransactionDir, "stage"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(plan.TransactionDir, "stage", hex.EncodeToString(occupiedNonce)), []byte("occupied"), 0o600))
+
+	originalRead := applyRandomRead
+	calls := 0
+	applyRandomRead = func(buffer []byte) (int, error) {
+		calls++
+		value := availableNonce
+		if calls == 1 || calls == 3 {
+			value = occupiedNonce
+		}
+		return copy(buffer, value), nil
+	}
+	t.Cleanup(func() { applyRandomRead = originalRead })
+
+	manifest, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+	require.Len(t, manifest.Entries, 1)
+	require.Equal(t, "stage/"+hex.EncodeToString(availableNonce), manifest.Entries[0].StagePath)
+	require.Equal(t, ".claude-squad-rollback-"+hex.EncodeToString(availableNonce), manifest.Entries[0].RollbackCaptureName)
+	require.FileExists(t, filepath.Join(workspace.data.SourcePath, ".claude-squad-rollback-"+hex.EncodeToString(occupiedNonce)))
+}
+
+func TestExclusiveTransactionDirectoryRetriesCollision(t *testing.T) {
+	root := t.TempDir()
+	first := bytes.Repeat([]byte{0x33}, 16)
+	second := bytes.Repeat([]byte{0x44}, 16)
+	collision := filepath.Join(root, "session-"+hex.EncodeToString(first))
+	require.NoError(t, os.Mkdir(collision, 0o700))
+	originalRead := applyRandomRead
+	calls := 0
+	applyRandomRead = func(buffer []byte) (int, error) {
+		calls++
+		value := second
+		if calls == 1 {
+			value = first
+		}
+		return copy(buffer, value), nil
+	}
+	t.Cleanup(func() { applyRandomRead = originalRead })
+
+	created, err := createExclusiveTransactionDirectory(root, "session")
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(root, "session-"+hex.EncodeToString(second)), created)
+	require.DirExists(t, collision)
+	require.DirExists(t, created)
+}
+
+func TestPrepareTransactionDoesNotRecordExistingParentsAsCreated(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace.data.SourcePath, "existing", "empty"), 0o751))
+	plan.Creates = map[string]applyEntry{"existing/empty/file": {Type: EntryRegular, Mode: 0o600, Contents: []byte("new")}}
+	plan.Updates = nil
+	plan.Deletes = nil
+
+	manifest, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+	for _, entry := range manifest.Entries {
+		require.NotEqual(t, EntryOperationCreatedParent, entry.Operation, entry.Path)
+	}
+}
+
+func TestPreparedReplacementDirectoryTreeIncludesDirectoriesModesAndEmptyDirectories(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace.data.SourcePath, "tree", "empty"), 0o751))
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace.data.SourcePath, "tree", "nested"), 0o750))
+	writeApplyFile(t, workspace.data.SourcePath, "tree/nested/file", "old", 0o640)
+	plan.OursSnapshot = mustSnapshot(t, workspace.data.SourcePath)
+	plan.Creates = map[string]applyEntry{"tree": {Type: EntryRegular, Mode: 0o600, Contents: []byte("replacement")}}
+	plan.Updates = nil
+	plan.Deletes = nil
+
+	manifest, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+	require.Len(t, manifest.Entries, 1)
+	tree := manifest.Entries[0].ExpectedTree
+	require.Equal(t, EntryType("directory"), tree["empty"].Type)
+	require.Equal(t, os.FileMode(0o751), tree["empty"].Mode)
+	require.Equal(t, EntryType("directory"), tree["nested"].Type)
+	require.Equal(t, os.FileMode(0o750), tree["nested"].Mode)
+	require.Equal(t, EntryRegular, tree["nested/file"].Type)
 }
 
 func TestPrepareTransactionFailureLeavesSourceAndRemovesOwnedArtifacts(t *testing.T) {

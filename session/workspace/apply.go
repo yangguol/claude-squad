@@ -74,13 +74,14 @@ type transactionEntry struct {
 
 // Transaction describes durable recovery metadata for an apply operation.
 type Transaction struct {
-	Directory  string             `json:"-"`
-	Version    int                `json:"version"`
-	SessionID  string             `json:"session_id"`
-	SourcePath string             `json:"source_path"`
-	MergedTree string             `json:"merged_tree"`
-	State      transactionState   `json:"state"`
-	Entries    []transactionEntry `json:"entries"`
+	Directory        string `json:"-"`
+	preserveManifest bool
+	Version          int                `json:"version"`
+	SessionID        string             `json:"session_id"`
+	SourcePath       string             `json:"source_path"`
+	MergedTree       string             `json:"merged_tree"`
+	State            transactionState   `json:"state"`
+	Entries          []transactionEntry `json:"entries"`
 }
 
 type fileHandle interface {
@@ -126,6 +127,7 @@ func (osFileOps) MkdirAll(path string, mode os.FileMode) error { return os.Mkdir
 func (osFileOps) Chmod(name string, mode os.FileMode) error    { return os.Chmod(name, mode) }
 
 var applyFS fileOps = osFileOps{}
+var applyRandomRead = rand.Read
 var applyBeforeRevalidateHook func()
 var applyAfterBackupHook func(string)
 var applyBeforeMutationHook func(string)
@@ -289,6 +291,10 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan, now time.Time) (man
 	if err := stageTransactionResults(plan.TransactionDir, entries); err != nil {
 		return manifest, err
 	}
+	projectPath := filepath.Dir(w.data.RepoPath)
+	if err := ValidateManifest(projectPath, plan.TransactionDir, manifest); err != nil {
+		return manifest, fmt.Errorf("validate prepared transaction manifest: %w", err)
+	}
 	if err := WriteManifestDurable(manifest, plan.TransactionDir); err != nil {
 		return manifest, err
 	}
@@ -308,6 +314,36 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 
 	entries := make([]TransactionEntry, 0, len(plan.ChangedPaths()))
 	createdParents := make(map[string]struct{})
+	reservedSourceNames := make(map[string]struct{})
+	reservedPrivateNames := make(map[string]struct{})
+	allocateSourceName := func(path, prefix string) (string, error) {
+		for attempts := 0; attempts < 100; attempts++ {
+			candidate, err := randomAbsentSourceSibling(plan.SourcePath, path, prefix)
+			if err != nil {
+				return "", err
+			}
+			if _, reserved := reservedSourceNames[candidate]; reserved {
+				continue
+			}
+			reservedSourceNames[candidate] = struct{}{}
+			return candidate, nil
+		}
+		return "", errors.New("could not allocate unique absent source sibling name")
+	}
+	allocatePrivateName := func(category string) (string, error) {
+		for attempts := 0; attempts < 100; attempts++ {
+			candidate, err := randomAbsentTransactionPath(plan.TransactionDir, category)
+			if err != nil {
+				return "", err
+			}
+			if _, reserved := reservedPrivateNames[candidate]; reserved {
+				continue
+			}
+			reservedPrivateNames[candidate] = struct{}{}
+			return candidate, nil
+		}
+		return "", errors.New("could not allocate unique absent transaction path")
+	}
 	var err error
 	for _, name := range plan.ChangedPaths() {
 		if pathBelowAny(name, replacedDirectories) {
@@ -327,7 +363,7 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 			} else {
 				item.Operation = EntryOperationUpdate
 			}
-			item.StagePath, err = randomTransactionPath("stage")
+			item.StagePath, err = allocatePrivateName("stage")
 			if err != nil {
 				return nil, err
 			}
@@ -335,7 +371,11 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 			item.Result = &result
 			item.stageContents, item.stageSymlinkTarget, item.stageMode = planned.Contents, planned.SymlinkTarget, planned.Mode
 			for parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(name))); parent != "."; parent = filepath.ToSlash(filepath.Dir(filepath.FromSlash(parent))) {
-				if _, exists := plan.OursSnapshot.Entries[parent]; exists {
+				_, exists, inspectErr := snapshotOne(plan.SourcePath, parent)
+				if inspectErr != nil && !errors.Is(inspectErr, syscall.ENOTDIR) {
+					return nil, fmt.Errorf("inspect planned parent %q: %w", parent, inspectErr)
+				}
+				if exists {
 					break
 				}
 				createdParents[parent] = struct{}{}
@@ -345,27 +385,30 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 		}
 		if expected, exists := plan.OursSnapshot.Entries[name]; exists {
 			item.Expected = cloneEntry(expected)
-			item.CaptureName, err = randomSourceSibling(name, ".claude-squad-displaced-")
+			item.CaptureName, err = allocateSourceName(name, ".claude-squad-displaced-")
 			if err != nil {
 				return nil, err
 			}
-			item.QuarantinePath, err = randomTransactionPath("quarantine")
+			item.QuarantinePath, err = allocatePrivateName("quarantine")
 			if err != nil {
 				return nil, err
 			}
 		} else if item.Operation != EntryOperationDelete && planReplacesDirectory(plan, name) {
-			item.CaptureName, err = randomSourceSibling(name, ".claude-squad-displaced-")
+			item.CaptureName, err = allocateSourceName(name, ".claude-squad-displaced-")
 			if err != nil {
 				return nil, err
 			}
-			item.QuarantinePath, err = randomTransactionPath("quarantine")
+			item.QuarantinePath, err = allocatePrivateName("quarantine")
 			if err != nil {
 				return nil, err
 			}
-			item.ExpectedTree = snapshotSubtree(plan.OursSnapshot, name)
+			item.ExpectedTree, err = snapshotDirectoryTree(plan.SourcePath, name)
+			if err != nil {
+				return nil, fmt.Errorf("snapshot replacement directory %q: %w", name, err)
+			}
 		}
 		if item.Operation == EntryOperationCreate || item.Operation == EntryOperationUpdate {
-			item.RollbackCaptureName, err = randomSourceSibling(name, ".claude-squad-rollback-")
+			item.RollbackCaptureName, err = allocateSourceName(name, ".claude-squad-rollback-")
 			if err != nil {
 				return nil, err
 			}
@@ -387,7 +430,7 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 	parentEntries := make([]TransactionEntry, 0, len(parents))
 	for _, parent := range parents {
 		result := Entry{Path: parent, Type: EntryType("directory"), Mode: 0o755}
-		rollbackName, err := randomSourceSibling(parent, ".claude-squad-rollback-")
+		rollbackName, err := allocateSourceName(parent, ".claude-squad-rollback-")
 		if err != nil {
 			return nil, err
 		}
@@ -430,20 +473,77 @@ func cloneEntry(entry Entry) *Entry {
 	return &copy
 }
 
+func createExclusiveTransactionDirectory(transactionRoot, sessionID string) (string, error) {
+	for attempts := 0; attempts < 100; attempts++ {
+		var nonce [16]byte
+		if _, err := applyRandomRead(nonce[:]); err != nil {
+			return "", err
+		}
+		name := sessionID + "-" + hex.EncodeToString(nonce[:])
+		if filepath.Base(name) != name {
+			return "", errors.New("invalid transaction directory name")
+		}
+		path := filepath.Join(transactionRoot, name)
+		err := applyFS.Mkdir(path, 0o700)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	return "", errors.New("could not allocate exclusive transaction directory")
+}
+
 func randomTransactionPath(category string) (string, error) {
 	var nonce [12]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
+	if _, err := applyRandomRead(nonce[:]); err != nil {
 		return "", err
 	}
 	return filepath.ToSlash(filepath.Join(category, hex.EncodeToString(nonce[:]))), nil
 }
 
+func randomAbsentTransactionPath(transactionDir, category string) (string, error) {
+	for attempts := 0; attempts < 100; attempts++ {
+		candidate, err := randomTransactionPath(category)
+		if err != nil {
+			return "", err
+		}
+		_, err = applyFS.Lstat(filepath.Join(transactionDir, filepath.FromSlash(candidate)))
+		if errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return "", errors.New("could not allocate absent transaction path")
+}
+
 func randomSourceSibling(path, prefix string) (string, error) {
 	var nonce [12]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
+	if _, err := applyRandomRead(nonce[:]); err != nil {
 		return "", err
 	}
 	return filepath.ToSlash(filepath.Join(filepath.Dir(filepath.FromSlash(path)), prefix+hex.EncodeToString(nonce[:]))), nil
+}
+
+func randomAbsentSourceSibling(sourceRoot, path, prefix string) (string, error) {
+	for attempts := 0; attempts < 100; attempts++ {
+		candidate, err := randomSourceSibling(path, prefix)
+		if err != nil {
+			return "", err
+		}
+		_, err = applyFS.Lstat(filepath.Join(sourceRoot, filepath.FromSlash(candidate)))
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return candidate, nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return "", errors.New("could not allocate absent source sibling name")
 }
 
 func stageTransactionResults(transactionDir string, entries []TransactionEntry) error {
@@ -495,7 +595,7 @@ func stageTransactionResults(transactionDir string, entries []TransactionEntry) 
 }
 
 func legacyTransactionFromManifest(directory string, manifest TransactionManifest) Transaction {
-	transaction := Transaction{Directory: directory, Version: 1, SessionID: manifest.SessionID, SourcePath: manifest.SourcePath, MergedTree: manifest.AppliedTree, State: transactionPrepared}
+	transaction := Transaction{Directory: directory, preserveManifest: true, Version: 1, SessionID: manifest.SessionID, SourcePath: manifest.SourcePath, MergedTree: manifest.AppliedTree, State: transactionPrepared}
 	for _, entry := range manifest.Entries {
 		if entry.Operation == EntryOperationCreatedParent {
 			continue
@@ -507,7 +607,7 @@ func legacyTransactionFromManifest(directory string, manifest TransactionManifes
 		item.Payload = entry.StagePath
 		item.Backup = entry.QuarantinePath
 		item.Displaced = entry.CaptureName
-		item.ReplacesDirectory = len(entry.ExpectedTree) != 0
+		item.ReplacesDirectory = entry.Expected == nil && entry.CaptureName != ""
 		transaction.Entries = append(transaction.Entries, item)
 	}
 	return transaction
@@ -524,6 +624,13 @@ func writeExclusiveFile(name string, contents []byte, mode os.FileMode) error {
 }
 
 func writeTransactionManifest(transaction Transaction) error {
+	return writeLegacyTransactionManifest(transaction)
+}
+
+func writeLegacyTransactionManifest(transaction Transaction) error {
+	if transaction.preserveManifest {
+		return nil
+	}
 	contents, err := json.MarshalIndent(transaction, "", "  ")
 	if err != nil {
 		return err
@@ -541,7 +648,7 @@ func writeTransactionManifest(transaction Transaction) error {
 
 func randomSiblingName(name, prefix string) (string, error) {
 	var nonce [12]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
+	if _, err := applyRandomRead(nonce[:]); err != nil {
 		return "", err
 	}
 	return filepath.Join(filepath.Dir(name), prefix+hex.EncodeToString(nonce[:])), nil
@@ -550,7 +657,7 @@ func randomSiblingName(name, prefix string) (string, error) {
 func createExclusiveSibling(parent, prefix string, contents []byte, mode os.FileMode) (string, error) {
 	for attempts := 0; attempts < 100; attempts++ {
 		var nonce [12]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
+		if _, err := applyRandomRead(nonce[:]); err != nil {
 			return "", err
 		}
 		name := filepath.Join(parent, prefix+hex.EncodeToString(nonce[:]))
@@ -574,7 +681,7 @@ func createExclusiveSibling(parent, prefix string, contents []byte, mode os.File
 func createExclusiveSymlinkSibling(parent, prefix, target string) (string, error) {
 	for attempts := 0; attempts < 100; attempts++ {
 		var nonce [12]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
+		if _, err := applyRandomRead(nonce[:]); err != nil {
 			return "", err
 		}
 		name := filepath.Join(parent, prefix+hex.EncodeToString(nonce[:]))
@@ -615,17 +722,50 @@ func (w *shadowWorkspace) revalidateTouched(plan applyPlan) error {
 	return nil
 }
 
-func snapshotSubtree(snapshot Snapshot, name string) map[string]Entry {
-	result := make(map[string]Entry)
-	prefix := name + "/"
-	for path, entry := range snapshot.Entries {
-		if strings.HasPrefix(path, prefix) {
-			relative := strings.TrimPrefix(path, prefix)
-			entry.Path = relative
-			result[relative] = entry
-		}
+func snapshotDirectoryTree(sourceRoot, name string) (map[string]Entry, error) {
+	root := filepath.Join(sourceRoot, filepath.FromSlash(name))
+	rootInfo, err := applyFS.Lstat(root)
+	if err != nil {
+		return nil, err
 	}
-	return result
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("replacement source is not a real directory")
+	}
+	result := make(map[string]Entry)
+	err = filepath.WalkDir(root, func(path string, directoryEntry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		entry, exists, err := snapshotOne(root, relative)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.New("replacement directory entry disappeared while scanning")
+		}
+		entry.Path = relative
+		result[relative] = entry
+		if entry.Type != EntryType("directory") && directoryEntry.IsDir() {
+			return errors.New("replacement directory entry changed while scanning")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	final, err := applyFS.Lstat(root)
+	if err != nil || !final.IsDir() || !os.SameFile(rootInfo, final) {
+		return nil, errorsJoinMessage(err, "replacement directory changed while scanning")
+	}
+	return result, nil
 }
 
 func planReplacesDirectory(plan applyPlan, name string) bool {
@@ -684,7 +824,7 @@ func (w *shadowWorkspace) executeTransaction(transaction *Transaction) error {
 		}
 	}
 	transaction.State = transactionApplying
-	if err := writeTransactionManifest(*transaction); err != nil {
+	if err := writeLegacyTransactionManifest(*transaction); err != nil {
 		return err
 	}
 	if applyAfterBackupHook != nil {
@@ -713,7 +853,7 @@ func (w *shadowWorkspace) executeTransaction(transaction *Transaction) error {
 		}
 	}
 	transaction.State = transactionCommitted
-	if err := writeTransactionManifest(*transaction); err != nil {
+	if err := writeLegacyTransactionManifest(*transaction); err != nil {
 		rollbackErr := w.rollbackTransaction(transaction, applied, createdDirs)
 		return errors.Join(fmt.Errorf("commit transaction metadata: %w", err), wrapRollbackError(rollbackErr))
 	}
@@ -955,11 +1095,11 @@ func capturedEntryMatches(displaced string, item transactionEntry) (bool, error)
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return false, nil
 		}
-		actual, err := Scan(displaced, Policy{})
+		actual, err := snapshotDirectoryTree(filepath.Dir(displaced), filepath.Base(displaced))
 		if err != nil {
 			return false, err
 		}
-		return reflect.DeepEqual(actual.Entries, item.ExpectedTree), nil
+		return reflect.DeepEqual(actual, item.ExpectedTree), nil
 	}
 	return false, errors.New("transaction entry is missing expected source state")
 }
@@ -1074,7 +1214,7 @@ func (w *shadowWorkspace) rollbackTransaction(transaction *Transaction, applied 
 	}
 	if rollbackErr == nil {
 		transaction.State = transactionRolledBack
-		if err := writeTransactionManifest(*transaction); err != nil {
+		if err := writeLegacyTransactionManifest(*transaction); err != nil {
 			return err
 		}
 		return applyFS.RemoveAll(transaction.Directory)
@@ -1239,11 +1379,15 @@ func (w *shadowWorkspace) planApply() (plan applyPlan, returnErr error) {
 	if err := ensureRealContainedPath(filepath.Dir(w.data.RepoPath), transactionRoot, false, "transaction root"); err != nil {
 		return plan, err
 	}
-	transactionDir, err := os.MkdirTemp(transactionRoot, w.data.SessionID+"-")
+	transactionDir, err := createExclusiveTransactionDirectory(transactionRoot, w.data.SessionID)
 	if err != nil {
 		return plan, fmt.Errorf("create apply transaction: %w", err)
 	}
 	plan.TransactionDir = transactionDir
+	if err := SyncDirectory(transactionRoot); err != nil {
+		_ = os.Remove(transactionDir)
+		return plan, fmt.Errorf("sync transaction root after creating transaction: %w", err)
+	}
 	defer func() {
 		if returnErr != nil {
 			_ = os.RemoveAll(transactionDir)
