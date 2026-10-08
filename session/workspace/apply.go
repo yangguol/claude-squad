@@ -195,7 +195,8 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 		applyBeforeRevalidateHook()
 	}
 	if err := w.revalidateTouched(plan); err != nil {
-		return nil, err
+		prepared.State = TransactionRollingBack
+		return nil, errors.Join(err, writeManifestAtBoundDirectory(prepared, plan.TransactionDir))
 	}
 	if err := ExecuteTransaction(&prepared, plan.TransactionDir); err != nil {
 		return nil, err
@@ -290,10 +291,34 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan, now time.Time) (man
 			returnErr = errors.Join(returnErr, cleanupUnpublishedTransaction(plan.TransactionDir))
 		}
 	}()
+	appliedEntries := make(map[string]Entry, len(plan.OursSnapshot.Entries)+len(plan.Creates)+len(plan.Updates))
+	for path, entry := range plan.OursSnapshot.Entries {
+		appliedEntries[path] = entry
+	}
+	removeAppliedPath := func(path string) {
+		delete(appliedEntries, path)
+		prefix := path + "/"
+		for existing := range appliedEntries {
+			if strings.HasPrefix(existing, prefix) {
+				delete(appliedEntries, existing)
+			}
+		}
+	}
+	for _, path := range plan.Deletes {
+		removeAppliedPath(path)
+	}
+	for path, entry := range plan.Creates {
+		removeAppliedPath(path)
+		appliedEntries[path] = applyEntryIdentity(path, entry)
+	}
+	for path, entry := range plan.Updates {
+		removeAppliedPath(path)
+		appliedEntries[path] = applyEntryIdentity(path, entry)
+	}
 	manifest = TransactionManifest{
 		Version: CurrentTransactionVersion, TransactionID: filepath.Base(plan.TransactionDir),
 		ProjectID: w.data.ProjectID, SessionID: w.data.SessionID, SourcePath: w.data.SourcePath,
-		State: TransactionPrepared, AppliedTree: plan.MergedTree, AppliedAt: now.UTC().Format(time.RFC3339Nano),
+		State: TransactionPrepared, AppliedTree: plan.MergedTree, AppliedAt: now.UTC().Format(time.RFC3339Nano), AppliedEntries: appliedEntries,
 	}
 	entries, err := preallocateTransactionEntries(plan)
 	if err != nil {

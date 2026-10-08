@@ -65,6 +65,8 @@ type TransactionEntry struct {
 	Expected            *Entry           `json:"expected,omitempty"`
 	Result              *Entry           `json:"result,omitempty"`
 	ExpectedTree        map[string]Entry `json:"expected_tree,omitempty"`
+	CreatedDevice       uint64           `json:"created_device,omitempty"`
+	CreatedInode        uint64           `json:"created_inode,omitempty"`
 	stageContents       []byte
 	stageSymlinkTarget  string
 	stageMode           os.FileMode
@@ -72,15 +74,16 @@ type TransactionEntry struct {
 }
 
 type TransactionManifest struct {
-	Version       int                `json:"version"`
-	TransactionID string             `json:"transaction_id"`
-	ProjectID     string             `json:"project_id"`
-	SessionID     string             `json:"session_id"`
-	SourcePath    string             `json:"source_path"`
-	State         TransactionState   `json:"state"`
-	AppliedTree   string             `json:"applied_tree,omitempty"`
-	AppliedAt     string             `json:"applied_at,omitempty"`
-	Entries       []TransactionEntry `json:"entries"`
+	Version        int                `json:"version"`
+	TransactionID  string             `json:"transaction_id"`
+	ProjectID      string             `json:"project_id"`
+	SessionID      string             `json:"session_id"`
+	SourcePath     string             `json:"source_path"`
+	State          TransactionState   `json:"state"`
+	AppliedTree    string             `json:"applied_tree,omitempty"`
+	AppliedAt      string             `json:"applied_at,omitempty"`
+	AppliedEntries map[string]Entry   `json:"applied_entries,omitempty"`
+	Entries        []TransactionEntry `json:"entries"`
 }
 
 func WriteManifestDurable(manifest TransactionManifest, transactionDir string) error {

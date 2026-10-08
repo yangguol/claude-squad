@@ -1394,3 +1394,133 @@ func TestCommittedIsTheOnlySuccessfulApplyCommitPoint(t *testing.T) {
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
 	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
+
+func TestFinalValidationRunsAfterBeforeCommitHook(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeCommitHook = func() error {
+		writeApplyFile(t, manifest.SourcePath, "update", "mutated by hook", 0o644)
+		return nil
+	}
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestPreparedRevalidationFailureDurablyEntersRollingBack(t *testing.T) {
+	workspace, _, _ := preparationPlan(t)
+	writeApplyFile(t, workspace.WorkDir(), "update", "agent", 0o644)
+	applyBeforeRevalidateHook = func() { writeApplyFile(t, workspace.data.SourcePath, "update", "concurrent", 0o644) }
+	t.Cleanup(func() { applyBeforeRevalidateHook = nil })
+
+	_, err := workspace.Apply()
+	require.Error(t, err)
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+	require.NoError(t, globErr)
+	require.Len(t, matches, 1)
+	manifest := readPersistedTransactionManifest(t, filepath.Dir(matches[0]))
+	require.Equal(t, TransactionRollingBack, manifest.State)
+}
+
+func TestFinalValidationRejectsUnexpectedCreatedParentChild(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeCommitHook = func() error {
+		writeApplyFile(t, manifest.SourcePath, "new/unexpected", "unexpected", 0o600)
+		return nil
+	}
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestCreatedParentPublishIntentWithoutIdentityIsAmbiguous(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Operation == EntryOperationCreatedParent })
+	require.NotEqual(t, -1, index)
+	manifest.State = TransactionApplying
+	manifest.Entries[index].Phase = EntryPhasePublishIntent
+	require.NoError(t, os.MkdirAll(filepath.Join(manifest.SourcePath, filepath.FromSlash(manifest.Entries[index].Path)), 0o755))
+	require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestForwardExecutionDoesNotFollowSubstitutedSourceRoot(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	outside := t.TempDir()
+	parked := manifest.SourcePath + ".parked"
+	applyAfterBackupHook = func(string) {
+		applyAfterBackupHook = nil
+		require.NoError(t, os.Rename(manifest.SourcePath, parked))
+		require.NoError(t, os.Symlink(outside, manifest.SourcePath))
+	}
+	t.Cleanup(func() { applyAfterBackupHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Empty(t, mustSnapshot(t, outside).Entries)
+}
+
+func TestForwardExecutionDoesNotFollowSubstitutedTransactionDirectory(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	outside := t.TempDir()
+	parked := plan.TransactionDir + ".parked"
+	applyAfterBackupHook = func(string) {
+		applyAfterBackupHook = nil
+		require.NoError(t, os.Rename(plan.TransactionDir, parked))
+		require.NoError(t, os.Symlink(outside, plan.TransactionDir))
+	}
+	t.Cleanup(func() { applyAfterBackupHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.NoFileExists(t, filepath.Join(outside, "manifest.json"))
+}
+
+func TestCommitWriteFailureBeforeRenameDurablyRollsBack(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	failed := false
+	transactionManifestWriteHook = func(state TransactionState) error {
+		if state == TransactionCommitted && !failed {
+			failed = true
+			return errors.New("injected commit write failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { transactionManifestWriteHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestCommitDirectorySyncFailureAfterRenameUsesDurableReadback(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionAfterManifestRenameHook = func(state TransactionState) error {
+		if state == TransactionCommitted {
+			return errors.New("injected post-rename sync failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { transactionAfterManifestRenameHook = nil })
+
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionCommitted, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestCreatedParentConcurrentCreatorIsNotClaimed(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if action == "create-parent" && path == "new" {
+			require.NoError(t, os.Mkdir(filepath.Join(manifest.SourcePath, "new"), 0o755))
+		}
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	require.Equal(t, TransactionRollingBack, persisted.State)
+	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
+	require.Zero(t, persisted.Entries[index].CreatedDevice)
+	require.Zero(t, persisted.Entries[index].CreatedInode)
+	require.DirExists(t, filepath.Join(manifest.SourcePath, "new"))
+}
