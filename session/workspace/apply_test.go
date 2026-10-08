@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestApplyTransactionCleanMerge(t *testing.T) {
@@ -1050,6 +1051,88 @@ func TestPrepareTransactionCleanupFailurePreservesAndReportsTransaction(t *testi
 	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
 	require.ErrorContains(t, err, "injected cleanup failure")
 	require.DirExists(t, plan.TransactionDir)
+}
+
+func TestPrepareTransactionRejectsSwappedFinalPreparedParent(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace.data.SourcePath, "parent"), 0o755))
+	plan.Creates = map[string]applyEntry{"parent/child": {Type: EntryRegular, Mode: 0o600, Contents: []byte("new")}}
+	plan.Updates = nil
+	plan.Deletes = nil
+	preparedPathAfterOpenHook = func(path string) {
+		if path != "parent" {
+			return
+		}
+		preparedPathAfterOpenHook = nil
+		require.NoError(t, os.Rename(filepath.Join(workspace.data.SourcePath, "parent"), filepath.Join(workspace.data.SourcePath, "parked")))
+		require.NoError(t, os.Mkdir(filepath.Join(workspace.data.SourcePath, "parent"), 0o755))
+	}
+	t.Cleanup(func() { preparedPathAfterOpenHook = nil })
+
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.Error(t, err)
+	require.DirExists(t, filepath.Join(workspace.data.SourcePath, "parent"))
+	require.DirExists(t, filepath.Join(workspace.data.SourcePath, "parked"))
+	require.NoFileExists(t, filepath.Join(workspace.data.SourcePath, "parent", "child"))
+	require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
+}
+
+func TestPreparedReplacementDirectoryScanRejectsSwappedRoot(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace.data.SourcePath, "tree"), 0o755))
+	writeApplyFile(t, workspace.data.SourcePath, "tree/file", "inside", 0o600)
+	plan.OursSnapshot = mustSnapshot(t, workspace.data.SourcePath)
+	plan.Creates = map[string]applyEntry{"tree": {Type: EntryRegular, Mode: 0o600, Contents: []byte("replacement")}}
+	plan.Updates = nil
+	plan.Deletes = nil
+	replacementScanAfterRootOpenHook = func() {
+		replacementScanAfterRootOpenHook = nil
+		require.NoError(t, os.Rename(filepath.Join(workspace.data.SourcePath, "tree"), filepath.Join(workspace.data.SourcePath, "parked")))
+		require.NoError(t, os.Mkdir(filepath.Join(workspace.data.SourcePath, "tree"), 0o755))
+		writeApplyFile(t, workspace.data.SourcePath, "tree/file", "substitute", 0o600)
+	}
+	t.Cleanup(func() { replacementScanAfterRootOpenHook = nil })
+
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.Error(t, err)
+	require.Equal(t, "inside", mustReadFile(t, filepath.Join(workspace.data.SourcePath, "parked", "file")))
+	require.Equal(t, "substitute", mustReadFile(t, filepath.Join(workspace.data.SourcePath, "tree", "file")))
+	require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
+}
+
+func TestPreparationTraversalClosesAllDescriptors(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "one", "two", "tree"), 0o755))
+	writeApplyFile(t, root, "one/two/tree/file", "content", 0o600)
+	fd, err := unix.Dup(1)
+	require.NoError(t, err)
+	require.NoError(t, unix.Close(fd))
+	for range 100 {
+		require.NoError(t, platformRequirePathAbsent(root, "one/two/missing"))
+		_, err := snapshotDirectoryTree(root, "one/two/tree")
+		require.NoError(t, err)
+	}
+	reused, err := unix.Dup(1)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(reused) })
+	require.Equal(t, fd, reused)
+}
+
+func TestPrepareTransactionRevalidatesParentAfterManifestValidation(t *testing.T) {
+	workspace, plan, before := preparationPlan(t)
+	plan.Creates = map[string]applyEntry{"parent/child": {Type: EntryRegular, Mode: 0o600, Contents: []byte("new")}}
+	plan.Updates = nil
+	plan.Deletes = nil
+	applyAfterManifestValidationHook = func() {
+		applyAfterManifestValidationHook = nil
+		require.NoError(t, os.Mkdir(filepath.Join(workspace.data.SourcePath, "parent"), 0o755))
+	}
+	t.Cleanup(func() { applyAfterManifestValidationHook = nil })
+
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.ErrorContains(t, err, "parent classification changed")
+	require.Equal(t, before, mustSnapshot(t, workspace.data.SourcePath))
+	require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
 }
 
 func TestPreparedReplacementDirectoryScanRejectsSwappedDescendant(t *testing.T) {

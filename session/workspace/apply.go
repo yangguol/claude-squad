@@ -131,7 +131,10 @@ var applyFS fileOps = osFileOps{}
 var applyRandomRead = rand.Read
 var applySyncDirectory = SyncDirectory
 var applyAfterParentClassificationHook func()
+var applyAfterManifestValidationHook func()
+var preparedPathAfterOpenHook func(string)
 var replacementScanBeforeOpenHook func(string)
+var replacementScanAfterRootOpenHook func()
 var applyBeforeRevalidateHook func()
 var applyAfterBackupHook func(string)
 var applyBeforeMutationHook func(string)
@@ -314,6 +317,12 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan, now time.Time) (man
 	projectPath := filepath.Dir(w.data.RepoPath)
 	if err := ValidateManifest(projectPath, plan.TransactionDir, manifest); err != nil {
 		return manifest, fmt.Errorf("validate prepared transaction manifest: %w", err)
+	}
+	if applyAfterManifestValidationHook != nil {
+		applyAfterManifestValidationHook()
+	}
+	if err := revalidatePreparedParents(plan.SourcePath, entries); err != nil {
+		return manifest, err
 	}
 	if err := WriteManifestDurable(manifest, plan.TransactionDir); err != nil {
 		return manifest, err

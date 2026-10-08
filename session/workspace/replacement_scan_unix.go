@@ -26,23 +26,56 @@ func platformRequirePathAbsent(root, relative string) error {
 	return nil
 }
 
-func platformPreparedPathType(root, relative string) (EntryType, error) {
-	parent, err := platformOpenTrustedDirectory(root)
+type openedDirectoryBinding struct {
+	parent   *os.File
+	name     string
+	identity unix.Stat_t
+	child    *os.File
+}
+
+func closeOpenedDirectoryBindings(root *os.File, bindings []openedDirectoryBinding) error {
+	var closeErr error
+	for index := len(bindings) - 1; index >= 0; index-- {
+		closeErr = errors.Join(closeErr, bindings[index].child.Close())
+	}
+	return errors.Join(closeErr, root.Close())
+}
+
+func verifyOpenedDirectoryBindings(bindings []openedDirectoryBinding) error {
+	for index := len(bindings) - 1; index >= 0; index-- {
+		binding := bindings[index]
+		if err := verifyOrphanDirectoryEntry(binding.parent, binding.name, binding.identity); err != nil {
+			return fmt.Errorf("directory component %q changed binding: %w", binding.name, err)
+		}
+		if err := verifyOpenedReplacementDirectory(binding.child, binding.identity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func platformPreparedPathType(root, relative string) (result EntryType, returnErr error) {
+	rootDirectory, err := platformOpenTrustedDirectory(root)
 	if err != nil {
 		return "", err
 	}
-	defer parent.Close()
+	bindings := make([]openedDirectoryBinding, 0)
+	defer func() { returnErr = errors.Join(returnErr, closeOpenedDirectoryBindings(rootDirectory, bindings)) }()
+	parent := rootDirectory
 	parts := strings.Split(filepath.ToSlash(relative), "/")
 	for index, component := range parts {
 		stat, err := orphanEntryInfoAt(parent, component)
 		if errors.Is(err, unix.ENOENT) {
-			return "", nil
+			return "", verifyOpenedDirectoryBindings(bindings)
 		}
 		if err != nil {
 			return "", err
 		}
 		fileType := stat.Mode & unix.S_IFMT
 		if index == len(parts)-1 {
+			if err := verifyOpenedDirectoryBindings(bindings); err != nil {
+				return "", err
+			}
 			switch fileType {
 			case unix.S_IFDIR:
 				return EntryType("directory"), nil
@@ -55,26 +88,32 @@ func platformPreparedPathType(root, relative string) (EntryType, error) {
 			}
 		}
 		if fileType != unix.S_IFDIR {
-			return "", nil
+			return "", verifyOpenedDirectoryBindings(bindings)
 		}
-		child, _, err := openOrphanDirectoryAt(parent, component)
+		child, identity, err := openOrphanDirectoryAt(parent, component)
 		if err != nil {
 			return "", err
 		}
-		if index > 0 {
-			_ = parent.Close()
+		bindings = append(bindings, openedDirectoryBinding{parent: parent, name: component, identity: identity, child: child})
+		if preparedPathAfterOpenHook != nil {
+			preparedPathAfterOpenHook(strings.Join(parts[:index+1], "/"))
+		}
+		if err := verifyOrphanDirectoryEntry(parent, component, identity); err != nil {
+			return "", err
 		}
 		parent = child
 	}
-	return EntryType("directory"), nil
+	return EntryType("directory"), verifyOpenedDirectoryBindings(bindings)
 }
 
-func platformSnapshotDirectoryTree(sourceRoot, name string) (map[string]Entry, error) {
-	parent, err := platformOpenTrustedDirectory(sourceRoot)
+func platformSnapshotDirectoryTree(sourceRoot, name string) (result map[string]Entry, returnErr error) {
+	rootDirectory, err := platformOpenTrustedDirectory(sourceRoot)
 	if err != nil {
 		return nil, err
 	}
-	defer parent.Close()
+	bindings := make([]openedDirectoryBinding, 0)
+	defer func() { returnErr = errors.Join(returnErr, closeOpenedDirectoryBindings(rootDirectory, bindings)) }()
+	parent := rootDirectory
 	parts := strings.Split(filepath.ToSlash(name), "/")
 	for index, component := range parts {
 		if replacementScanBeforeOpenHook != nil {
@@ -84,17 +123,22 @@ func platformSnapshotDirectoryTree(sourceRoot, name string) (map[string]Entry, e
 		if err != nil {
 			return nil, fmt.Errorf("open replacement directory %q: %w", strings.Join(parts[:index+1], "/"), err)
 		}
-		if index > 0 {
-			_ = parent.Close()
+		bindings = append(bindings, openedDirectoryBinding{parent: parent, name: component, identity: identity, child: child})
+		if err := verifyOrphanDirectoryEntry(parent, component, identity); err != nil {
+			return nil, fmt.Errorf("bind replacement directory %q: %w", strings.Join(parts[:index+1], "/"), err)
 		}
 		parent = child
 		if index == len(parts)-1 {
-			result := make(map[string]Entry)
-			err = scanReplacementDirectory(parent, "", result)
-			if verifyErr := verifyOpenedReplacementDirectory(parent, identity); verifyErr != nil {
-				err = errors.Join(err, verifyErr)
+			if replacementScanAfterRootOpenHook != nil {
+				replacementScanAfterRootOpenHook()
 			}
-			return result, err
+			result = make(map[string]Entry)
+			scanErr := scanReplacementDirectory(parent, "", result)
+			verifyErr := verifyOpenedDirectoryBindings(bindings)
+			if err := errors.Join(scanErr, verifyErr); err != nil {
+				return result, err
+			}
+			return result, nil
 		}
 	}
 	return nil, errors.New("replacement source is not a real directory")

@@ -177,3 +177,46 @@ The first full workspace regression run exposed the valid file-to-directory tran
 ### Remaining concern
 
 Durable v2 phase transitions and crash recovery remain Task 5. The fix deliberately guarantees absent-at-preparation plus atomic/exclusive no-replace consumption; it does not claim impossible hostile namespace reservation.
+
+## Fix Round 3
+
+### RED
+
+The focused substitution and publication-window tests were added first. Their initial run failed to compile because the deterministic seams did not yet exist:
+
+```text
+session/workspace/apply_test.go:1061:2: undefined: preparedPathAfterOpenHook
+session/workspace/apply_test.go:1085:2: undefined: replacementScanAfterRootOpenHook
+session/workspace/apply_test.go:1105:2: undefined: applyAfterManifestValidationHook
+FAIL claude-squad/session/workspace [build failed]
+```
+
+### Corrections
+
+- Prepared-path classification now retains every opened ancestor descriptor and its parent/name identity binding, verifies each binding before accepting presence or absence, and closes the root and every child descriptor on all returns.
+- Replacement-tree snapshots now open the root descriptor-relative through a retained stable source-root chain, keep every ancestor descriptor alive, and revalidate the replacement root plus the complete ancestor chain after scanning before accepting `ExpectedTree`.
+- Parent classifications are revalidated again after staging and strict manifest validation, immediately before durable manifest publication. A late appearance, disappearance, or type change aborts and removes only the unpublished transaction directory.
+- Added deterministic final-parent substitution, replacement-root substitution, late parent mutation, and descriptor-reuse leak regressions. Source objects are not modified by preparation failures.
+
+### GREEN and regressions
+
+```text
+go test ./session/workspace -run '^(TestPrepareTransaction|TestPreparedManifest|TestPreparationTraversal|TestPreparedReplacementDirectoryScan)' -count=1
+ok  claude-squad/session/workspace  30.873s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  208.936s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 207.724s)
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.013s
+
+git diff --check
+PASS
+```
+
+### Remaining concern
+
+Pathname-based forward execution capture and rollback remain intentionally scoped to Task 5. This round binds preparation checks and snapshots without broadening into legacy execution migration.
