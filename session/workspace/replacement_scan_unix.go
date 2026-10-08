@@ -65,15 +65,36 @@ func platformPreparedPathType(root, relative string) (result EntryType, returnEr
 	parts := strings.Split(filepath.ToSlash(relative), "/")
 	for index, component := range parts {
 		stat, err := orphanEntryInfoAt(parent, component)
+		if index == len(parts)-1 && preparedPathAfterLeafStatHook != nil {
+			preparedPathAfterLeafStatHook(strings.Join(parts[:index+1], "/"))
+		}
 		if errors.Is(err, unix.ENOENT) {
-			return "", verifyOpenedDirectoryBindings(bindings)
+			if err := verifyOpenedDirectoryBindings(bindings); err != nil {
+				return "", err
+			}
+			absent, err := orphanEntryAbsentAt(parent, component)
+			if err != nil || !absent {
+				return "", errors.Join(err, errors.New("prepared path leaf changed after absence check"))
+			}
+			return "", nil
 		}
 		if err != nil {
 			return "", err
 		}
 		fileType := stat.Mode & unix.S_IFMT
 		if index == len(parts)-1 {
-			if err := verifyOpenedDirectoryBindings(bindings); err != nil {
+			leaf, err := platformOpenPreparedLeafAt(parent, component)
+			if err != nil {
+				return "", fmt.Errorf("open prepared path leaf: %w", err)
+			}
+			opened, statErr := orphanOpenedInfo(leaf)
+			verifyErr := verifyOpenedDirectoryBindings(bindings)
+			binding, bindingErr := orphanEntryInfoAt(parent, component)
+			closeErr := leaf.Close()
+			if statErr != nil || bindingErr != nil || !sameOrphanIdentity(stat, opened) || !sameOrphanIdentity(opened, binding) {
+				bindingErr = errors.Join(bindingErr, errors.New("prepared path leaf changed binding"))
+			}
+			if err := errors.Join(statErr, verifyErr, bindingErr, closeErr); err != nil {
 				return "", err
 			}
 			switch fileType {
@@ -106,14 +127,49 @@ func platformPreparedPathType(root, relative string) (result EntryType, returnEr
 	return EntryType("directory"), verifyOpenedDirectoryBindings(bindings)
 }
 
+func openBoundAbsoluteDirectory(path string) (*os.File, []openedDirectoryBinding, *os.File, error) {
+	clean, err := filepath.EvalSymlinks(filepath.Clean(path))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !filepath.IsAbs(clean) {
+		return nil, nil, nil, fmt.Errorf("bound directory must be absolute: %q", path)
+	}
+	anchor, err := platformOpenTrustedDirectory(string(filepath.Separator))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	bindings := make([]openedDirectoryBinding, 0)
+	parent := anchor
+	trimmed := strings.TrimPrefix(filepath.ToSlash(clean), "/")
+	if trimmed == "" {
+		return anchor, bindings, anchor, nil
+	}
+	for _, component := range strings.Split(trimmed, "/") {
+		child, identity, err := openOrphanDirectoryAt(parent, component)
+		if err != nil {
+			_ = closeOpenedDirectoryBindings(anchor, bindings)
+			return nil, nil, nil, err
+		}
+		bindings = append(bindings, openedDirectoryBinding{parent: parent, name: component, identity: identity, child: child})
+		if err := verifyOrphanDirectoryEntry(parent, component, identity); err != nil {
+			_ = closeOpenedDirectoryBindings(anchor, bindings)
+			return nil, nil, nil, err
+		}
+		parent = child
+	}
+	return anchor, bindings, parent, nil
+}
+
 func platformSnapshotDirectoryTree(sourceRoot, name string) (result map[string]Entry, returnErr error) {
-	rootDirectory, err := platformOpenTrustedDirectory(sourceRoot)
+	rootDirectory, bindings, parent, err := openBoundAbsoluteDirectory(sourceRoot)
 	if err != nil {
 		return nil, err
 	}
-	bindings := make([]openedDirectoryBinding, 0)
 	defer func() { returnErr = errors.Join(returnErr, closeOpenedDirectoryBindings(rootDirectory, bindings)) }()
-	parent := rootDirectory
+	if replacementScanAfterSourceRootOpenHook != nil {
+		replacementScanAfterSourceRootOpenHook()
+	}
 	parts := strings.Split(filepath.ToSlash(name), "/")
 	for index, component := range parts {
 		if replacementScanBeforeOpenHook != nil {

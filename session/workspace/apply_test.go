@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 )
 
 func TestApplyTransactionCleanMerge(t *testing.T) {
@@ -1077,6 +1076,74 @@ func TestPrepareTransactionRejectsSwappedFinalPreparedParent(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
 }
 
+func TestPreparedPathClassificationRejectsSwappedFinalComponent(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(t *testing.T, root, path string)
+		swap  func(t *testing.T, root, path string)
+	}{
+		{
+			name: "present leaf",
+			setup: func(t *testing.T, root, path string) {
+				writeApplyFile(t, root, path, "original", 0o600)
+			},
+			swap: func(t *testing.T, root, path string) {
+				require.NoError(t, os.Rename(filepath.Join(root, path), filepath.Join(root, "parent", "parked")))
+				writeApplyFile(t, root, path, "substitute", 0o600)
+			},
+		},
+		{
+			name: "absent leaf",
+			setup: func(t *testing.T, root, path string) {
+				require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(root, path)), 0o755))
+			},
+			swap: func(t *testing.T, root, path string) {
+				writeApplyFile(t, root, path, "appeared", 0o600)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := "parent/leaf"
+			test.setup(t, root, path)
+			preparedPathAfterLeafStatHook = func(got string) {
+				if got != path {
+					return
+				}
+				preparedPathAfterLeafStatHook = nil
+				test.swap(t, root, path)
+			}
+			t.Cleanup(func() { preparedPathAfterLeafStatHook = nil })
+
+			_, err := platformPreparedPathType(root, path)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestPreparedReplacementDirectoryScanRejectsSwappedSourceRoot(t *testing.T) {
+	container, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	source := filepath.Join(container, "source")
+	parked := filepath.Join(container, "parked")
+	require.NoError(t, os.Mkdir(source, 0o755))
+	require.NoError(t, os.Mkdir(filepath.Join(source, "tree"), 0o755))
+	writeApplyFile(t, source, "tree/file", "original", 0o600)
+	replacementScanAfterSourceRootOpenHook = func() {
+		replacementScanAfterSourceRootOpenHook = nil
+		require.NoError(t, os.Rename(source, parked))
+		require.NoError(t, os.Mkdir(source, 0o755))
+		require.NoError(t, os.Mkdir(filepath.Join(source, "tree"), 0o755))
+		writeApplyFile(t, source, "tree/file", "substitute", 0o600)
+	}
+	t.Cleanup(func() { replacementScanAfterSourceRootOpenHook = nil })
+
+	_, err = snapshotDirectoryTree(source, "tree")
+	require.Error(t, err)
+	require.Equal(t, "original", mustReadFile(t, filepath.Join(parked, "tree", "file")))
+	require.Equal(t, "substitute", mustReadFile(t, filepath.Join(source, "tree", "file")))
+}
+
 func TestPreparedReplacementDirectoryScanRejectsSwappedRoot(t *testing.T) {
 	workspace, plan, _ := preparationPlan(t)
 	require.NoError(t, os.MkdirAll(filepath.Join(workspace.data.SourcePath, "tree"), 0o755))
@@ -1098,24 +1165,6 @@ func TestPreparedReplacementDirectoryScanRejectsSwappedRoot(t *testing.T) {
 	require.Equal(t, "inside", mustReadFile(t, filepath.Join(workspace.data.SourcePath, "parked", "file")))
 	require.Equal(t, "substitute", mustReadFile(t, filepath.Join(workspace.data.SourcePath, "tree", "file")))
 	require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
-}
-
-func TestPreparationTraversalClosesAllDescriptors(t *testing.T) {
-	root := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "one", "two", "tree"), 0o755))
-	writeApplyFile(t, root, "one/two/tree/file", "content", 0o600)
-	fd, err := unix.Dup(1)
-	require.NoError(t, err)
-	require.NoError(t, unix.Close(fd))
-	for range 100 {
-		require.NoError(t, platformRequirePathAbsent(root, "one/two/missing"))
-		_, err := snapshotDirectoryTree(root, "one/two/tree")
-		require.NoError(t, err)
-	}
-	reused, err := unix.Dup(1)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = unix.Close(reused) })
-	require.Equal(t, fd, reused)
 }
 
 func TestPrepareTransactionRevalidatesParentAfterManifestValidation(t *testing.T) {

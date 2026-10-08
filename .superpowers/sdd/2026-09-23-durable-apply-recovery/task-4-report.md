@@ -220,3 +220,53 @@ PASS
 ### Remaining concern
 
 Pathname-based forward execution capture and rollback remain intentionally scoped to Task 5. This round binds preparation checks and snapshots without broadening into legacy execution migration.
+
+## Fix Round 4
+
+### RED
+
+Direct deterministic tests were added at the two remaining vulnerable boundaries. Before implementation, both present/absent final-component substitutions and source-root substitution were accepted:
+
+```text
+TestPreparedPathClassificationRejectsSwappedFinalComponent/present_leaf: expected error, got nil
+TestPreparedPathClassificationRejectsSwappedFinalComponent/absent_leaf: expected error, got nil
+TestPreparedReplacementDirectoryScanRejectsSwappedSourceRoot: expected error, got nil
+```
+
+### Corrections
+
+- Present prepared-path leaves are opened descriptor-relatively with nonblocking, no-follow semantics; the exact opened object is `fstat`-classified, retained through ancestor verification, and rebound to its parent/name before acceptance. Linux uses `O_PATH`; Darwin uses `O_SYMLINK` so symlink and special leaves are inspectable without following or blocking.
+- Absent prepared-path leaves are checked absent again after the retained ancestor chain is verified.
+- Replacement scanning resolves the already-canonical source path, opens it component-by-component from the filesystem root, retains every descriptor and parent/name identity, and revalidates the complete chain after scanning. This binds the source-root leaf to its canonical parent while retaining the existing canonical source-path trust boundary.
+- The Unix FD reuse regression moved from cross-platform `apply_test.go` into Darwin/Linux-tagged `apply_unix_test.go`; the shared test file no longer imports `x/sys/unix`.
+
+### GREEN and regressions
+
+```text
+go test ./session/workspace -run '^(TestPreparedPathClassificationRejectsSwappedFinalComponent|TestPreparedReplacementDirectoryScanRejectsSwappedSourceRoot|TestPreparationTraversalClosesAllDescriptors)$' -count=1
+ok  claude-squad/session/workspace  0.792s
+
+go test ./session/workspace -run '^(TestPrepareTransaction|TestPreparedManifest|TestPreparationTraversal|TestPreparedPathClassification|TestPreparedReplacementDirectoryScan)' -count=1
+ok  claude-squad/session/workspace  27.391s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  198.680s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 206.064s)
+
+GOOS=darwin go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.013s
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.012s
+
+git diff --check
+PASS
+```
+
+Windows test compilation was attempted with `GOOS=windows go test ./session/workspace -run '^$' -count=1`. It remains blocked by pre-existing missing unsupported-platform recovery definitions in `recovery.go` (`orphanQuarantinePrefix`, `manifestFileIdentity`, and related functions), rather than by the moved FD test or this round's tagged implementation.
+
+### Remaining concern
+
+The stable ancestor traversal anchors at the opened filesystem root and rechecks every canonical source-path component, but no userspace scheme can prevent replacement of an already-open ultimate filesystem mount/root anchor. Durable v2 execution migration remains deferred to Task 5.
