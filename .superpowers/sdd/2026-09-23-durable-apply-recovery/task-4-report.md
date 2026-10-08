@@ -129,3 +129,51 @@ PASS
 ### Remaining concern
 
 Durable v2 phase transitions and crash recovery are intentionally deferred to Task 5. During current legacy execution the authoritative manifest remains at `prepared`, even after source mutation; this round prevents schema destruction but does not claim crash-safe forward progress.
+
+## Fix Round 2
+
+### RED
+
+The new focused tests were added before implementation. The first run failed to compile because the required deterministic parent-classification, directory-sync, and replacement-scan seams did not exist:
+
+```text
+session/workspace/apply_test.go:955:2: undefined: applyAfterParentClassificationHook
+session/workspace/apply_test.go:970:18: undefined: applySyncDirectory
+session/workspace/apply_test.go:1008:2: undefined: replacementScanBeforeOpenHook
+FAIL claude-squad/session/workspace [build failed]
+```
+
+The tests cover source-capture and transaction-quarantine occupants appearing after preparation, malformed ancestor exemptions, cleanup removal/sync ordering and removal failure retention, descendant substitution during replacement-tree scanning, and stale created-parent classification.
+
+### Corrections
+
+- Recovery names remain cryptographically generated absent names rather than claimed reservations. Source and private absence checks now traverse from opened stable parent descriptors. Execution consumes source capture and the persisted rollback-capture name only through atomic no-replace renames; private backup creation remains exclusive. Occupants appearing after publication are preserved and cause safe failure rather than overwrite or deletion.
+- Descendant reconstruction exemptions now require a validated directory-to-non-directory replacement, or the exact created-directory transition paired with replacement of a non-directory at the same path. Arbitrary create/delete ancestors no longer suppress overlap or reconstructibility checks.
+- Every failed cleanup of an unpublished, durably-created transaction directory removes first and then syncs the transaction root. Removal failures are joined into the returned error and leave the directory discoverable; post-publication failures retain the authoritative manifest.
+- Replacement directory snapshots now recursively scan through no-follow directory descriptors on Darwin/Linux. Every directory and regular file is identity-bound to its parent; symlinks are read without following; special files are rejected; directory entries, empty directories, modes, regular hashes, and symlink targets are retained.
+- Parent existence/type classifications are retained in memory and revalidated descriptor-relatively immediately before staging and durable manifest publication. Appearance, disappearance, or type change aborts preparation without mutating source content.
+
+### GREEN and regressions
+
+```text
+go test ./session/workspace -run '^(TestPreparedCaptureOccupantIsPreservedAndApplyFailsSafely|TestPreparedRollbackCaptureOccupantIsPreservedAndRollbackFailsSafely|TestPreparedQuarantineOccupantIsPreservedAndApplyFailsSafely|TestPrepareTransactionRevalidatesParentClassificationBeforePublish|TestPrepareTransactionCleanupSyncsRootAfterRemoval|TestPrepareTransactionCleanupFailurePreservesAndReportsTransaction|TestPreparedReplacementDirectoryScanRejectsSwappedDescendant|TestValidateManifestDoesNotExemptDescendantsBelowMalformedAncestor)$' -count=1
+ok  claude-squad/session/workspace  21.484s
+
+go test ./session/workspace -count=1
+ok  claude-squad/session/workspace  195.380s
+
+go test ./... -count=1
+PASS (all repository packages; workspace 213.275s)
+
+GOOS=linux go test ./session/workspace -run '^$' -exec=true -count=1
+ok  claude-squad/session/workspace  0.014s
+
+git diff --check
+PASS
+```
+
+The first full workspace regression run exposed the valid file-to-directory transition being rejected by the new parent check. The classification was corrected to retain exact entry types and validation was narrowed to the paired non-directory replacement semantics; the full package and repository suites then passed.
+
+### Remaining concern
+
+Durable v2 phase transitions and crash recovery remain Task 5. The fix deliberately guarantees absent-at-preparation plus atomic/exclusive no-replace consumption; it does not claim impossible hostile namespace reservation.

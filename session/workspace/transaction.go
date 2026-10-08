@@ -68,6 +68,7 @@ type TransactionEntry struct {
 	stageContents       []byte
 	stageSymlinkTarget  string
 	stageMode           os.FileMode
+	preparedParents     map[string]EntryType
 }
 
 type TransactionManifest struct {

@@ -59,17 +59,18 @@ const (
 )
 
 type transactionEntry struct {
-	Path              string           `json:"path"`
-	Operation         string           `json:"operation"`
-	Type              EntryType        `json:"type,omitempty"`
-	Mode              os.FileMode      `json:"mode,omitempty"`
-	Payload           string           `json:"payload,omitempty"`
-	Target            string           `json:"target,omitempty"`
-	Backup            string           `json:"backup,omitempty"`
-	Displaced         string           `json:"displaced,omitempty"`
-	Expected          *Entry           `json:"expected,omitempty"`
-	ExpectedTree      map[string]Entry `json:"expected_tree,omitempty"`
-	ReplacesDirectory bool             `json:"replaces_directory,omitempty"`
+	Path                string           `json:"path"`
+	Operation           string           `json:"operation"`
+	Type                EntryType        `json:"type,omitempty"`
+	Mode                os.FileMode      `json:"mode,omitempty"`
+	Payload             string           `json:"payload,omitempty"`
+	Target              string           `json:"target,omitempty"`
+	Backup              string           `json:"backup,omitempty"`
+	Displaced           string           `json:"displaced,omitempty"`
+	Expected            *Entry           `json:"expected,omitempty"`
+	ExpectedTree        map[string]Entry `json:"expected_tree,omitempty"`
+	ReplacesDirectory   bool             `json:"replaces_directory,omitempty"`
+	RollbackCaptureName string           `json:"rollback_capture_name,omitempty"`
 }
 
 // Transaction describes durable recovery metadata for an apply operation.
@@ -128,6 +129,9 @@ func (osFileOps) Chmod(name string, mode os.FileMode) error    { return os.Chmod
 
 var applyFS fileOps = osFileOps{}
 var applyRandomRead = rand.Read
+var applySyncDirectory = SyncDirectory
+var applyAfterParentClassificationHook func()
+var replacementScanBeforeOpenHook func(string)
 var applyBeforeRevalidateHook func()
 var applyAfterBackupHook func(string)
 var applyBeforeMutationHook func(string)
@@ -173,12 +177,13 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 		return nil, err
 	}
 	if len(plan.ChangedPaths()) == 0 {
-		_ = os.RemoveAll(plan.TransactionDir)
+		if err := cleanupUnpublishedTransaction(plan.TransactionDir); err != nil {
+			return nil, err
+		}
 		return &ApplyResult{}, nil
 	}
 	prepared, err := w.prepareTransaction(plan, time.Now().UTC())
 	if err != nil {
-		_ = os.RemoveAll(plan.TransactionDir)
 		return nil, err
 	}
 	transaction := legacyTransactionFromManifest(plan.TransactionDir, prepared)
@@ -186,11 +191,9 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 		applyBeforeRevalidateHook()
 	}
 	if err := w.revalidateTouched(plan); err != nil {
-		_ = os.RemoveAll(plan.TransactionDir)
 		return nil, err
 	}
 	if err := preflightNoReplace(transaction); err != nil {
-		_ = os.RemoveAll(plan.TransactionDir)
 		return nil, err
 	}
 	if err := w.executeTransaction(&transaction); err != nil {
@@ -272,10 +275,21 @@ func cleanupCommittedTransaction(transaction Transaction) error {
 	return nil
 }
 
+func cleanupUnpublishedTransaction(transactionDir string) error {
+	if err := applyFS.RemoveAll(transactionDir); err != nil {
+		return fmt.Errorf("remove unpublished transaction %q: %w", transactionDir, err)
+	}
+	if err := applySyncDirectory(filepath.Dir(transactionDir)); err != nil {
+		return fmt.Errorf("sync transaction root after removing unpublished transaction: %w", err)
+	}
+	return nil
+}
+
 func (w *shadowWorkspace) prepareTransaction(plan applyPlan, now time.Time) (manifest TransactionManifest, returnErr error) {
+	published := false
 	defer func() {
-		if returnErr != nil {
-			returnErr = errors.Join(returnErr, applyFS.RemoveAll(plan.TransactionDir))
+		if returnErr != nil && !published {
+			returnErr = errors.Join(returnErr, cleanupUnpublishedTransaction(plan.TransactionDir))
 		}
 	}()
 	manifest = TransactionManifest{
@@ -288,6 +302,12 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan, now time.Time) (man
 		return manifest, err
 	}
 	manifest.Entries = entries
+	if applyAfterParentClassificationHook != nil {
+		applyAfterParentClassificationHook()
+	}
+	if err := revalidatePreparedParents(plan.SourcePath, entries); err != nil {
+		return manifest, err
+	}
 	if err := stageTransactionResults(plan.TransactionDir, entries); err != nil {
 		return manifest, err
 	}
@@ -298,7 +318,31 @@ func (w *shadowWorkspace) prepareTransaction(plan applyPlan, now time.Time) (man
 	if err := WriteManifestDurable(manifest, plan.TransactionDir); err != nil {
 		return manifest, err
 	}
+	published = true
 	return manifest, nil
+}
+
+func revalidatePreparedParents(sourceRoot string, entries []TransactionEntry) error {
+	checked := make(map[string]EntryType)
+	for _, entry := range entries {
+		for parent, expectedType := range entry.preparedParents {
+			if previous, ok := checked[parent]; ok {
+				if previous != expectedType {
+					return fmt.Errorf("inconsistent prepared parent classification for %q", parent)
+				}
+				continue
+			}
+			checked[parent] = expectedType
+			actualType, err := platformPreparedPathType(sourceRoot, parent)
+			if err != nil {
+				return fmt.Errorf("revalidate prepared parent %q: %w", parent, err)
+			}
+			if actualType != expectedType {
+				return fmt.Errorf("parent classification changed for %q", parent)
+			}
+		}
+	}
+	return nil
 }
 
 func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
@@ -318,7 +362,13 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 	reservedPrivateNames := make(map[string]struct{})
 	allocateSourceName := func(path, prefix string) (string, error) {
 		for attempts := 0; attempts < 100; attempts++ {
-			candidate, err := randomAbsentSourceSibling(plan.SourcePath, path, prefix)
+			candidate, err := randomSourceSibling(path, prefix)
+			if err == nil {
+				err = platformRequirePathAbsent(plan.SourcePath, candidate)
+			}
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
 			if err != nil {
 				return "", err
 			}
@@ -332,7 +382,13 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 	}
 	allocatePrivateName := func(category string) (string, error) {
 		for attempts := 0; attempts < 100; attempts++ {
-			candidate, err := randomAbsentTransactionPath(plan.TransactionDir, category)
+			candidate, err := randomTransactionPath(category)
+			if err == nil {
+				err = platformRequirePathAbsent(plan.TransactionDir, candidate)
+			}
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
 			if err != nil {
 				return "", err
 			}
@@ -356,7 +412,7 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 		if !create {
 			planned = plan.Updates[name]
 		}
-		item := TransactionEntry{Path: name, Phase: EntryPhasePending, CleanupPhase: CleanupPhasePending}
+		item := TransactionEntry{Path: name, Phase: EntryPhasePending, CleanupPhase: CleanupPhasePending, preparedParents: make(map[string]EntryType)}
 		if create || planned.Type != "" {
 			if create {
 				item.Operation = EntryOperationCreate
@@ -371,11 +427,19 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 			item.Result = &result
 			item.stageContents, item.stageSymlinkTarget, item.stageMode = planned.Contents, planned.SymlinkTarget, planned.Mode
 			for parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(name))); parent != "."; parent = filepath.ToSlash(filepath.Dir(filepath.FromSlash(parent))) {
-				_, exists, inspectErr := snapshotOne(plan.SourcePath, parent)
+				parentEntry, exists, inspectErr := snapshotOne(plan.SourcePath, parent)
+				parentType := EntryType("")
+				if exists {
+					parentType = parentEntry.Type
+				}
+				item.preparedParents[parent] = parentType
 				if inspectErr != nil && !errors.Is(inspectErr, syscall.ENOTDIR) {
 					return nil, fmt.Errorf("inspect planned parent %q: %w", parent, inspectErr)
 				}
 				if exists {
+					if parentEntry.Type != EntryType("directory") {
+						createdParents[parent] = struct{}{}
+					}
 					break
 				}
 				createdParents[parent] = struct{}{}
@@ -607,6 +671,7 @@ func legacyTransactionFromManifest(directory string, manifest TransactionManifes
 		item.Payload = entry.StagePath
 		item.Backup = entry.QuarantinePath
 		item.Displaced = entry.CaptureName
+		item.RollbackCaptureName = entry.RollbackCaptureName
 		item.ReplacesDirectory = entry.Expected == nil && entry.CaptureName != ""
 		transaction.Entries = append(transaction.Entries, item)
 	}
@@ -723,49 +788,7 @@ func (w *shadowWorkspace) revalidateTouched(plan applyPlan) error {
 }
 
 func snapshotDirectoryTree(sourceRoot, name string) (map[string]Entry, error) {
-	root := filepath.Join(sourceRoot, filepath.FromSlash(name))
-	rootInfo, err := applyFS.Lstat(root)
-	if err != nil {
-		return nil, err
-	}
-	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("replacement source is not a real directory")
-	}
-	result := make(map[string]Entry)
-	err = filepath.WalkDir(root, func(path string, directoryEntry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == root {
-			return nil
-		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		relative = filepath.ToSlash(relative)
-		entry, exists, err := snapshotOne(root, relative)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return errors.New("replacement directory entry disappeared while scanning")
-		}
-		entry.Path = relative
-		result[relative] = entry
-		if entry.Type != EntryType("directory") && directoryEntry.IsDir() {
-			return errors.New("replacement directory entry changed while scanning")
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	final, err := applyFS.Lstat(root)
-	if err != nil || !final.IsDir() || !os.SameFile(rootInfo, final) {
-		return nil, errorsJoinMessage(err, "replacement directory changed while scanning")
-	}
-	return result, nil
+	return platformSnapshotDirectoryTree(sourceRoot, name)
 }
 
 func planReplacesDirectory(plan applyPlan, name string) bool {
@@ -1234,11 +1257,10 @@ func (w *shadowWorkspace) captureAppliedForRollback(transaction Transaction, ite
 		}
 		return "", nil
 	}
-	captured, err := randomSiblingName(item.Path, ".claude-squad-rollback-captured-")
-	if err != nil {
-		return "", err
+	if item.RollbackCaptureName == "" {
+		return "", errors.New("transaction entry is missing preallocated rollback capture name")
 	}
-	captured = filepath.Join(w.data.SourcePath, filepath.FromSlash(captured))
+	captured := filepath.Join(w.data.SourcePath, filepath.FromSlash(item.RollbackCaptureName))
 	if err := applyRenameNoReplace(target, captured); err != nil {
 		return "", err
 	}
@@ -1384,13 +1406,12 @@ func (w *shadowWorkspace) planApply() (plan applyPlan, returnErr error) {
 		return plan, fmt.Errorf("create apply transaction: %w", err)
 	}
 	plan.TransactionDir = transactionDir
-	if err := SyncDirectory(transactionRoot); err != nil {
-		_ = os.Remove(transactionDir)
-		return plan, fmt.Errorf("sync transaction root after creating transaction: %w", err)
+	if err := applySyncDirectory(transactionRoot); err != nil {
+		return plan, errors.Join(fmt.Errorf("sync transaction root after creating transaction: %w", err), cleanupUnpublishedTransaction(transactionDir))
 	}
 	defer func() {
 		if returnErr != nil {
-			_ = os.RemoveAll(transactionDir)
+			returnErr = errors.Join(returnErr, cleanupUnpublishedTransaction(transactionDir))
 		}
 	}()
 	if err := ensureRealContainedPath(transactionRoot, transactionDir, false, "transaction directory"); err != nil {

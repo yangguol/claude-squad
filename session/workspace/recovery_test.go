@@ -518,6 +518,27 @@ func TestValidateManifestRejectsAncestorNamespaceOverlaps(t *testing.T) {
 	}
 }
 
+func TestValidateManifestDoesNotExemptDescendantsBelowMalformedAncestor(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	writeApplyFile(t, source, "ancestor", "file", 0o600)
+
+	for _, operation := range []EntryOperation{EntryOperationDelete, EntryOperationCreate} {
+		t.Run(string(operation), func(t *testing.T) {
+			manifest := validRecoveryManifest(project, source, "tx")
+			ancestor := validRecoveryEntry("ancestor", operation)
+			if operation == EntryOperationCreate {
+				ancestor.Expected = nil
+				ancestor.CaptureName = ""
+				ancestor.QuarantinePath = ""
+			}
+			manifest.Entries = []TransactionEntry{ancestor, validRecoveryEntry("ancestor/child", EntryOperationCreate)}
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
+}
+
 func TestManifestNamespaceComparisonUsesGoverningParentCaseBehavior(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)

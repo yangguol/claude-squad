@@ -428,7 +428,22 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 
 func manifestTargetParentWillBeReplaced(manifest TransactionManifest, path string) bool {
 	for _, candidate := range manifest.Entries {
-		if candidate.Path != path && candidate.Operation != EntryOperationCreatedParent && strings.HasPrefix(path, candidate.Path+"/") {
+		if candidate.Path == path || !strings.HasPrefix(path, candidate.Path+"/") {
+			continue
+		}
+		if (candidate.Operation == EntryOperationCreate || candidate.Operation == EntryOperationUpdate) && candidate.Expected == nil && len(candidate.ExpectedTree) != 0 && candidate.Result != nil && candidate.Result.Type != EntryType("directory") {
+			return true
+		}
+		if candidate.Operation == EntryOperationCreatedParent && candidate.Result != nil && candidate.Result.Type == EntryType("directory") && manifestReplacesNonDirectoryAt(manifest, candidate.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func manifestReplacesNonDirectoryAt(manifest TransactionManifest, path string) bool {
+	for _, candidate := range manifest.Entries {
+		if candidate.Path == path && (candidate.Operation == EntryOperationDelete || candidate.Operation == EntryOperationUpdate) && candidate.Expected != nil && candidate.Expected.Type != EntryType("directory") {
 			return true
 		}
 	}

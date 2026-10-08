@@ -898,6 +898,186 @@ func TestPrepareTransactionFailureLeavesSourceAndRemovesOwnedArtifacts(t *testin
 	require.NoDirExists(t, plan.TransactionDir)
 }
 
+func TestPreparedCaptureOccupantIsPreservedAndApplyFailsSafely(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	var occupant string
+	applyBeforeRevalidateHook = func() {
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+		require.NoError(t, err)
+		require.Len(t, matches, 1)
+		manifest, err := ReadManifestStrict(filepath.Dir(workspace.data.RepoPath), filepath.Dir(matches[0]))
+		require.NoError(t, err)
+		occupant = filepath.Join(source, filepath.FromSlash(manifest.Entries[0].CaptureName))
+		require.NoError(t, os.WriteFile(occupant, []byte("occupant"), 0o600))
+	}
+	t.Cleanup(func() { applyBeforeRevalidateHook = nil })
+
+	_, err := workspace.Apply()
+	require.Error(t, err)
+	require.Equal(t, "before", mustReadFile(t, filepath.Join(source, "file")))
+	require.Equal(t, "occupant", mustReadFile(t, occupant))
+}
+
+func TestPreparedRollbackCaptureOccupantIsPreservedAndRollbackFailsSafely(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	writeApplyFile(t, workspace.WorkDir(), "zz-fail", "fail", 0o644)
+	var occupant string
+	applyBeforeRevalidateHook = func() {
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+		require.NoError(t, err)
+		manifest, err := ReadManifestStrict(filepath.Dir(workspace.data.RepoPath), filepath.Dir(matches[0]))
+		require.NoError(t, err)
+		for _, entry := range manifest.Entries {
+			if entry.Path == "file" {
+				occupant = filepath.Join(source, filepath.FromSlash(entry.RollbackCaptureName))
+			}
+		}
+		require.NotEmpty(t, occupant)
+		require.NoError(t, os.WriteFile(occupant, []byte("occupant"), 0o600))
+	}
+	applyBeforeMutationHook = func(path string) {
+		if path == "zz-fail" {
+			writeApplyFile(t, source, "zz-fail", "late", 0o600)
+		}
+	}
+	t.Cleanup(func() {
+		applyBeforeRevalidateHook = nil
+		applyBeforeMutationHook = nil
+	})
+
+	_, err := workspace.Apply()
+	require.ErrorContains(t, err, "rollback transaction")
+	require.Equal(t, "occupant", mustReadFile(t, occupant))
+	require.Equal(t, "after", mustReadFile(t, filepath.Join(source, "file")))
+}
+
+func TestPreparedQuarantineOccupantIsPreservedAndApplyFailsSafely(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	var occupant string
+	applyBeforeRevalidateHook = func() {
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+		require.NoError(t, err)
+		require.Len(t, matches, 1)
+		manifest, err := ReadManifestStrict(filepath.Dir(workspace.data.RepoPath), filepath.Dir(matches[0]))
+		require.NoError(t, err)
+		occupant = filepath.Join(filepath.Dir(matches[0]), filepath.FromSlash(manifest.Entries[0].QuarantinePath))
+		require.NoError(t, os.MkdirAll(filepath.Dir(occupant), 0o700))
+		require.NoError(t, os.WriteFile(occupant, []byte("occupant"), 0o600))
+	}
+	t.Cleanup(func() { applyBeforeRevalidateHook = nil })
+
+	_, err := workspace.Apply()
+	require.Error(t, err)
+	require.Equal(t, "before", mustReadFile(t, filepath.Join(source, "file")))
+	require.Equal(t, "occupant", mustReadFile(t, occupant))
+}
+
+func TestPrepareTransactionRevalidatesParentClassificationBeforePublish(t *testing.T) {
+	for name, setup := range map[string]func(*testing.T, *shadowWorkspace, *applyPlan){
+		"appeared": func(t *testing.T, workspace *shadowWorkspace, plan *applyPlan) {
+			applyAfterParentClassificationHook = func() {
+				require.NoError(t, os.Mkdir(filepath.Join(workspace.data.SourcePath, "parent"), 0o700))
+			}
+		},
+		"disappeared": func(t *testing.T, workspace *shadowWorkspace, plan *applyPlan) {
+			require.NoError(t, os.Mkdir(filepath.Join(workspace.data.SourcePath, "parent"), 0o700))
+			applyAfterParentClassificationHook = func() {
+				require.NoError(t, os.Remove(filepath.Join(workspace.data.SourcePath, "parent")))
+			}
+		},
+		"type changed": func(t *testing.T, workspace *shadowWorkspace, plan *applyPlan) {
+			require.NoError(t, os.Mkdir(filepath.Join(workspace.data.SourcePath, "parent"), 0o700))
+			applyAfterParentClassificationHook = func() {
+				require.NoError(t, os.Remove(filepath.Join(workspace.data.SourcePath, "parent")))
+				writeApplyFile(t, workspace.data.SourcePath, "parent", "replacement", 0o600)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			workspace, plan, _ := preparationPlan(t)
+			plan.Creates = map[string]applyEntry{"parent/child": {Type: EntryRegular, Mode: 0o600, Contents: []byte("new")}}
+			plan.Updates = nil
+			plan.Deletes = nil
+			setup(t, workspace, &plan)
+			t.Cleanup(func() { applyAfterParentClassificationHook = nil })
+
+			_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+			require.ErrorContains(t, err, "parent classification changed")
+			require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
+		})
+	}
+}
+
+func TestPrepareTransactionCleanupSyncsRootAfterRemoval(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	workspace.data.SessionID = ""
+	root := filepath.Dir(plan.TransactionDir)
+	originalSync := applySyncDirectory
+	var events []string
+	applySyncDirectory = func(path string) error {
+		if path == root {
+			events = append(events, "sync")
+			require.NoDirExists(t, plan.TransactionDir)
+		}
+		return nil
+	}
+	t.Cleanup(func() { applySyncDirectory = originalSync })
+
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.Error(t, err)
+	require.Equal(t, []string{"sync"}, events)
+}
+
+func TestPrepareTransactionCleanupFailurePreservesAndReportsTransaction(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	workspace.data.SessionID = ""
+	original := applyFS
+	applyFS = cleanupFailOps{fileOps: original}
+	t.Cleanup(func() { applyFS = original })
+
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.ErrorContains(t, err, "injected cleanup failure")
+	require.DirExists(t, plan.TransactionDir)
+}
+
+func TestPreparedReplacementDirectoryScanRejectsSwappedDescendant(t *testing.T) {
+	workspace, plan, _ := preparationPlan(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace.data.SourcePath, "tree", "child"), 0o755))
+	writeApplyFile(t, workspace.data.SourcePath, "tree/child/file", "inside", 0o600)
+	outside := t.TempDir()
+	writeApplyFile(t, outside, "file", "outside", 0o600)
+	plan.OursSnapshot = mustSnapshot(t, workspace.data.SourcePath)
+	plan.Creates = map[string]applyEntry{"tree": {Type: EntryRegular, Mode: 0o600, Contents: []byte("replacement")}}
+	plan.Updates = nil
+	plan.Deletes = nil
+	replacementScanBeforeOpenHook = func(path string) {
+		if path != "child" {
+			return
+		}
+		replacementScanBeforeOpenHook = nil
+		require.NoError(t, os.Rename(filepath.Join(workspace.data.SourcePath, "tree", "child"), filepath.Join(workspace.data.SourcePath, "tree", "parked")))
+		require.NoError(t, os.Symlink(outside, filepath.Join(workspace.data.SourcePath, "tree", "child")))
+	}
+	t.Cleanup(func() { replacementScanBeforeOpenHook = nil })
+
+	_, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.Error(t, err)
+	require.Equal(t, "outside", mustReadFile(t, filepath.Join(outside, "file")))
+	require.NoFileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
+}
+
 type failingStageOps struct{ fileOps }
 
 func (f failingStageOps) OpenFile(name string, flag int, mode os.FileMode) (fileHandle, error) {
