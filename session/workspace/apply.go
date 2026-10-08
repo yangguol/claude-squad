@@ -191,24 +191,17 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 	if err != nil {
 		return nil, err
 	}
-	transaction := legacyTransactionFromManifest(plan.TransactionDir, prepared)
 	if applyBeforeRevalidateHook != nil {
 		applyBeforeRevalidateHook()
 	}
 	if err := w.revalidateTouched(plan); err != nil {
 		return nil, err
 	}
-	if err := preflightNoReplace(transaction); err != nil {
+	if err := ExecuteTransaction(&prepared, plan.TransactionDir); err != nil {
 		return nil, err
 	}
-	if err := w.executeTransaction(&transaction); err != nil {
-		return nil, err
-	}
-	w.data.LastAppliedTree = plan.MergedTree
-	w.data.LastAppliedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if err := cleanupCommittedTransaction(transaction); err != nil {
-		return nil, err
-	}
+	w.data.LastAppliedTree = prepared.AppliedTree
+	w.data.LastAppliedAt = prepared.AppliedAt
 	return &ApplyResult{Changed: plan.ChangedPaths()}, nil
 }
 

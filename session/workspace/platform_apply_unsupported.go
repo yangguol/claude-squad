@@ -23,3 +23,7 @@ func platformAtomicApplyPreflight(string, string) error {
 func platformProbeAtomicNoReplace(*os.File) error {
 	return errors.New("atomic apply is unsupported on " + runtime.GOOS)
 }
+
+func platformRenameatNoReplaceBetween(int, string, int, string) error {
+	return errors.New("atomic apply is unsupported on " + runtime.GOOS)
+}

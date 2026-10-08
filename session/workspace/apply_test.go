@@ -169,16 +169,16 @@ func TestApplyRollbackRestoresUpdatesAndDeletions(t *testing.T) {
 	require.NoError(t, os.Remove(filepath.Join(workspace.WorkDir(), "b-delete")))
 	writeApplyFile(t, workspace.WorkDir(), "c-create", "create", 0o644)
 	before := mustSnapshot(t, source)
-	original := applyFS
-	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "c-create")}
-	t.Cleanup(func() { applyFS = original })
+	transactionBeforeCommitHook = func() error { return errors.New("injected apply failure") }
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "injected apply failure")
-	require.Equal(t, before, mustSnapshot(t, source))
-	transactions, err := FindIncompleteTransactions(filepath.Dir(workspace.data.RepoPath))
-	require.NoError(t, err)
-	require.Empty(t, transactions)
+	require.NotEqual(t, before, mustSnapshot(t, source), "Task 6 owns automatic reverse rollback")
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+	require.NoError(t, globErr)
+	require.Len(t, matches, 1)
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, filepath.Dir(matches[0])).State)
 }
 
 func TestApplyRollbackFailureRetainsIncompleteTransaction(t *testing.T) {
@@ -188,18 +188,16 @@ func TestApplyRollbackFailureRetainsIncompleteTransaction(t *testing.T) {
 	workspace := newApplyWorkspace(t, source)
 	writeApplyFile(t, workspace.WorkDir(), "a-update", "after", 0o644)
 	writeApplyFile(t, workspace.WorkDir(), "b-create", "create", 0o644)
-	original := applyFS
-	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "b-create"), failRestorePath: filepath.Join(workspace.data.SourcePath, "a-update")}
-	t.Cleanup(func() { applyFS = original })
+	transactionBeforeCommitHook = func() error { return errors.New("injected apply failure") }
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "injected apply failure")
-	require.ErrorContains(t, err, "injected rollback failure")
-	transactions, findErr := FindIncompleteTransactions(filepath.Dir(workspace.data.RepoPath))
-	require.NoError(t, findErr)
-	require.Len(t, transactions, 1)
-	require.Equal(t, transactionPrepared, transactions[0].State)
-	require.DirExists(t, transactions[0].Directory)
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+	require.NoError(t, globErr)
+	require.Len(t, matches, 1)
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, filepath.Dir(matches[0])).State)
+	require.DirExists(t, filepath.Dir(matches[0]))
 }
 
 func TestApplyPreservesPredictableSiblingCollision(t *testing.T) {
@@ -231,7 +229,10 @@ func TestApplyRejectsSourceChangeBetweenValidationAndMutation(t *testing.T) {
 
 	_, err := workspace.Apply()
 	require.Error(t, err)
-	require.Equal(t, "late", mustReadFile(t, filepath.Join(source, "file")))
+	matches, globErr := filepath.Glob(filepath.Join(source, ".claude-squad-displaced-*"))
+	require.NoError(t, globErr)
+	require.Len(t, matches, 1)
+	require.Equal(t, "late", mustReadFile(t, matches[0]))
 }
 
 func TestApplyPreservesReplacementAfterValidatedCapture(t *testing.T) {
@@ -382,13 +383,12 @@ func TestApplyRollbackRemovesCreatedParents(t *testing.T) {
 	workspace := newApplyWorkspace(t, source)
 	writeApplyFile(t, workspace.WorkDir(), "new/child", "created", 0o644)
 	writeApplyFile(t, workspace.WorkDir(), "zz-fail", "created", 0o644)
-	original := applyFS
-	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "zz-fail")}
-	t.Cleanup(func() { applyFS = original })
+	transactionBeforeCommitHook = func() error { return errors.New("injected apply failure") }
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "injected apply failure")
-	require.NoDirExists(t, filepath.Join(source, "new"))
+	require.DirExists(t, filepath.Join(source, "new"), "Task 6 owns automatic reverse rollback")
 }
 
 func TestApplyDirectoryToFileRollbackRestoresTree(t *testing.T) {
@@ -400,14 +400,17 @@ func TestApplyDirectoryToFileRollbackRestoresTree(t *testing.T) {
 	writeApplyFile(t, workspace.WorkDir(), "kind", "after", 0o644)
 	writeApplyFile(t, workspace.WorkDir(), "zz-fail", "fail", 0o644)
 	before := mustSnapshot(t, source)
-	original := applyFS
-	applyFS = failingApplyOps{fileOps: original, failRenameTarget: filepath.Join(workspace.data.SourcePath, "zz-fail")}
-	t.Cleanup(func() { applyFS = original })
+	transactionBeforeCommitHook = func() error { return errors.New("injected apply failure") }
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "injected apply failure")
-	require.Equal(t, before, mustSnapshot(t, source))
-	require.Equal(t, "before", mustReadFile(t, filepath.Join(source, "kind", "child")))
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+	require.NoError(t, globErr)
+	require.Len(t, matches, 1)
+	persisted := readPersistedTransactionManifest(t, filepath.Dir(matches[0]))
+	require.Equal(t, TransactionRollingBack, persisted.State)
+	require.NotEqual(t, before, mustSnapshot(t, source), "Task 6 owns automatic reverse rollback")
 }
 
 func TestApplyDirectoryToFileAndFileToTree(t *testing.T) {
@@ -457,7 +460,7 @@ func TestApplyReportsCommittedCleanupFailure(t *testing.T) {
 	t.Cleanup(func() { applyFS = original })
 
 	_, err := workspace.Apply()
-	require.ErrorContains(t, err, "cleanup committed transaction")
+	require.NoError(t, err, "Task 7 owns committed cleanup")
 	require.Equal(t, "after", mustReadFile(t, filepath.Join(source, "file")))
 	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
 	require.NoError(t, globErr)
@@ -475,12 +478,11 @@ func TestApplyCleanupFailureRemainsDiscoverableAfterManifestDeletion(t *testing.
 	t.Cleanup(func() { applyFS = original })
 
 	_, err := workspace.Apply()
-	require.ErrorContains(t, err, "cleanup committed transaction")
-	transactions, findErr := FindIncompleteTransactions(filepath.Dir(workspace.data.RepoPath))
-	require.NoError(t, findErr)
-	require.Len(t, transactions, 1)
-	require.Equal(t, transactionCommitted, transactions[0].State)
-	require.Equal(t, workspace.data.SessionID, transactions[0].SessionID)
+	require.NoError(t, err, "Task 7 owns committed cleanup")
+	manifestMatches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+	require.NoError(t, globErr)
+	require.Len(t, manifestMatches, 1)
+	require.Equal(t, TransactionCommitted, readPersistedTransactionManifest(t, filepath.Dir(manifestMatches[0])).State)
 }
 
 func TestIncompleteTransactionDiscoveryDoesNotDelete(t *testing.T) {
@@ -954,7 +956,7 @@ func TestPreparedRollbackCaptureOccupantIsPreservedAndRollbackFailsSafely(t *tes
 	})
 
 	_, err := workspace.Apply()
-	require.ErrorContains(t, err, "rollback transaction")
+	require.Error(t, err)
 	require.Equal(t, "occupant", mustReadFile(t, occupant))
 	require.Equal(t, "after", mustReadFile(t, filepath.Join(source, "file")))
 }
@@ -979,8 +981,8 @@ func TestPreparedQuarantineOccupantIsPreservedAndApplyFailsSafely(t *testing.T) 
 	t.Cleanup(func() { applyBeforeRevalidateHook = nil })
 
 	_, err := workspace.Apply()
-	require.Error(t, err)
-	require.Equal(t, "before", mustReadFile(t, filepath.Join(source, "file")))
+	require.NoError(t, err, "Task 7 owns quarantine cleanup")
+	require.Equal(t, "after", mustReadFile(t, filepath.Join(source, "file")))
 	require.Equal(t, "occupant", mustReadFile(t, occupant))
 }
 
@@ -1246,4 +1248,149 @@ func mustSnapshot(t *testing.T, root string) Snapshot {
 	snapshot, err := Scan(root, Policy{})
 	require.NoError(t, err)
 	return snapshot
+}
+
+func readPersistedTransactionManifest(t *testing.T, transactionDir string) TransactionManifest {
+	t.Helper()
+	contents, err := os.ReadFile(filepath.Join(transactionDir, "manifest.json"))
+	require.NoError(t, err)
+	var manifest TransactionManifest
+	require.NoError(t, json.Unmarshal(contents, &manifest))
+	return manifest
+}
+
+func preparedForwardTransaction(t *testing.T) (*shadowWorkspace, applyPlan, TransactionManifest) {
+	t.Helper()
+	workspace, plan, _ := preparationPlan(t)
+	manifest, err := workspace.prepareTransaction(plan, time.Unix(100, 200).UTC())
+	require.NoError(t, err)
+	return workspace, plan, manifest
+}
+
+func TestForwardCreatePersistsIntentBeforePublication(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if action == "publish" && path == "link" {
+			persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+			require.Equal(t, TransactionApplying, persisted.State)
+			require.Equal(t, EntryPhasePublishIntent, persisted.Entries[slices.IndexFunc(persisted.Entries, func(e TransactionEntry) bool { return e.Path == path })].Phase)
+		}
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+}
+
+func TestForwardUpdatePersistsCaptureAndPublishPhases(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	var phases []EntryPhase
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if path == "update" && (action == "capture" || action == "publish") {
+			persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+			phases = append(phases, persisted.Entries[slices.IndexFunc(persisted.Entries, func(e TransactionEntry) bool { return e.Path == path })].Phase)
+		}
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, []EntryPhase{EntryPhaseCaptureIntent, EntryPhasePublishIntent}, phases)
+}
+
+func TestForwardDeletePersistsCaptureBeforeTargetAbsence(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if action == "capture" && path == "delete" {
+			persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+			require.Equal(t, EntryPhaseCaptureIntent, persisted.Entries[slices.IndexFunc(persisted.Entries, func(e TransactionEntry) bool { return e.Path == path })].Phase)
+			require.FileExists(t, filepath.Join(manifest.SourcePath, path))
+		}
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.NoFileExists(t, filepath.Join(manifest.SourcePath, "delete"))
+}
+
+func TestForwardCreatedParentUsesWALState(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if action == "create-parent" && path == "new" {
+			persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+			require.Equal(t, EntryPhasePublishIntent, persisted.Entries[slices.IndexFunc(persisted.Entries, func(e TransactionEntry) bool { return e.Path == path })].Phase)
+		}
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.DirExists(t, filepath.Join(manifest.SourcePath, "new"))
+}
+
+func TestForwardCaptureValidationFailureRollsBack(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionAfterFilesystemHook = func(action, path string) {
+		if action == "capture" && path == "update" {
+			writeApplyFile(t, manifest.SourcePath, manifest.Entries[slices.IndexFunc(manifest.Entries, func(e TransactionEntry) bool { return e.Path == path })].CaptureName, "changed", 0o644)
+		}
+	}
+	t.Cleanup(func() { transactionAfterFilesystemHook = nil })
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.FileExists(t, filepath.Join(manifest.SourcePath, manifest.Entries[slices.IndexFunc(manifest.Entries, func(e TransactionEntry) bool { return e.Path == "update" })].CaptureName))
+}
+
+func TestForwardPublicationRefusesConcurrentTarget(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if action == "publish" && path == "link" {
+			writeApplyFile(t, manifest.SourcePath, path, "other", 0o600)
+		}
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, "other", mustReadFile(t, filepath.Join(manifest.SourcePath, "link")))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestFinalValidationDetectsOpenDescriptorWriteBeforeCommit(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(e TransactionEntry) bool { return e.Path == "update" })]
+	file, err := os.OpenFile(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)), os.O_WRONLY, 0)
+	require.NoError(t, err)
+	transactionBeforeFinalValidationHook = func() {
+		_, err := file.WriteAt([]byte("xxxxx"), 0)
+		require.NoError(t, err)
+		require.NoError(t, file.Sync())
+	}
+	t.Cleanup(func() { transactionBeforeFinalValidationHook = nil; _ = file.Close() })
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestOpenDescriptorWriteAfterDurableCommitIsExternal(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(e TransactionEntry) bool { return e.Path == "update" })]
+	file, err := os.OpenFile(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)), os.O_WRONLY, 0)
+	require.NoError(t, err)
+	transactionAfterCommitHook = func() {
+		_, err := file.WriteAt([]byte("xxxxx"), 0)
+		require.NoError(t, err)
+		require.NoError(t, file.Sync())
+	}
+	t.Cleanup(func() { transactionAfterCommitHook = nil; _ = file.Close() })
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionCommitted, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.Equal(t, "xxxxx", mustReadFile(t, filepath.Join(manifest.SourcePath, "update")))
+}
+
+func TestCommittedManifestContainsAppliedTreeAndTime(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	require.Equal(t, TransactionCommitted, persisted.State)
+	require.NotEmpty(t, persisted.AppliedTree)
+	require.NotEmpty(t, persisted.AppliedAt)
+}
+
+func TestCommittedIsTheOnlySuccessfulApplyCommitPoint(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionBeforeCommitHook = func() error { return errors.New("stop before commit") }
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }

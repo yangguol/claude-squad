@@ -320,7 +320,8 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 
 	sourcePaths, transactionPaths := []manifestNamespacePath{}, []manifestNamespacePath{}
 	for index, entry := range manifest.Entries {
-		if !validOperation(entry.Operation) || !validEntryPhase(entry.Phase) || !validCleanupPhase(entry.CleanupPhase) || !phaseAllowed(entry.Operation, entry.Phase) {
+		phaseOK := phaseAllowed(entry.Operation, entry.Phase) || entry.Operation == EntryOperationCreate && entry.CaptureName != "" && len(entry.ExpectedTree) != 0 && (entry.Phase == EntryPhaseCaptureIntent || entry.Phase == EntryPhaseCaptured)
+		if !validOperation(entry.Operation) || !validEntryPhase(entry.Phase) || !validCleanupPhase(entry.CleanupPhase) || !phaseOK {
 			return fmt.Errorf("transaction entry %d has invalid operation or phase", index)
 		}
 		if err := validateRelativeManifestPath(entry.Path); err != nil {
