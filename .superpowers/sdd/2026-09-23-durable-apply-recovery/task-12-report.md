@@ -81,3 +81,19 @@ Pending at report creation.
 ## Concerns
 
 The brief's foreign-OS `go test` commands attempt to execute foreign binaries on the Darwin host. Compilation succeeds, but Linux and Windows invocations end in the expected host `exec format error`; `go test -c` supplies the definitive all-target build evidence. Runtime platform-contract execution was performed on Darwin; Linux behavior is compile-validated and uses the Linux-specific `renameat2(RENAME_NOREPLACE)` implementation, but was not executed on a Linux kernel in this environment.
+
+## Fix Round 1/5
+
+Corrected the README's lock guarantee. Directory Apply, recovery, resume, and reset acquire the per-project lock and can report `OperationInProgressError` on contention. Session kill/workspace cleanup does not acquire that lock, and standalone acknowledgement is not documented as independently acquiring it; the README now explicitly excludes kill/workspace cleanup from this coordination claim. Reviewed the other Task 12 documentation additions and found no equivalent operation-list overstatement.
+
+Verification:
+
+```text
+git diff --check
+PASS
+
+git diff -- README.md .superpowers/sdd/2026-09-23-durable-apply-recovery/task-12-report.md
+PASS; documentation-only changes match the requested lock-scope correction
+```
+
+No runtime tests were needed because this round changes documentation only.
