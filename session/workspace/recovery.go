@@ -142,6 +142,33 @@ func classificationReport(discovered []DiscoveredTransaction) RecoveryReport {
 	return report
 }
 
+func preflightProjectRecovery(discovered []DiscoveredTransaction, sessions map[string]*ShadowData) (RecoveryReport, error) {
+	report := classificationReport(discovered)
+	if report.Disposition == RecoveryBlocked {
+		return report, nil
+	}
+	for _, transaction := range discovered {
+		manifest := transaction.Manifest
+		if manifest == nil {
+			continue
+		}
+		if session, ok := sessions[manifest.SessionID]; ok && session != nil && (session.ProjectID != manifest.ProjectID || session.SourcePath != manifest.SourcePath) {
+			report.Disposition = RecoveryBlocked
+			report.Issues = append(report.Issues, RecoveryIssue{TransactionID: manifest.TransactionID, State: manifest.State, Message: "transaction session metadata mismatch", RetainedPaths: []string{transaction.Directory}})
+			continue
+		}
+		transactionReport, err := PreflightRecoverTransaction(manifest, transaction.Directory)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		if transactionReport.Disposition == RecoveryBlocked {
+			report.Disposition = RecoveryBlocked
+			report.Issues = append(report.Issues, transactionReport.Issues...)
+		}
+	}
+	return report, nil
+}
+
 func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (RecoveryReport, error) {
 	discovered, err := DiscoverTransactions(projectPath)
 	if err != nil {

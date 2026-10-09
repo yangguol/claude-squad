@@ -584,11 +584,11 @@ func QuarantineSourceTemporary(manifest *TransactionManifest, entryIndex int, tr
 
 func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex int, roots *forwardRoots) error {
 	entry := &manifest.Entries[entryIndex]
+	if err := preflightCleanupEntryBound(*entry, roots); err != nil {
+		return err
+	}
 	if entry.CleanupPhase == CleanupPhaseRemoved {
 		return nil
-	}
-	if entry.QuarantinePath == "" || entry.Expected == nil && len(entry.ExpectedTree) == 0 {
-		return errors.New("source cleanup entry lacks quarantine identity")
 	}
 	if err := ensurePrivateParentBound(roots.tx, entry.QuarantinePath); err != nil {
 		return err
@@ -682,6 +682,59 @@ func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex in
 	return nil
 }
 
+func preflightCleanupEntryBound(entry TransactionEntry, roots *forwardRoots) error {
+	if entry.CleanupPhase == CleanupPhaseRemoved {
+		return nil
+	}
+	if entry.QuarantinePath == "" || entry.Expected == nil && len(entry.ExpectedTree) == 0 {
+		return errors.New("source cleanup entry lacks quarantine identity")
+	}
+	quarantineAbsent, err := absentAt(roots.tx, entry.QuarantinePath)
+	if err != nil {
+		return err
+	}
+	switch entry.CleanupPhase {
+	case CleanupPhasePending:
+		if !quarantineAbsent {
+			return errors.New("cleanup quarantine is occupied")
+		}
+		if entry.Expected != nil {
+			if _, err := validateIdentityStatBound(roots.source, entry.CaptureName, *entry.Expected); err != nil {
+				return fmt.Errorf("source temporary is not transaction-owned: %w", err)
+			}
+		} else {
+			actual, err := snapshotSubtreeAt(roots.source, entry.CaptureName)
+			if err != nil || !reflect.DeepEqual(actual, entry.ExpectedTree) {
+				return fmt.Errorf("source temporary is not transaction-owned: %w", errors.Join(err, errors.New("captured source tree identity mismatch")))
+			}
+		}
+	case CleanupPhaseQuarantineIntent:
+		if quarantineAbsent {
+			return errors.New("cleanup quarantine capture is missing")
+		}
+		if err := validateCleanupQuarantineBound(entry, roots.tx); err != nil {
+			return fmt.Errorf("cleanup quarantine identity mismatch: %w", err)
+		}
+	case CleanupPhaseQuarantined:
+		if !quarantineAbsent {
+			if err := validateCleanupQuarantineBound(entry, roots.tx); err != nil {
+				return fmt.Errorf("cleanup quarantine identity mismatch: %w", err)
+			}
+		} else {
+			removing := privateRemovingPath(entry.QuarantinePath)
+			if _, err := entryStatAt(roots.tx, removing); errors.Is(err, os.ErrNotExist) {
+				return nil
+			} else if err != nil {
+				return err
+			}
+			if err := validateCleanupPathBound(entry, roots.tx, removing); err != nil {
+				return fmt.Errorf("private cleanup capture identity mismatch: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
 func cleanupRetainedPaths(manifest TransactionManifest, entry TransactionEntry, transactionDir string) []string {
 	retained := make([]string, 0, 2)
 	if entry.CleanupPhase == CleanupPhasePending || entry.CleanupPhase == CleanupPhaseQuarantineIntent {
@@ -769,6 +822,57 @@ func CleanCommittedTransaction(manifest *TransactionManifest, transactionDir str
 	return nil, nil
 }
 
+// PreflightRecoverTransaction observes the same descriptor-bound identities and
+// reconciliation decisions as recovery without writing manifests or mutating paths.
+func PreflightRecoverTransaction(manifest *TransactionManifest, transactionDir string) (report RecoveryReport, returnErr error) {
+	if manifest == nil {
+		return RecoveryReport{}, errors.New("transaction manifest is nil")
+	}
+	copyManifest := *manifest
+	copyManifest.Entries = append([]TransactionEntry(nil), manifest.Entries...)
+	switch copyManifest.State {
+	case TransactionCommitted, TransactionCleaning:
+		roots, err := openForwardRoots(copyManifest.SourcePath, transactionDir)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		defer func() { returnErr = errors.Join(returnErr, roots.close()) }()
+		for _, entry := range copyManifest.Entries {
+			if entry.CaptureName == "" {
+				continue
+			}
+			if err := preflightCleanupEntryBound(entry, roots); err != nil {
+				return RecoveryReport{Disposition: RecoveryBlocked, Issues: []RecoveryIssue{{
+					TransactionID: copyManifest.TransactionID, State: TransactionCleanupBlocked,
+					Message: err.Error(), Paths: []string{entry.Path},
+					RetainedPaths: cleanupRetainedPaths(copyManifest, entry, transactionDir),
+				}}}, nil
+			}
+		}
+	case TransactionPrepared, TransactionApplying, TransactionRollingBack:
+		roots, err := openForwardRoots(copyManifest.SourcePath, transactionDir)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		defer func() { returnErr = errors.Join(returnErr, roots.close()) }()
+		for index := len(copyManifest.Entries) - 1; index >= 0; index-- {
+			issue, err := preflightRollbackEntryBound(&copyManifest, index, roots)
+			if err != nil {
+				return RecoveryReport{}, err
+			}
+			if issue != nil {
+				issue.TransactionID, issue.State = copyManifest.TransactionID, TransactionRecoveryBlocked
+				return RecoveryReport{Disposition: RecoveryBlocked, Issues: []RecoveryIssue{*issue}}, nil
+			}
+		}
+	case TransactionRecoveryBlocked:
+		return RecoveryReport{Disposition: RecoveryBlocked, Issues: append([]RecoveryIssue(nil), copyManifest.RecoveryIssues...)}, nil
+	case TransactionCleanupBlocked:
+		return RecoveryReport{Disposition: RecoveryBlocked, Issues: append([]RecoveryIssue(nil), copyManifest.RecoveryIssues...)}, nil
+	}
+	return RecoveryReport{Disposition: RecoveryUnchanged}, nil
+}
+
 // RecoverTransaction reverses every pre-commit state and leaves committed
 // transactions for the committed-cleanup path.
 func RecoverTransaction(manifest *TransactionManifest, transactionDir string) (RecoveryReport, error) {
@@ -851,6 +955,14 @@ func rollbackTransactionBound(manifest *TransactionManifest, roots *forwardRoots
 }
 
 func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forwardRoots) (*RecoveryIssue, error) {
+	return reconcileRollbackEntryBound(manifest, index, roots, false)
+}
+
+func preflightRollbackEntryBound(manifest *TransactionManifest, index int, roots *forwardRoots) (*RecoveryIssue, error) {
+	return reconcileRollbackEntryBound(manifest, index, roots, true)
+}
+
+func reconcileRollbackEntryBound(manifest *TransactionManifest, index int, roots *forwardRoots, preflight bool) (*RecoveryIssue, error) {
 	entry := &manifest.Entries[index]
 	observe := func() (ObservedEntryState, error) {
 		state, err := observeEntryStateBound(*entry, roots)
@@ -876,7 +988,13 @@ func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forward
 	block := func(message string, paths, retained []string) *RecoveryIssue {
 		return &RecoveryIssue{Message: message, Paths: paths, RetainedPaths: retained}
 	}
-	persist := func(phase EntryPhase) error { entry.Phase = phase; return writeManifestBound(*manifest, roots.tx) }
+	persist := func(phase EntryPhase) error {
+		entry.Phase = phase
+		if preflight {
+			return nil
+		}
+		return writeManifestBound(*manifest, roots.tx)
+	}
 	retainRollbackResult := func() *RecoveryIssue {
 		if entry.StagePath == "" {
 			return block("published result has no private retention path", []string{entry.Path}, []string{entry.RollbackCaptureName})
@@ -887,6 +1005,9 @@ func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forward
 		observed, err := validateIdentityStatBound(roots.source, entry.RollbackCaptureName, *entry.Result)
 		if err != nil {
 			return block("retained published result changed before private capture", []string{entry.Path}, []string{entry.RollbackCaptureName})
+		}
+		if preflight {
+			return nil
 		}
 		if transactionBeforeFilesystemHook != nil {
 			transactionBeforeFilesystemHook("retain-result", entry.Path)
@@ -914,6 +1035,7 @@ func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forward
 		publicationPossible = true
 	}
 	published := publicationPossible && state.TargetMatchesResult
+	simulatedCapture := false
 	if entry.Operation == EntryOperationCreate && entry.Phase == EntryPhasePending && state.TargetExists {
 		return block("pending create target is externally owned", []string{entry.Path}, []string{entry.Path, entry.StagePath}), nil
 	}
@@ -937,24 +1059,35 @@ func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forward
 		if statErr != nil {
 			return block("published result changed before capture", []string{entry.Path}, []string{entry.Path, entry.CaptureName}), nil
 		}
-		if transactionBeforeFilesystemHook != nil {
-			transactionBeforeFilesystemHook("rollback-capture", entry.Path)
-		}
-		if err := renameRelativeNoReplaceBound(roots.source, entry.Path, roots.source, entry.RollbackCaptureName, &observed); err != nil {
-			return block("published result could not be captured safely", []string{entry.Path}, []string{entry.Path, entry.RollbackCaptureName, entry.CaptureName}), nil
-		}
-		if transactionAfterFilesystemHook != nil {
-			transactionAfterFilesystemHook("rollback-capture", entry.Path)
-		}
-		state, err = observe()
-		if err != nil {
-			return nil, err
-		}
-		if !state.RollbackMatchesResult || state.TargetExists {
-			return block("published result capture is ambiguous", []string{entry.Path}, []string{entry.RollbackCaptureName, entry.CaptureName}), nil
-		}
-		if err := persist(EntryPhaseRollbackCaptured); err != nil {
-			return nil, err
+		if preflight {
+			simulatedCapture = true
+			state.TargetExists = false
+			state.TargetMatchesResult = false
+			state.RollbackExists = true
+			state.RollbackMatchesResult = true
+			if err := persist(EntryPhaseRollbackCaptured); err != nil {
+				return nil, err
+			}
+		} else {
+			if transactionBeforeFilesystemHook != nil {
+				transactionBeforeFilesystemHook("rollback-capture", entry.Path)
+			}
+			if err := renameRelativeNoReplaceBound(roots.source, entry.Path, roots.source, entry.RollbackCaptureName, &observed); err != nil {
+				return block("published result could not be captured safely", []string{entry.Path}, []string{entry.Path, entry.RollbackCaptureName, entry.CaptureName}), nil
+			}
+			if transactionAfterFilesystemHook != nil {
+				transactionAfterFilesystemHook("rollback-capture", entry.Path)
+			}
+			state, err = observe()
+			if err != nil {
+				return nil, err
+			}
+			if !state.RollbackMatchesResult || state.TargetExists {
+				return block("published result capture is ambiguous", []string{entry.Path}, []string{entry.RollbackCaptureName, entry.CaptureName}), nil
+			}
+			if err := persist(EntryPhaseRollbackCaptured); err != nil {
+				return nil, err
+			}
 		}
 	} else if state.RollbackMatchesResult && !state.TargetExists {
 		if entry.Phase != EntryPhaseRollbackCaptured {
@@ -966,9 +1099,11 @@ func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forward
 		return block("result exists at both target and rollback capture", []string{entry.Path}, []string{entry.Path, entry.RollbackCaptureName, entry.CaptureName}), nil
 	}
 
-	state, err = observe()
-	if err != nil {
-		return nil, err
+	if !simulatedCapture {
+		state, err = observe()
+		if err != nil {
+			return nil, err
+		}
 	}
 	switch entry.Operation {
 	case EntryOperationUpdate, EntryOperationDelete, EntryOperationCreate:
@@ -1011,6 +1146,14 @@ func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forward
 		}
 		if statErr != nil {
 			return block("captured original changed before restore", []string{entry.Path}, []string{entry.CaptureName, entry.RollbackCaptureName}), nil
+		}
+		if preflight {
+			if state.RollbackMatchesResult {
+				if issue := retainRollbackResult(); issue != nil {
+					return issue, nil
+				}
+			}
+			return nil, persist(EntryPhaseRestored)
 		}
 		if transactionBeforeFilesystemHook != nil {
 			transactionBeforeFilesystemHook("restore", entry.Path)

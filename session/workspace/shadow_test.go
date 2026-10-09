@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -147,6 +148,94 @@ func TestResetRejectsReferenceInsertedAfterEnumeration(t *testing.T) {
 	contents, readErr := os.ReadFile(statePath)
 	require.NoError(t, readErr)
 	require.NotEqual(t, persisted, contents)
+}
+
+func TestResetPreflightsFilesystemRecoveryAcrossAllProjects(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	fixtures := []resetRecoveryFixture{newResetRecoveryFixture(t, "first"), newResetRecoveryFixture(t, "second")}
+	sort.Slice(fixtures, func(i, j int) bool { return fixtures[i].project < fixtures[j].project })
+	earlier, later := fixtures[0], fixtures[1]
+	prepareCapturedUpdate(t, &earlier, false)
+	prepareCapturedUpdate(t, &later, true)
+	earlierManifestBefore := mustReadFile(t, filepath.Join(earlier.transactionDir, "manifest.json"))
+	earlierSourceBefore := mustSnapshot(t, earlier.manifest.SourcePath)
+
+	entered := false
+	err := WithResetPreflight(func() error { entered = true; return nil })
+	require.ErrorContains(t, err, "restore target is occupied")
+	require.ErrorContains(t, err, "paths=[update]")
+	require.ErrorContains(t, err, "retained_paths=["+later.entry.CaptureName+" "+later.entry.RollbackCaptureName+"]")
+	require.False(t, entered)
+	require.Equal(t, earlierManifestBefore, mustReadFile(t, filepath.Join(earlier.transactionDir, "manifest.json")))
+	require.Equal(t, earlierSourceBefore, mustSnapshot(t, earlier.manifest.SourcePath))
+}
+
+func TestResetPreflightsCommittedCleanupAcrossAllProjects(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	fixtures := []resetRecoveryFixture{newResetRecoveryFixture(t, "first"), newResetRecoveryFixture(t, "second")}
+	sort.Slice(fixtures, func(i, j int) bool { return fixtures[i].project < fixtures[j].project })
+	earlier, later := fixtures[0], fixtures[1]
+	prepareCapturedUpdate(t, &earlier, false)
+	require.NoError(t, ExecuteTransaction(&later.manifest, later.transactionDir))
+	later.entry = later.manifest.Entries[slices.IndexFunc(later.manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	require.NoError(t, os.Remove(filepath.Join(later.manifest.SourcePath, later.entry.CaptureName)))
+	writeApplyFile(t, later.manifest.SourcePath, later.entry.CaptureName, "external", 0o600)
+	earlierManifestBefore := mustReadFile(t, filepath.Join(earlier.transactionDir, "manifest.json"))
+	earlierSourceBefore := mustSnapshot(t, earlier.manifest.SourcePath)
+
+	entered := false
+	err := WithResetPreflight(func() error { entered = true; return nil })
+	require.ErrorContains(t, err, "source temporary is not transaction-owned")
+	require.ErrorContains(t, err, "paths=[update]")
+	require.ErrorContains(t, err, "retained_paths=["+later.entry.CaptureName+"]")
+	require.False(t, entered)
+	require.Equal(t, earlierManifestBefore, mustReadFile(t, filepath.Join(earlier.transactionDir, "manifest.json")))
+	require.Equal(t, earlierSourceBefore, mustSnapshot(t, earlier.manifest.SourcePath))
+}
+
+type resetRecoveryFixture struct {
+	project        string
+	transactionDir string
+	manifest       TransactionManifest
+	entry          TransactionEntry
+}
+
+func newResetRecoveryFixture(t *testing.T, session string) resetRecoveryFixture {
+	t.Helper()
+	source := t.TempDir()
+	writeApplyFile(t, source, "update", "before", 0o644)
+	value, _, err := NewShadow(source, session)
+	require.NoError(t, err)
+	ws := value.(*shadowWorkspace)
+	transactionRoot := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+	require.NoError(t, os.MkdirAll(transactionRoot, 0o700))
+	transactionDir, err := os.MkdirTemp(transactionRoot, session+"-")
+	require.NoError(t, err)
+	before := mustSnapshot(t, source)
+	plan := applyPlan{
+		TransactionDir: transactionDir,
+		SourcePath:     source,
+		MergedTree:     strings.Repeat("a", 40),
+		OursSnapshot:   before,
+		Updates:        map[string]applyEntry{"update": {Type: EntryRegular, Mode: 0o644, Contents: []byte("after")}},
+		Creates:        map[string]applyEntry{},
+	}
+	manifest, err := ws.prepareTransaction(plan, time.Unix(300, 0).UTC())
+	require.NoError(t, err)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	return resetRecoveryFixture{project: filepath.Dir(ws.data.RepoPath), transactionDir: transactionDir, manifest: manifest, entry: entry}
+}
+
+func prepareCapturedUpdate(t *testing.T, fixture *resetRecoveryFixture, occupyTarget bool) {
+	t.Helper()
+	require.NoError(t, os.Rename(filepath.Join(fixture.manifest.SourcePath, fixture.entry.Path), filepath.Join(fixture.manifest.SourcePath, fixture.entry.CaptureName)))
+	fixture.entry.Phase = EntryPhaseCaptured
+	fixture.manifest.State = TransactionApplying
+	fixture.manifest.Entries[slices.IndexFunc(fixture.manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == fixture.entry.Path })] = fixture.entry
+	if occupyTarget {
+		writeApplyFile(t, fixture.manifest.SourcePath, fixture.entry.Path, "external", 0o600)
+	}
+	require.NoError(t, WriteManifestDurable(fixture.manifest, fixture.transactionDir))
 }
 
 func TestResetMixedRecoverableAndBlockedProjectsMakesNoRecoveryMutation(t *testing.T) {

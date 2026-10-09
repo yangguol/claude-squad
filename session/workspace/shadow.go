@@ -804,8 +804,12 @@ func withResetPreflight(run func(func() error) error) (returnErr error) {
 		if err != nil {
 			return fmt.Errorf("classify shadow project %q: %w", filepath.Base(projectPath), err)
 		}
-		if access := accessStateFromReport(classificationReport(discovered)); access.ReadOnly {
-			return fmt.Errorf("shadow project %q requires explicit recovery: %s", filepath.Base(projectPath), access.Message)
+		report, err := preflightProjectRecovery(discovered, nil)
+		if err != nil {
+			return fmt.Errorf("preflight shadow project %q recovery: %w", filepath.Base(projectPath), err)
+		}
+		if access := accessStateFromReport(report); access.ReadOnly {
+			return fmt.Errorf("shadow project %q requires explicit recovery: %s; paths=%v; retained_paths=%v", filepath.Base(projectPath), access.Message, access.Paths, access.RetainedPaths)
 		}
 	}
 	for _, projectPath := range projects {
