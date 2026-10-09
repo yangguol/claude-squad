@@ -28,7 +28,7 @@ var transactionAfterCreatedParentOpenHook func(string)
 var replacementScanAfterRootReadHook func()
 var cleanupAfterSourceQuarantineHook func(string)
 var cleanupAfterQuarantineValidationHook func(string)
-var cleanupAfterPrivateCaptureHook func(string)
+var cleanupAfterPrivateCaptureHook func(string) error
 var cleanupAfterPrivateRemovalHook func(string)
 var acknowledgeAfterValidationHook func()
 

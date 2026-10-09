@@ -107,3 +107,31 @@ git diff --check
 PASS, no output.
 
 Private cleanup now atomically recaptures the validated inode under a descriptor-owned removing name before recursive deletion and rechecks identity across every name-based mutation. Acknowledgement reads and validates the complete receipt through the retained transaction descriptor, verifies the original binding, atomically captures it under a private root name, and only removes that captured inode. Cleanup-blocked receipts record every actual retained capture and/or quarantine path and reproduce the same typed warning after strict reload. Crash tests cover intent before/after rename, quarantined before removal, removal before durable removed, and final complete persistence.
+
+## Fix Round 2
+
+### RED
+
+`go test ./session/workspace -run '^(TestCleanupPrivateCaptureReplacementIsPreserved|TestCommittedCleanupCrashPointsRecoverIdempotently|TestApplyCleanupBlockedReturnsSuccessWithTypedWarning|TestCleanupNeverRemoveAllsSourceNamespacePath)$' -count=1 -v`
+
+Failed deterministically for the directory replacement case: after private `.removing-*` capture, cleanup reopened the replacement directory by name and recursively deleted its contents because the opened inode was not compared with the captured identity. The acceptance assertions also exposed the missing genuine post-durable-`quarantined` seam and insufficient exact-path/source-safety coverage.
+
+### GREEN
+
+`go test ./session/workspace -run '^(TestApplyCleanupBlocked|TestCleanup|TestCommittedCleanup|TestCleaningRecovery|TestCompleteTransaction|TestAcknowledgeApply)' -count=1 -v`
+
+PASS (`ok claude-squad/session/workspace`, 54.221s).
+
+`go test ./session/workspace -count=1`
+
+PASS (`ok claude-squad/session/workspace`, 348.686s).
+
+`go test ./... -count=1`
+
+PASS for all repository packages; workspace completed in 355.684s.
+
+`git diff --check`
+
+PASS, no output.
+
+Private directory recursion now begins only after the opened directory descriptor's device/inode matches the expected captured identity. Deterministic post-private-capture replacement tests cover regular files, symlinks, and directories; replacements survive and Apply-level reconciliation durably records exact quarantine and `.removing-*` paths. Crash coverage now interrupts after the `quarantined` manifest rename has succeeded and after private capture, then strictly reloads and safely resumes. Source-safety coverage exercises descriptor-relative private cleanup and proves published results and unrelated source entries remain untouched.

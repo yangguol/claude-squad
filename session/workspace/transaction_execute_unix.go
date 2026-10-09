@@ -290,12 +290,18 @@ func removePrivateRelativeBound(root *os.File, relative string, expected unix.St
 		return errors.Join(err, errors.New("private cleanup captured a different inode"))
 	}
 	if cleanupAfterPrivateCaptureHook != nil {
-		cleanupAfterPrivateCaptureHook(relative)
+		if err := cleanupAfterPrivateCaptureHook(relative); err != nil {
+			return err
+		}
 	}
 	if captured.Mode&unix.S_IFMT == unix.S_IFDIR {
 		directory, opened, err := openOrphanDirectoryAt(parent, removing)
 		if err != nil {
 			return err
+		}
+		if !sameOrphanIdentity(expected, opened) {
+			_ = directory.Close()
+			return errors.New("private cleanup directory changed before recursion")
 		}
 		if err := removeOrphanDirectoryContents(directory); err != nil {
 			_ = directory.Close()

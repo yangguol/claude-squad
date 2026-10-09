@@ -470,6 +470,16 @@ func TestApplyCleanupBlockedReturnsSuccessWithTypedWarning(t *testing.T) {
 	require.NotNil(t, result.Warning)
 	require.NotEmpty(t, result.TransactionID)
 	require.Equal(t, "after", mustReadFile(t, filepath.Join(source, "file")))
+
+	transactionDir := filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", result.TransactionID)
+	persisted := readPersistedTransactionManifest(t, transactionDir)
+	entry := persisted.Entries[slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "file" })]
+	require.Equal(t, []string{"file"}, result.Warning.Paths)
+	require.Equal(t, []string{entry.CaptureName}, result.Warning.RetainedPaths)
+	require.Equal(t, TransactionCleanupBlocked, persisted.State)
+	require.Len(t, persisted.RecoveryIssues, 1)
+	require.Equal(t, result.Warning.Paths, persisted.RecoveryIssues[0].Paths)
+	require.Equal(t, result.Warning.RetainedPaths, persisted.RecoveryIssues[0].RetainedPaths)
 }
 
 func TestAcknowledgeApplyRemovesOnlyCompleteTransaction(t *testing.T) {

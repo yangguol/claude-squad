@@ -983,13 +983,23 @@ func (f *sourceRemoveAllTrackingOps) RemoveAll(path string) error {
 func TestCleanupNeverRemoveAllsSourceNamespacePath(t *testing.T) {
 	_, plan, manifest := preparedForwardTransaction(t)
 	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	writeApplyFile(t, manifest.SourcePath, "external", "untouched", 0o600)
+	beforeResult := mustReadFile(t, filepath.Join(manifest.SourcePath, "update"))
 	original := applyFS
 	tracking := &sourceRemoveAllTrackingOps{fileOps: original, source: manifest.SourcePath}
 	applyFS = tracking
-	t.Cleanup(func() { applyFS = original })
+	privateCaptureObserved := false
+	cleanupAfterPrivateCaptureHook = func(string) error {
+		privateCaptureObserved = true
+		return nil
+	}
+	t.Cleanup(func() { applyFS = original; cleanupAfterPrivateCaptureHook = nil })
 	_, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
 	require.NoError(t, err)
+	require.True(t, privateCaptureObserved, "cleanup must exercise descriptor-relative private capture")
 	require.False(t, tracking.called)
+	require.Equal(t, beforeResult, mustReadFile(t, filepath.Join(manifest.SourcePath, "update")))
+	require.Equal(t, "untouched", mustReadFile(t, filepath.Join(manifest.SourcePath, "external")))
 }
 
 func TestCleanupReplacementBecomesCleanupBlocked(t *testing.T) {
@@ -1042,6 +1052,92 @@ func TestCleanupQuarantineReplacementAfterValidationIsPreserved(t *testing.T) {
 	}
 }
 
+func TestCleanupPrivateCaptureReplacementIsPreserved(t *testing.T) {
+	for _, kind := range []string{"regular", "symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			rootPath := t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(rootPath, "quarantine"), 0o700))
+			quarantine := filepath.Join(rootPath, "quarantine", "entry")
+			switch kind {
+			case "regular":
+				require.NoError(t, os.WriteFile(quarantine, []byte("owned"), 0o600))
+			case "symlink":
+				require.NoError(t, os.Symlink("owned-target", quarantine))
+			case "directory":
+				require.NoError(t, os.Mkdir(quarantine, 0o700))
+				require.NoError(t, os.WriteFile(filepath.Join(quarantine, "owned"), []byte("owned"), 0o600))
+			}
+			root, err := platformOpenTrustedDirectory(rootPath)
+			require.NoError(t, err)
+			defer root.Close()
+			expected, err := entryStatAt(root, "quarantine/entry")
+			require.NoError(t, err)
+			removing := filepath.Join(rootPath, "quarantine", ".removing-entry")
+			owned := filepath.Join(rootPath, "quarantine", ".owned-entry")
+			cleanupAfterPrivateCaptureHook = func(path string) error {
+				require.Equal(t, "quarantine/entry", path)
+				cleanupAfterPrivateCaptureHook = nil
+				require.NoError(t, os.Rename(removing, owned))
+				switch kind {
+				case "regular":
+					require.NoError(t, os.WriteFile(removing, []byte("external"), 0o600))
+				case "symlink":
+					require.NoError(t, os.Symlink("external-target", removing))
+				case "directory":
+					require.NoError(t, os.Mkdir(removing, 0o700))
+					require.NoError(t, os.WriteFile(filepath.Join(removing, "external"), []byte("keep"), 0o600))
+				}
+				return nil
+			}
+			t.Cleanup(func() { cleanupAfterPrivateCaptureHook = nil })
+
+			require.Error(t, removePrivateRelativeBound(root, "quarantine/entry", expected, false))
+			require.NoError(t, func() error { _, err := os.Lstat(removing); return err }())
+			switch kind {
+			case "regular":
+				require.Equal(t, "external", mustReadFile(t, removing))
+			case "symlink":
+				target, err := os.Readlink(removing)
+				require.NoError(t, err)
+				require.Equal(t, "external-target", target)
+			case "directory":
+				require.Equal(t, "keep", mustReadFile(t, filepath.Join(removing, "external")))
+			}
+		})
+	}
+}
+
+func TestCleanupPostPrivateCaptureReplacementBecomesBlocked(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })
+	entry := manifest.Entries[index]
+	quarantine := filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.QuarantinePath))
+	removingPath := privateRemovingPath(entry.QuarantinePath)
+	removing := filepath.Join(plan.TransactionDir, filepath.FromSlash(removingPath))
+	cleanupAfterPrivateCaptureHook = func(path string) error {
+		if path != entry.QuarantinePath {
+			return nil
+		}
+		cleanupAfterPrivateCaptureHook = nil
+		require.NoError(t, os.Rename(removing, quarantine))
+		require.NoError(t, os.WriteFile(removing, []byte("external"), 0o600))
+		return nil
+	}
+	t.Cleanup(func() { cleanupAfterPrivateCaptureHook = nil })
+
+	warning, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.NotNil(t, warning)
+	require.Equal(t, []string{entry.Path}, warning.Paths)
+	require.Equal(t, []string{entry.QuarantinePath, removingPath}, warning.RetainedPaths)
+	require.Equal(t, "external", mustReadFile(t, removing))
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	require.Equal(t, TransactionCleanupBlocked, persisted.State)
+	require.Equal(t, warning.Paths, persisted.RecoveryIssues[0].Paths)
+	require.Equal(t, warning.RetainedPaths, persisted.RecoveryIssues[0].RetainedPaths)
+}
+
 func TestCleanupBlockedReportsActualRetainedLocation(t *testing.T) {
 	t.Run("capture never occurred", func(t *testing.T) {
 		_, plan, manifest := preparedForwardTransaction(t)
@@ -1074,7 +1170,7 @@ func TestCleanupBlockedReportsActualRetainedLocation(t *testing.T) {
 }
 
 func TestCommittedCleanupCrashPointsRecoverIdempotently(t *testing.T) {
-	points := []string{"intent-before-rename", "intent-after-rename", "quarantined-before-removal", "removal-before-removed", "final-complete-write"}
+	points := []string{"intent-before-rename", "intent-after-rename", "quarantined-durable-before-removal", "private-capture-before-removal", "removal-before-removed", "final-complete-write"}
 	for _, point := range points {
 		t.Run(point, func(t *testing.T) {
 			_, plan, manifest := preparedForwardTransaction(t)
@@ -1100,10 +1196,18 @@ func TestCommittedCleanupCrashPointsRecoverIdempotently(t *testing.T) {
 						transactionManifestWriteHook = func(TransactionState) error { transactionManifestWriteHook = nil; return errors.New(crash) }
 					}
 				}
-			case "quarantined-before-removal":
-				transactionManifestWriteHook = func(state TransactionState) error {
+			case "quarantined-durable-before-removal":
+				transactionAfterManifestRenameHook = func(state TransactionState) error {
 					if manifest.Entries[index].CleanupPhase == CleanupPhaseQuarantined {
-						transactionManifestWriteHook = nil
+						transactionAfterManifestRenameHook = nil
+						return errors.New(crash)
+					}
+					return nil
+				}
+			case "private-capture-before-removal":
+				cleanupAfterPrivateCaptureHook = func(path string) error {
+					if path == entry.QuarantinePath {
+						cleanupAfterPrivateCaptureHook = nil
 						return errors.New(crash)
 					}
 					return nil
@@ -1126,7 +1230,9 @@ func TestCommittedCleanupCrashPointsRecoverIdempotently(t *testing.T) {
 			}
 			t.Cleanup(func() {
 				transactionManifestWriteHook = nil
+				transactionAfterManifestRenameHook = nil
 				cleanupAfterSourceQuarantineHook = nil
+				cleanupAfterPrivateCaptureHook = nil
 				cleanupAfterPrivateRemovalHook = nil
 			})
 			var err error
