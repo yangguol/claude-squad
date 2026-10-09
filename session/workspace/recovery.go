@@ -41,6 +41,29 @@ type ApplyMetadataRepair struct {
 	TransactionID string
 	AppliedTree   string
 	AppliedAt     string
+	State         TransactionState
+}
+
+// ProjectRecoveryLease keeps recovery, durable metadata publication, receipt
+// acknowledgement, and workspace publication under one project lock.
+// A lease is valid only for the duration of RecoverProjectLocked's callback.
+type ProjectRecoveryLease struct {
+	projectPath string
+	active      bool
+}
+
+func (l *ProjectRecoveryLease) RestoreShadow(data Data, access AccessState) (Workspace, error) {
+	if l == nil || !l.active || data.Shadow == nil || filepath.Dir(data.Shadow.RepoPath) != l.projectPath {
+		return nil, errors.New("invalid project recovery lease")
+	}
+	return restoreShadowLocked(data, access)
+}
+
+func (l *ProjectRecoveryLease) AcknowledgeApply(transactionID string) error {
+	if l == nil || !l.active || transactionID == "" || filepath.Base(transactionID) != transactionID {
+		return errors.New("invalid project recovery lease acknowledgement")
+	}
+	return acknowledgeCompleteTransaction(l.projectPath, filepath.Join(l.projectPath, "transactions", transactionID), transactionID)
 }
 
 type RecoveryIssue struct {
@@ -49,6 +72,7 @@ type RecoveryIssue struct {
 	Message       string
 	Paths         []string
 	RetainedPaths []string
+	Informational bool
 }
 
 type RecoveryReport struct {
@@ -60,12 +84,28 @@ type RecoveryReport struct {
 
 // RecoverProject serializes discovery and automatic recovery for one project.
 func RecoverProject(projectPath string, sessions map[string]*ShadowData) (report RecoveryReport, returnErr error) {
+	returnErr = RecoverProjectLocked(projectPath, sessions, func(recovered RecoveryReport, _ *ProjectRecoveryLease) error {
+		report = recovered
+		return nil
+	})
+	return report, returnErr
+}
+
+// RecoverProjectLocked invokes publish while the project recovery lock remains
+// held, preventing another lifecycle operation from invalidating recovered state.
+func RecoverProjectLocked(projectPath string, sessions map[string]*ShadowData, publish func(RecoveryReport, *ProjectRecoveryLease) error) (returnErr error) {
 	lock, err := AcquireProjectLock(projectPath, "recover")
 	if err != nil {
-		return RecoveryReport{}, err
+		return err
 	}
 	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
-	return recoverProjectLocked(projectPath, sessions)
+	report, err := recoverProjectLocked(projectPath, sessions)
+	if err != nil {
+		return err
+	}
+	lease := &ProjectRecoveryLease{projectPath: projectPath, active: true}
+	defer func() { lease.active = false }()
+	return publish(report, lease)
 }
 
 func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (RecoveryReport, error) {
@@ -109,9 +149,17 @@ func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (
 		report.Orphans = append(report.Orphans, transactionReport.Orphans...)
 		if len(transactionReport.Repairs) != 0 {
 			if _, exists := sessions[manifest.SessionID]; !exists {
-				if err := acknowledgeCompleteTransaction(projectPath, transaction.Directory, manifest.TransactionID); err != nil {
-					return RecoveryReport{}, err
+				if manifest.State == TransactionComplete {
+					if err := acknowledgeCompleteTransaction(projectPath, transaction.Directory, manifest.TransactionID); err != nil {
+						return RecoveryReport{}, err
+					}
 				}
+				report.Issues = append(report.Issues, RecoveryIssue{
+					TransactionID: manifest.TransactionID,
+					State:         manifest.State,
+					Message:       "committed apply receipt has no stored session",
+					Informational: true,
+				})
 				continue
 			}
 		}
@@ -147,6 +195,9 @@ func accessStateFromReport(report RecoveryReport) AccessState {
 		}
 	}
 	for _, issue := range report.Issues {
+		if issue.Informational {
+			continue
+		}
 		state.ReadOnly = true
 		if state.Message == "" {
 			state.Message = issue.Message

@@ -112,6 +112,34 @@ func RestoreShadowRecovered(data Data, access AccessState) (Workspace, error) {
 	return restoreShadow(data, &access)
 }
 
+func restoreShadowLocked(data Data, access AccessState) (Workspace, error) {
+	if data.Version != CurrentVersion {
+		return nil, fmt.Errorf("unsupported workspace data version %d", data.Version)
+	}
+	if data.Mode != ModeDirectory || data.Shadow == nil {
+		return nil, errors.New("invalid shadow workspace data")
+	}
+	stored := *data.Shadow
+	if err := validateShadowData(stored); err != nil {
+		return nil, err
+	}
+	if err := validateShadowIdentity(stored, false); err != nil {
+		return nil, err
+	}
+	if _, err := os.Lstat(stored.WorktreePath); err == nil {
+		valid, validateErr := validateWorktreeIdentity(stored)
+		if validateErr != nil || !valid {
+			return nil, errors.New("shadow worktree identity is invalid")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat shadow worktree: %w", err)
+	}
+	if lifecycleAccessStatePublishedHook != nil {
+		lifecycleAccessStatePublishedHook()
+	}
+	return &shadowWorkspace{data: stored, access: access}, nil
+}
+
 func restoreShadow(data Data, recoveredAccess *AccessState) (result Workspace, returnErr error) {
 	if data.Version != CurrentVersion {
 		return nil, fmt.Errorf("unsupported workspace data version %d", data.Version)

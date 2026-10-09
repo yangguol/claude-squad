@@ -783,7 +783,7 @@ func RecoverTransaction(manifest *TransactionManifest, transactionDir string) (R
 		}
 		report := RecoveryReport{Disposition: RecoveryUnchanged, Repairs: []ApplyMetadataRepair{{
 			SessionID: manifest.SessionID, TransactionID: manifest.TransactionID,
-			AppliedTree: manifest.AppliedTree, AppliedAt: manifest.AppliedAt,
+			AppliedTree: manifest.AppliedTree, AppliedAt: manifest.AppliedAt, State: manifest.State,
 		}}}
 		if warning != nil {
 			report.Issues = append([]RecoveryIssue(nil), manifest.RecoveryIssues...)
@@ -795,7 +795,7 @@ func RecoverTransaction(manifest *TransactionManifest, transactionDir string) (R
 			Issues:      append([]RecoveryIssue(nil), manifest.RecoveryIssues...),
 			Repairs: []ApplyMetadataRepair{{
 				SessionID: manifest.SessionID, TransactionID: manifest.TransactionID,
-				AppliedTree: manifest.AppliedTree, AppliedAt: manifest.AppliedAt,
+				AppliedTree: manifest.AppliedTree, AppliedAt: manifest.AppliedAt, State: manifest.State,
 			}},
 		}, nil
 	case TransactionRolledBack:

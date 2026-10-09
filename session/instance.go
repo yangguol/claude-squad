@@ -106,6 +106,10 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 }
 
 func fromInstanceData(data InstanceData, recoveredAccess *workspace.AccessState) (*Instance, error) {
+	return fromInstanceDataWithLease(data, recoveredAccess, nil)
+}
+
+func fromInstanceDataWithLease(data InstanceData, recoveredAccess *workspace.AccessState, lease *workspace.ProjectRecoveryLease) (*Instance, error) {
 	var workspaceData workspace.Data
 	if data.Workspace != nil {
 		workspaceData = *data.Workspace
@@ -132,7 +136,9 @@ func fromInstanceData(data InstanceData, recoveredAccess *workspace.AccessState)
 	case workspace.ModeGit:
 		restored, err = workspace.RestoreGit(workspaceData)
 	case workspace.ModeDirectory:
-		if recoveredAccess != nil {
+		if lease != nil && recoveredAccess != nil {
+			restored, err = lease.RestoreShadow(workspaceData, *recoveredAccess)
+		} else if recoveredAccess != nil {
 			restored, err = workspace.RestoreShadowRecovered(workspaceData, *recoveredAccess)
 		} else {
 			restored, err = workspace.RestoreShadow(workspaceData)

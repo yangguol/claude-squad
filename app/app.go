@@ -787,8 +787,12 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		if selected == nil || selected.Status == session.Loading {
 			return m, nil
 		}
+		capabilities := selected.Capabilities()
+		if selected.WorkspaceMode() == workspace.ModeDirectory && !capabilities.Apply {
+			return m, nil
+		}
 
-		if selected.Capabilities().Apply {
+		if capabilities.Apply {
 			if selected.Paused() || m.actionPending(selected) {
 				return m, nil
 			}

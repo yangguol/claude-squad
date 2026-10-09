@@ -95,6 +95,20 @@ func (s *Storage) SaveInstances(instances []*Instance) error {
 	return s.state.SaveInstances(jsonData)
 }
 
+var loadInstancePublishedHook func()
+
+func newerApplyRepair(candidate, current workspace.ApplyMetadataRepair) bool {
+	candidateTime, candidateErr := time.Parse(time.RFC3339Nano, candidate.AppliedAt)
+	currentTime, currentErr := time.Parse(time.RFC3339Nano, current.AppliedAt)
+	if candidateErr == nil && currentErr == nil && !candidateTime.Equal(currentTime) {
+		return candidateTime.After(currentTime)
+	}
+	if candidate.AppliedAt != current.AppliedAt {
+		return candidate.AppliedAt > current.AppliedAt
+	}
+	return candidate.TransactionID > current.TransactionID
+}
+
 // LoadInstances loads the list of instances from disk
 func (s *Storage) LoadInstances() ([]*Instance, error) {
 	jsonData := s.state.GetInstances()
@@ -128,64 +142,99 @@ func (s *Storage) LoadInstances() ([]*Instance, error) {
 		projectPaths = append(projectPaths, projectPath)
 	}
 	sort.Strings(projectPaths)
+	leases := make(map[string]*workspace.ProjectRecoveryLease)
 	acknowledgements := make(map[string][]workspace.ApplyMetadataRepair)
-	repaired := false
-	for _, projectPath := range projectPaths {
-		project := projects[projectPath]
-		report, err := workspace.RecoverProject(projectPath, project.data)
-		if err != nil {
-			return nil, fmt.Errorf("recover project %s: %w", projectPath, err)
+	var instances []*Instance
+	var recoverLocked func(int) error
+	recoverLocked = func(index int) error {
+		if index < len(projectPaths) {
+			projectPath := projectPaths[index]
+			project := projects[projectPath]
+			return workspace.RecoverProjectLocked(projectPath, project.data, func(report workspace.RecoveryReport, lease *workspace.ProjectRecoveryLease) error {
+				project.report = report
+				leases[projectPath] = lease
+				return recoverLocked(index + 1)
+			})
 		}
-		project.report = report
-		for _, repair := range report.Repairs {
-			shadow := project.data[repair.SessionID]
-			if shadow == nil {
-				continue
-			}
-			shadow.LastAppliedTree = repair.AppliedTree
-			shadow.LastAppliedAt = repair.AppliedAt
-			shadow.LastAppliedTransactionID = repair.TransactionID
-			acknowledgements[projectPath] = append(acknowledgements[projectPath], repair)
-			repaired = true
-		}
-	}
-	if repaired {
-		updated, err := json.Marshal(instancesData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal repaired instances: %w", err)
-		}
-		if err := s.state.SaveInstances(updated); err != nil {
-			return nil, fmt.Errorf("failed to save repaired instances: %w", err)
-		}
-	}
 
-	instances := make([]*Instance, len(instancesData))
-	for i, data := range instancesData {
-		var access *workspace.AccessState
-		if data.Workspace != nil && data.Workspace.Mode == workspace.ModeDirectory && data.Workspace.Shadow != nil {
-			state := workspace.AccessStateFromRecovery(projects[filepath.Dir(data.Workspace.Shadow.RepoPath)].report)
-			access = &state
+		repaired := false
+		informational := make(map[string][]workspace.RecoveryIssue)
+		for _, projectPath := range projectPaths {
+			project := projects[projectPath]
+			authoritative := make(map[string]workspace.ApplyMetadataRepair)
+			for _, issue := range project.report.Issues {
+				if issue.Informational {
+					informational[projectPath] = append(informational[projectPath], issue)
+				}
+			}
+			for _, repair := range project.report.Repairs {
+				shadow := project.data[repair.SessionID]
+				if shadow == nil {
+					continue
+				}
+				current, exists := authoritative[repair.SessionID]
+				if !exists || newerApplyRepair(repair, current) {
+					authoritative[repair.SessionID] = repair
+				}
+				if repair.State == workspace.TransactionComplete {
+					acknowledgements[projectPath] = append(acknowledgements[projectPath], repair)
+				}
+			}
+			for sessionID, repair := range authoritative {
+				shadow := project.data[sessionID]
+				shadow.LastAppliedTree = repair.AppliedTree
+				shadow.LastAppliedAt = repair.AppliedAt
+				shadow.LastAppliedTransactionID = repair.TransactionID
+				repaired = true
+			}
 		}
-		instance, err := fromInstanceData(data, access)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create instance %s: %w", data.Title, err)
+		if repaired {
+			updated, err := json.Marshal(instancesData)
+			if err != nil {
+				return fmt.Errorf("failed to marshal repaired instances: %w", err)
+			}
+			if err := s.state.SaveInstances(updated); err != nil {
+				return fmt.Errorf("failed to save repaired instances: %w", err)
+			}
 		}
-		instances[i] = instance
-	}
-	for _, projectPath := range projectPaths {
-		for _, repair := range acknowledgements[projectPath] {
-			for _, instance := range instances {
-				data := instance.ToInstanceData()
-				if data.Workspace != nil && data.Workspace.Shadow != nil && data.Workspace.Shadow.SessionID == repair.SessionID {
-					if err := instance.AcknowledgeApply(repair.TransactionID); err != nil {
-						return nil, fmt.Errorf("acknowledge transaction %s: %w", repair.TransactionID, err)
-					}
-					break
+
+		instances = make([]*Instance, len(instancesData))
+		for i, data := range instancesData {
+			var access *workspace.AccessState
+			var lease *workspace.ProjectRecoveryLease
+			if data.Workspace != nil && data.Workspace.Mode == workspace.ModeDirectory && data.Workspace.Shadow != nil {
+				projectPath := filepath.Dir(data.Workspace.Shadow.RepoPath)
+				state := workspace.AccessStateFromRecovery(projects[projectPath].report)
+				if len(informational[projectPath]) != 0 && state.Message == "" {
+					state.Message = informational[projectPath][0].Message
+				}
+				access = &state
+				lease = leases[projectPath]
+			}
+			instance, err := fromInstanceDataWithLease(data, access, lease)
+			if err != nil {
+				return fmt.Errorf("failed to create instance %s: %w", data.Title, err)
+			}
+			instances[i] = instance
+		}
+		if loadInstancePublishedHook != nil {
+			loadInstancePublishedHook()
+		}
+		for _, projectPath := range projectPaths {
+			sort.Slice(acknowledgements[projectPath], func(i, j int) bool {
+				return acknowledgements[projectPath][i].TransactionID < acknowledgements[projectPath][j].TransactionID
+			})
+			for _, repair := range acknowledgements[projectPath] {
+				if err := leases[projectPath].AcknowledgeApply(repair.TransactionID); err != nil {
+					return fmt.Errorf("acknowledge transaction %s: %w", repair.TransactionID, err)
 				}
 			}
 		}
+		return nil
 	}
-
+	if err := recoverLocked(0); err != nil {
+		return nil, err
+	}
 	return instances, nil
 }
 

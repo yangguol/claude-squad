@@ -727,6 +727,21 @@ func TestBlockedSessionMenuDisablesApplyAndResume(t *testing.T) {
 	rendered := h.menu.String()
 	require.NotContains(t, rendered, "apply")
 	require.NotContains(t, rendered, "resume")
+
+	applyCalls := 0
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		applyCalls++
+		return nil, nil
+	}
+	_, applyCmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	require.Nil(t, applyCmd)
+	require.Equal(t, 0, applyCalls)
+
+	_, resumeCmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if resumeCmd != nil {
+		_ = resumeCmd()
+	}
+	require.Equal(t, session.Paused, instance.Status)
 }
 
 func TestApplyFlowUsesWorkspaceApplyBackend(t *testing.T) {

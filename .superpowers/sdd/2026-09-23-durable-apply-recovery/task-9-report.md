@@ -89,3 +89,53 @@ A matching complete receipt is acknowledged only after repaired/applied metadata
 ## Concerns
 
 None within Task 9 scope. Cleanup-blocked acknowledgement intentionally returns an error internally because the receipt is not complete; the warning path deliberately retains that receipt and continues the successful Apply lifecycle.
+
+## Fix Round 1
+
+### RED
+
+Added deterministic regressions for newest-receipt selection (including lexical/time inversion and an equal-time transaction-ID tie), exact repaired metadata, cleanup-blocked restart without acknowledgement, orphan reporting, lock continuity through save/publication/acknowledgement, and hidden Apply/Resume keys. The first focused run failed on the pre-fix orphan behavior; the new multi-receipt and cleanup-blocked expectations additionally exposed the prior unconditional acknowledgement and directory-order selection.
+
+### Implementation
+
+- Selects one authoritative repair per session by parsed durable `AppliedAt`, then transaction ID as a deterministic tie-break, while acknowledging every complete receipt only after metadata persistence. Cleanup-blocked receipts are never acknowledged.
+- Adds a scoped `ProjectRecoveryLease` callback API so grouped recovery, metadata save, instance/access publication, and eligible acknowledgement remain under Task 8 project locks. Locked restore avoids recursive lock acquisition.
+- Restores cleanup-blocked sessions read-only with exact issue paths, retained paths, disposition, and message while persisting exact transaction/tree/time metadata.
+- Reports cleaned absent-session complete receipts as informational loader evidence without unnecessarily blocking unrelated sessions.
+- Blocks hidden checkout/apply and resume invocations when directory capabilities deny them.
+
+### Verification
+
+```bash
+go test ./session ./app ./session/workspace -run '^(TestLoadInstances|TestApplyCleanupWarning|TestApplyMetadataSaveFailure|TestBlockedSessionMenu|TestRestoreShadow)' -count=1
+```
+
+PASS: `session` 34.040s, `app` 4.950s, `session/workspace` 6.667s.
+
+```bash
+go test ./session ./app -count=1
+```
+
+PASS: `session` 47.860s, `app` 31.085s.
+
+```bash
+go test ./session/workspace ./ui -count=1
+```
+
+PASS: `session/workspace` 384.798s, `ui` 6.665s.
+
+```bash
+go test ./... -count=1
+```
+
+PASS across all packages; `session/workspace` 386.530s.
+
+```bash
+git diff --check
+```
+
+PASS.
+
+### Fix Round 1 Concerns
+
+None. Task 10 reset locking and Task 11 crash-matrix expansion remain out of scope.
