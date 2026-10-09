@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"golang.org/x/sys/unix"
@@ -292,6 +293,33 @@ func removeOrphanDirectoryContents(directory *os.File) error {
 		}
 	}
 	return nil
+}
+
+func removeCompleteTransaction(projectPath, transactionID string) error {
+	rootPath := filepath.Join(projectPath, "transactions")
+	root, err := platformOpenTrustedDirectory(rootPath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	directory, identity, err := openOrphanDirectoryAt(root, transactionID)
+	if err != nil {
+		return err
+	}
+	if err := removeOrphanDirectoryContents(directory); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	if err := directory.Close(); err != nil {
+		return err
+	}
+	if err := verifyOrphanDirectoryEntry(root, transactionID, identity); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(int(root.Fd()), transactionID, unix.AT_REMOVEDIR); err != nil {
+		return err
+	}
+	return root.Sync()
 }
 
 func removeOrphanAt(root *os.File, originalName, quarantineName string) error {

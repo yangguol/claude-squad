@@ -24,7 +24,9 @@ type Capabilities struct {
 }
 
 type ApplyResult struct {
-	Changed []string
+	Changed       []string
+	TransactionID string
+	Warning       *CleanupBlockedWarning
 }
 
 type ConflictError struct {

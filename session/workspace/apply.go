@@ -205,9 +205,35 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 	if err := ExecuteTransaction(&prepared, plan.TransactionDir); err != nil {
 		return nil, err
 	}
+	warning, err := CleanCommittedTransaction(&prepared, plan.TransactionDir)
+	if err != nil {
+		warning = &CleanupBlockedWarning{TransactionID: prepared.TransactionID, RetainedPaths: []string{plan.TransactionDir}}
+		prepared.State = TransactionCleanupBlocked
+		prepared.RecoveryIssues = []RecoveryIssue{{TransactionID: prepared.TransactionID, State: prepared.State, Message: err.Error(), RetainedPaths: warning.RetainedPaths}}
+		if writeErr := writeManifestAtBoundDirectory(prepared, plan.TransactionDir); writeErr != nil {
+			return nil, errors.Join(err, writeErr)
+		}
+	}
 	w.data.LastAppliedTree = prepared.AppliedTree
 	w.data.LastAppliedAt = prepared.AppliedAt
-	return &ApplyResult{Changed: plan.ChangedPaths()}, nil
+	return &ApplyResult{Changed: plan.ChangedPaths(), TransactionID: prepared.TransactionID, Warning: warning}, nil
+}
+
+// AcknowledgeApply removes a complete transaction receipt and nothing else.
+func (w *shadowWorkspace) AcknowledgeApply(transactionID string) error {
+	if transactionID == "" || filepath.Base(transactionID) != transactionID {
+		return errors.New("invalid transaction ID")
+	}
+	projectPath := filepath.Dir(w.data.RepoPath)
+	transactionDir := filepath.Join(projectPath, "transactions", transactionID)
+	manifest, err := ReadManifestStrict(projectPath, transactionDir)
+	if err != nil {
+		return err
+	}
+	if manifest.TransactionID != transactionID || manifest.State != TransactionComplete {
+		return errors.New("only a complete transaction may be acknowledged")
+	}
+	return removeCompleteTransaction(projectPath, transactionID)
 }
 
 func preflightNoReplace(transaction Transaction) error {

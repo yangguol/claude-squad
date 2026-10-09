@@ -240,6 +240,64 @@ func unlinkAt(directory *os.File, name string) error {
 	return unix.Unlinkat(int(directory.Fd()), name, 0)
 }
 
+func ensurePrivateParentBound(root *os.File, relative string) error {
+	parent, _, err := openRelativeParent(root, relative)
+	if err == nil {
+		return parent.Close()
+	}
+	if !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	if len(parts) != 2 {
+		return errors.New("private cleanup path must have one parent")
+	}
+	if err := unix.Mkdirat(int(root.Fd()), parts[0], 0o700); err != nil && !errors.Is(err, unix.EEXIST) {
+		return err
+	}
+	return root.Sync()
+}
+
+func removePrivateRelativeBound(root *os.File, relative string) error {
+	parent, leaf, err := openRelativeParent(root, relative)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	defer parent.Close()
+	stat, err := orphanEntryInfoAt(parent, leaf)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
+		directory, opened, err := openOrphanDirectoryAt(parent, leaf)
+		if err != nil {
+			return err
+		}
+		if err := removeOrphanDirectoryContents(directory); err != nil {
+			_ = directory.Close()
+			return err
+		}
+		if err := directory.Close(); err != nil {
+			return err
+		}
+		if err := verifyOrphanDirectoryEntry(parent, leaf, opened); err != nil {
+			return err
+		}
+		if err := unix.Unlinkat(int(parent.Fd()), leaf, unix.AT_REMOVEDIR); err != nil {
+			return err
+		}
+	} else if err := unix.Unlinkat(int(parent.Fd()), leaf, 0); err != nil {
+		return err
+	}
+	return parent.Sync()
+}
+
 func validateIdentityStatBound(root *os.File, relative string, expected Entry) (unix.Stat_t, error) {
 	before, err := entryStatAt(root, relative)
 	if err != nil {

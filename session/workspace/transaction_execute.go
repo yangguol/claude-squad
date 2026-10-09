@@ -27,6 +27,21 @@ var transactionAfterCreatedParentMkdirHook func(string)
 var transactionAfterCreatedParentOpenHook func(string)
 var replacementScanAfterRootReadHook func()
 
+// CleanupBlockedWarning reports committed apply material that could not be
+// proven transaction-owned. The apply itself remains successful.
+type CleanupBlockedWarning struct {
+	TransactionID string
+	Paths         []string
+	RetainedPaths []string
+}
+
+func (w *CleanupBlockedWarning) Error() string {
+	if w == nil {
+		return ""
+	}
+	return fmt.Sprintf("transaction %s cleanup blocked; retained: %s", w.TransactionID, strings.Join(w.RetainedPaths, ", "))
+}
+
 // ExecuteTransaction advances a prepared v2 transaction through its durable
 // forward WAL and commits only after every published result is revalidated.
 func ExecuteTransaction(manifest *TransactionManifest, transactionDir string) (returnErr error) {
@@ -533,6 +548,160 @@ func observeEntryStateBound(entry TransactionEntry, roots *forwardRoots) (state 
 	return state, errors.Join(errs...)
 }
 
+// QuarantineSourceTemporary atomically moves one validated source capture into
+// its predeclared transaction-private quarantine before any recursive removal.
+func QuarantineSourceTemporary(manifest *TransactionManifest, entryIndex int, transactionDir string) (returnErr error) {
+	if manifest == nil || entryIndex < 0 || entryIndex >= len(manifest.Entries) {
+		return errors.New("invalid cleanup entry")
+	}
+	entry := &manifest.Entries[entryIndex]
+	if entry.CaptureName == "" {
+		entry.CleanupPhase = CleanupPhaseRemoved
+		return writeManifestAtBoundDirectory(*manifest, transactionDir)
+	}
+	roots, err := openForwardRoots(manifest.SourcePath, transactionDir)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, roots.close()) }()
+	return quarantineSourceTemporaryBound(manifest, entryIndex, roots)
+}
+
+func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex int, roots *forwardRoots) error {
+	entry := &manifest.Entries[entryIndex]
+	if entry.CleanupPhase == CleanupPhaseRemoved {
+		return nil
+	}
+	if entry.QuarantinePath == "" || entry.Expected == nil && len(entry.ExpectedTree) == 0 {
+		return errors.New("source cleanup entry lacks quarantine identity")
+	}
+	if err := ensurePrivateParentBound(roots.tx, entry.QuarantinePath); err != nil {
+		return err
+	}
+	quarantineExists, err := absentAt(roots.tx, entry.QuarantinePath)
+	if err != nil {
+		return err
+	}
+	quarantineExists = !quarantineExists
+	if entry.CleanupPhase == CleanupPhasePending {
+		if quarantineExists {
+			return errors.New("cleanup quarantine is occupied")
+		}
+		var observed unix.Stat_t
+		if entry.Expected != nil {
+			observed, err = validateIdentityStatBound(roots.source, entry.CaptureName, *entry.Expected)
+		} else {
+			var actual map[string]Entry
+			observed, err = entryStatAt(roots.source, entry.CaptureName)
+			if err == nil {
+				actual, err = snapshotSubtreeAt(roots.source, entry.CaptureName)
+			}
+			if err == nil && !reflect.DeepEqual(actual, entry.ExpectedTree) {
+				err = errors.New("captured source tree identity mismatch")
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("source temporary is not transaction-owned: %w", err)
+		}
+		entry.CleanupPhase = CleanupPhaseQuarantineIntent
+		if err := writeManifestBound(*manifest, roots.tx); err != nil {
+			return err
+		}
+		if err := renameRelativeNoReplaceBound(roots.source, entry.CaptureName, roots.tx, entry.QuarantinePath, &observed); err != nil {
+			return err
+		}
+		quarantineExists = true
+	}
+	if entry.CleanupPhase == CleanupPhaseQuarantineIntent {
+		if !quarantineExists {
+			return errors.New("cleanup quarantine capture is missing")
+		}
+		if err := validateCleanupQuarantineBound(*entry, roots.tx); err != nil {
+			return fmt.Errorf("cleanup quarantine identity mismatch: %w", err)
+		}
+		entry.CleanupPhase = CleanupPhaseQuarantined
+		if err := writeManifestBound(*manifest, roots.tx); err != nil {
+			return err
+		}
+	}
+	if entry.CleanupPhase == CleanupPhaseQuarantined {
+		if quarantineExists {
+			if err := validateCleanupQuarantineBound(*entry, roots.tx); err != nil {
+				return fmt.Errorf("cleanup quarantine identity mismatch: %w", err)
+			}
+		}
+		if err := removePrivateRelativeBound(roots.tx, entry.QuarantinePath); err != nil {
+			return err
+		}
+		entry.CleanupPhase = CleanupPhaseRemoved
+		return writeManifestBound(*manifest, roots.tx)
+	}
+	return nil
+}
+
+func validateCleanupQuarantineBound(entry TransactionEntry, root *os.File) error {
+	if entry.Expected != nil {
+		return validateIdentityBound(root, entry.QuarantinePath, *entry.Expected)
+	}
+	actual, err := snapshotSubtreeAt(root, entry.QuarantinePath)
+	if err != nil || !reflect.DeepEqual(actual, entry.ExpectedTree) {
+		return errors.Join(err, errors.New("captured source tree identity mismatch"))
+	}
+	return nil
+}
+
+// CleanCommittedTransaction cleans only transaction-owned private material and
+// converts ownership ambiguity into a durable warning, never rollback.
+func CleanCommittedTransaction(manifest *TransactionManifest, transactionDir string) (*CleanupBlockedWarning, error) {
+	if manifest == nil {
+		return nil, errors.New("transaction manifest is nil")
+	}
+	if manifest.State == TransactionComplete {
+		return nil, nil
+	}
+	if manifest.State == TransactionCleanupBlocked {
+		issue := RecoveryIssue{}
+		if len(manifest.RecoveryIssues) != 0 {
+			issue = manifest.RecoveryIssues[0]
+		}
+		return &CleanupBlockedWarning{TransactionID: manifest.TransactionID, Paths: issue.Paths, RetainedPaths: issue.RetainedPaths}, nil
+	}
+	if manifest.State != TransactionCommitted && manifest.State != TransactionCleaning {
+		return nil, fmt.Errorf("cannot clean transaction in state %q", manifest.State)
+	}
+	manifest.State = TransactionCleaning
+	if err := writeManifestAtBoundDirectory(*manifest, transactionDir); err != nil {
+		return nil, err
+	}
+	for index := range manifest.Entries {
+		entry := &manifest.Entries[index]
+		if entry.CaptureName == "" {
+			if entry.CleanupPhase != CleanupPhaseRemoved {
+				entry.CleanupPhase = CleanupPhaseRemoved
+				if err := writeManifestAtBoundDirectory(*manifest, transactionDir); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if err := QuarantineSourceTemporary(manifest, index, transactionDir); err != nil {
+			warning := &CleanupBlockedWarning{TransactionID: manifest.TransactionID, Paths: []string{entry.Path}, RetainedPaths: []string{entry.CaptureName}}
+			manifest.State = TransactionCleanupBlocked
+			manifest.RecoveryIssues = []RecoveryIssue{{TransactionID: manifest.TransactionID, State: manifest.State, Message: err.Error(), Paths: warning.Paths, RetainedPaths: warning.RetainedPaths}}
+			if writeErr := writeManifestAtBoundDirectory(*manifest, transactionDir); writeErr != nil {
+				return nil, errors.Join(err, writeErr)
+			}
+			return warning, nil
+		}
+	}
+	manifest.State = TransactionComplete
+	manifest.RecoveryIssues = nil
+	if err := writeManifestAtBoundDirectory(*manifest, transactionDir); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
 // RecoverTransaction reverses every pre-commit state and leaves committed
 // transactions for the committed-cleanup path.
 func RecoverTransaction(manifest *TransactionManifest, transactionDir string) (RecoveryReport, error) {
@@ -540,8 +709,18 @@ func RecoverTransaction(manifest *TransactionManifest, transactionDir string) (R
 		return RecoveryReport{}, errors.New("transaction manifest is nil")
 	}
 	switch manifest.State {
-	case TransactionCommitted, TransactionCleaning, TransactionComplete, TransactionCleanupBlocked:
-		return RecoveryReport{Disposition: RecoveryUnchanged}, nil
+	case TransactionCommitted, TransactionCleaning:
+		warning, err := CleanCommittedTransaction(manifest, transactionDir)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		report := RecoveryReport{Disposition: RecoveryUnchanged}
+		if warning != nil {
+			report.Issues = append([]RecoveryIssue(nil), manifest.RecoveryIssues...)
+		}
+		return report, nil
+	case TransactionComplete, TransactionCleanupBlocked:
+		return RecoveryReport{Disposition: RecoveryUnchanged, Issues: append([]RecoveryIssue(nil), manifest.RecoveryIssues...)}, nil
 	case TransactionRolledBack:
 		return RecoveryReport{Disposition: RecoveryRolledBack}, nil
 	case TransactionRecoveryBlocked:

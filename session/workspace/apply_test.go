@@ -449,6 +449,42 @@ func (f cleanupFailOps) RemoveAll(path string) error {
 	return f.fileOps.RemoveAll(path)
 }
 
+func TestApplyCleanupBlockedReturnsSuccessWithTypedWarning(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	transactionAfterCommitHook = func() {
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
+		require.NoError(t, err)
+		manifest := readPersistedTransactionManifest(t, filepath.Dir(matches[0]))
+		entry := manifest.Entries[0]
+		require.NoError(t, os.Remove(filepath.Join(source, entry.CaptureName)))
+		writeApplyFile(t, source, entry.CaptureName, "external", 0o600)
+	}
+	t.Cleanup(func() { transactionAfterCommitHook = nil })
+
+	result, err := workspace.Apply()
+	require.NoError(t, err)
+	require.NotNil(t, result.Warning)
+	require.NotEmpty(t, result.TransactionID)
+	require.Equal(t, "after", mustReadFile(t, filepath.Join(source, "file")))
+}
+
+func TestAcknowledgeApplyRemovesOnlyCompleteTransaction(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	result, err := workspace.Apply()
+	require.NoError(t, err)
+	require.NoError(t, workspace.AcknowledgeApply(result.TransactionID))
+	require.NoDirExists(t, filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", result.TransactionID))
+	require.Error(t, workspace.AcknowledgeApply("not-complete"))
+}
+
 func TestApplyReportsCommittedCleanupFailure(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := t.TempDir()
@@ -482,7 +518,7 @@ func TestApplyCleanupFailureRemainsDiscoverableAfterManifestDeletion(t *testing.
 	manifestMatches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
 	require.NoError(t, globErr)
 	require.Len(t, manifestMatches, 1)
-	require.Equal(t, TransactionCommitted, readPersistedTransactionManifest(t, filepath.Dir(manifestMatches[0])).State)
+	require.Equal(t, TransactionComplete, readPersistedTransactionManifest(t, filepath.Dir(manifestMatches[0])).State)
 }
 
 func TestIncompleteTransactionDiscoveryDoesNotDelete(t *testing.T) {

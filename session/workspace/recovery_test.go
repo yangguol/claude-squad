@@ -930,6 +930,105 @@ func failedRecoveryTransaction(t *testing.T) (applyPlan, TransactionManifest, Sn
 	return plan, persisted, before
 }
 
+func TestCleanupCommittedTransactionNeverRollsBack(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	before := mustSnapshot(t, manifest.SourcePath)
+	for path := range before.Entries {
+		if strings.Contains(path, ".claude-squad-displaced-") {
+			delete(before.Entries, path)
+		}
+	}
+	warning, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Nil(t, warning)
+	require.Equal(t, before, mustSnapshot(t, manifest.SourcePath))
+	require.Equal(t, TransactionComplete, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestCleanupCapturesSourceTemporaryBeforeRecursiveRemoval(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })
+	entry := manifest.Entries[index]
+	sourceTemporary := filepath.Join(manifest.SourcePath, entry.CaptureName)
+	quarantine := filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.QuarantinePath))
+	require.FileExists(t, sourceTemporary)
+	transactionManifestWriteHook = func(state TransactionState) error {
+		if manifest.Entries[index].CleanupPhase == CleanupPhaseQuarantined {
+			transactionManifestWriteHook = nil
+			return errors.New("stop before private removal")
+		}
+		return nil
+	}
+	t.Cleanup(func() { transactionManifestWriteHook = nil })
+	require.Error(t, QuarantineSourceTemporary(&manifest, index, plan.TransactionDir))
+	require.NoFileExists(t, sourceTemporary)
+	require.FileExists(t, quarantine)
+}
+
+type sourceRemoveAllTrackingOps struct {
+	fileOps
+	source string
+	called bool
+}
+
+func (f *sourceRemoveAllTrackingOps) RemoveAll(path string) error {
+	if path == f.source || strings.HasPrefix(path, f.source+string(filepath.Separator)) {
+		f.called = true
+	}
+	return f.fileOps.RemoveAll(path)
+}
+
+func TestCleanupNeverRemoveAllsSourceNamespacePath(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	original := applyFS
+	tracking := &sourceRemoveAllTrackingOps{fileOps: original, source: manifest.SourcePath}
+	applyFS = tracking
+	t.Cleanup(func() { applyFS = original })
+	_, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.False(t, tracking.called)
+}
+
+func TestCleanupReplacementBecomesCleanupBlocked(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	require.NoError(t, os.Remove(filepath.Join(manifest.SourcePath, entry.CaptureName)))
+	writeApplyFile(t, manifest.SourcePath, entry.CaptureName, "external", 0o600)
+	warning, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.NotNil(t, warning)
+	require.Contains(t, warning.RetainedPaths, entry.CaptureName)
+	require.Equal(t, "external", mustReadFile(t, filepath.Join(manifest.SourcePath, entry.CaptureName)))
+	require.Equal(t, TransactionCleanupBlocked, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestCleaningRecoveryResumesIdempotently(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	manifest.State = TransactionCleaning
+	require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+	first, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Nil(t, first)
+	second, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Nil(t, second)
+}
+
+func TestCompleteTransactionRetainsMetadataUntilAcknowledged(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	warning, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Nil(t, warning)
+	require.FileExists(t, filepath.Join(plan.TransactionDir, "manifest.json"))
+	require.Equal(t, TransactionComplete, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
 func TestRecoveryPreparedTransactionRollsBack(t *testing.T) {
 	_, plan, manifest := preparedForwardTransaction(t)
 	before := mustSnapshot(t, manifest.SourcePath)
