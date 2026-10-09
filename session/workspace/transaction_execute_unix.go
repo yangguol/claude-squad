@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -111,6 +110,14 @@ func absentAt(root *os.File, relative string) (bool, error) {
 }
 
 func renameRelativeNoReplace(fromRoot *os.File, fromRelative string, toRoot *os.File, toRelative string) error {
+	return renameRelativeNoReplaceBound(fromRoot, fromRelative, toRoot, toRelative, nil)
+}
+
+// renameRelativeNoReplaceBound atomically captures the source at the private
+// destination, then proves that the inode moved was the one observed directly
+// before the rename. A racing replacement is retained at the destination and
+// reported instead of being consumed by later rollback work.
+func renameRelativeNoReplaceBound(fromRoot *os.File, fromRelative string, toRoot *os.File, toRelative string, expected *unix.Stat_t) error {
 	fromParent, fromLeaf, err := openRelativeParent(fromRoot, fromRelative)
 	if err != nil {
 		return err
@@ -121,8 +128,19 @@ func renameRelativeNoReplace(fromRoot *os.File, fromRelative string, toRoot *os.
 		return err
 	}
 	defer toParent.Close()
+	var before unix.Stat_t
+	if err := unix.Fstatat(int(fromParent.Fd()), fromLeaf, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if expected != nil && !sameOrphanIdentity(*expected, before) {
+		return errors.New("rename source changed before mutation")
+	}
 	if err := platformRenameatNoReplaceBetween(int(fromParent.Fd()), fromLeaf, int(toParent.Fd()), toLeaf); err != nil {
 		return err
+	}
+	var captured unix.Stat_t
+	if err := unix.Fstatat(int(toParent.Fd()), toLeaf, &captured, unix.AT_SYMLINK_NOFOLLOW); err != nil || !sameOrphanIdentity(before, captured) {
+		return errors.Join(err, errors.New("rename captured a different source inode"))
 	}
 	return errors.Join(fromParent.Sync(), toParent.Sync())
 }
@@ -222,61 +240,19 @@ func unlinkAt(directory *os.File, name string) error {
 	return unix.Unlinkat(int(directory.Fd()), name, 0)
 }
 
-func removeRelativeIdentity(root *os.File, relative string, expected Entry, device, inode uint64) error {
-	parent, leaf, err := openRelativeParent(root, relative)
+func validateIdentityStatBound(root *os.File, relative string, expected Entry) (unix.Stat_t, error) {
+	before, err := entryStatAt(root, relative)
 	if err != nil {
-		return err
+		return unix.Stat_t{}, err
 	}
-	defer parent.Close()
-	var before unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), leaf, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return err
+	if err := validateIdentityBound(root, relative, expected); err != nil {
+		return unix.Stat_t{}, err
 	}
-	if device != 0 {
-		if uint64(before.Dev) != device || uint64(before.Ino) != inode || before.Mode&unix.S_IFMT != unix.S_IFDIR {
-			return errors.New("created directory changed identity before removal")
-		}
-		fd, err := unix.Openat(int(parent.Fd()), leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return err
-		}
-		directory := os.NewFile(uintptr(fd), leaf)
-		entries, readErr := directory.ReadDir(-1)
-		var opened unix.Stat_t
-		statErr := unix.Fstat(fd, &opened)
-		closeErr := directory.Close()
-		var rebound unix.Stat_t
-		rebindErr := unix.Fstatat(int(parent.Fd()), leaf, &rebound, unix.AT_SYMLINK_NOFOLLOW)
-		if err := errors.Join(readErr, statErr, closeErr, rebindErr); err != nil {
-			return err
-		}
-		if len(entries) != 0 || !sameOrphanIdentity(before, opened) || !sameOrphanIdentity(before, rebound) {
-			return errors.New("created directory is non-empty or changed identity")
-		}
-		if err := unix.Unlinkat(int(parent.Fd()), leaf, unix.AT_REMOVEDIR); err != nil {
-			return err
-		}
-		return parent.Sync()
+	after, err := entryStatAt(root, relative)
+	if err != nil || !sameOrphanIdentity(before, after) {
+		return unix.Stat_t{}, errors.Join(err, errors.New("entry changed while binding identity"))
 	}
-	actual, exists, err := snapshotEntryAt(root, relative)
-	if err != nil || !exists {
-		return errors.Join(err, errors.New("rollback capture is absent"))
-	}
-	actual.Path = expected.Path
-	if expected.Type == EntrySymlink {
-		actual.Mode = expected.Mode
-	}
-	if !reflect.DeepEqual(actual, expected) {
-		return errors.New("rollback capture changed identity")
-	}
-	var rebound unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), leaf, &rebound, unix.AT_SYMLINK_NOFOLLOW); err != nil || !sameOrphanIdentity(before, rebound) {
-		return errors.Join(err, errors.New("rollback capture changed before removal"))
-	}
-	if err := unix.Unlinkat(int(parent.Fd()), leaf, 0); err != nil {
-		return err
-	}
-	return parent.Sync()
+	return after, nil
 }
 
 func readFileAt(directory *os.File, name string) ([]byte, error) {

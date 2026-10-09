@@ -1061,3 +1061,104 @@ func TestRollbackNeverRemovesSourceTemporaryByPathname(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "temporary occupant", mustReadFile(t, filepath.Join(manifest.SourcePath, entry.RollbackCaptureName)))
 }
+
+func TestRecoveryPendingCreateDoesNotClaimEqualExternalTarget(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "link" })
+	entry := manifest.Entries[index]
+	require.NoError(t, os.Symlink(entry.Result.SymlinkTarget, filepath.Join(manifest.SourcePath, entry.Path)))
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryBlocked, report.Disposition)
+	require.Equal(t, []string{entry.Path}, report.Issues[0].Paths)
+	require.Equal(t, []string{entry.Path, entry.StagePath}, report.Issues[0].RetainedPaths)
+	require.FileExists(t, filepath.Join(manifest.SourcePath, entry.Path))
+}
+
+func TestRecoveryBlockedReportSurvivesRestartExactly(t *testing.T) {
+	plan, manifest, _ := failedRecoveryTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	writeApplyFile(t, manifest.SourcePath, entry.Path, "external", 0o600)
+	first, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryBlocked, first.Disposition)
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	second, err := RecoverTransaction(&persisted, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+}
+
+func TestRecoveryRenameConflictBecomesDurablyBlocked(t *testing.T) {
+	plan, manifest, _ := failedRecoveryTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if action == "rollback-capture" && path == entry.Path {
+			writeApplyFile(t, manifest.SourcePath, entry.RollbackCaptureName, "external", 0o600)
+		}
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryBlocked, report.Disposition)
+	require.Equal(t, TransactionRecoveryBlocked, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.Equal(t, "external", mustReadFile(t, filepath.Join(manifest.SourcePath, entry.RollbackCaptureName)))
+}
+
+func TestRecoveryRollbackCaptureSourceReplacementIsPreserved(t *testing.T) {
+	plan, manifest, _ := failedRecoveryTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	var displaced string
+	transactionBeforeFilesystemHook = func(action, path string) {
+		if action != "rollback-capture" || path != entry.Path {
+			return
+		}
+		displaced = filepath.Join(manifest.SourcePath, "displaced-result")
+		require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, entry.Path), displaced))
+		writeApplyFile(t, manifest.SourcePath, entry.Path, "external", 0o600)
+	}
+	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryBlocked, report.Disposition)
+	require.Equal(t, "external", mustReadFile(t, filepath.Join(manifest.SourcePath, entry.Path)))
+	require.NoFileExists(t, filepath.Join(manifest.SourcePath, entry.RollbackCaptureName))
+	require.FileExists(t, displaced)
+}
+
+func TestRecoveryCreatedParentPublishIntentClassifiesStageOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		replaceStage bool
+		publish      bool
+		wantBlocked  bool
+	}{
+		{name: "owned at stage"},
+		{name: "owned at source", publish: true},
+		{name: "replacement at stage", replaceStage: true, wantBlocked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, plan, manifest := preparedForwardTransaction(t)
+			index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Operation == EntryOperationCreatedParent })
+			entry := &manifest.Entries[index]
+			require.NoError(t, os.Mkdir(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)), 0o755))
+			var stat unix.Stat_t
+			require.NoError(t, unix.Lstat(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)), &stat))
+			entry.CreatedDevice, entry.CreatedInode = uint64(stat.Dev), uint64(stat.Ino)
+			entry.Phase, manifest.State = EntryPhasePublishIntent, TransactionApplying
+			if test.publish {
+				require.NoError(t, os.Rename(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)), filepath.Join(manifest.SourcePath, entry.Path)))
+			}
+			if test.replaceStage {
+				require.NoError(t, os.Remove(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath))))
+				require.NoError(t, os.Mkdir(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)), 0o755))
+			}
+			require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+			report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+			require.NoError(t, err)
+			require.Equal(t, test.wantBlocked, report.Disposition == RecoveryBlocked)
+			if test.wantBlocked {
+				require.DirExists(t, filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)))
+			}
+		})
+	}
+}

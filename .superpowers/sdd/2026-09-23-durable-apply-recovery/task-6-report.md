@@ -62,3 +62,23 @@ Reviewed reverse ordering, intent-before-filesystem and filesystem-before-comple
 - Successful rollback intentionally retains the transaction directory and manifest for Task 7 cleanup.
 - `ApplyMetadataRepair` is included as the stable report field required by the interface; metadata repair remains Task 9.
 - Recovery-blocked lifecycle and project-lock integration remain Task 8.
+
+## Fix Round 1
+
+Addressed the independent review blockers with phase-constrained ownership inference, inode-bound rollback/restore mutations, private no-replace retention instead of pathname deletion, durable exact blocked reports, and explicit created-parent stage/source ownership reconciliation. Rollback observations now share the exported bound observer, operation-time no-replace conflicts transition durably to `recovery-blocked`, and external/replacement content is preserved.
+
+### RED
+
+- `go test ./session/workspace -run '^(TestRecoveryPendingCreate|TestRecoveryBlockedReport|TestRecoveryRenameConflict|TestRecoveryRollbackCaptureSourceReplacement|TestRecoveryCreatedParent)' -count=1` — failed as expected: pending equal-content create rolled back instead of blocking; blocked path sets disappeared after restart; operation-time conflicts/replacements rolled back instead of blocking; created-parent fixture exposed missing coverage.
+
+### GREEN
+
+- `go test ./session/workspace -run '^(TestRecoveryPendingCreate|TestRecoveryBlockedReport|TestRecoveryRenameConflict|TestRecoveryRollbackCaptureSourceReplacement|TestRecoveryCreatedParent)' -count=1` — pass, 13.509s
+- `go test ./session/workspace -run '^(TestRecovery|TestRollbackNever|TestApplyRollback)' -count=1` — pass, 46.389s
+- `go test ./session/workspace -count=1` — pass, 283.802s
+- `go test ./... -count=1` — pass; all repository packages, workspace 289.968s
+- `git diff --check` — pass
+
+### Remaining boundaries
+
+Successful rollback still leaves transaction metadata and privately retained published results for Task 7 cleanup. Project locking and blocked-lifecycle orchestration remain Task 8.

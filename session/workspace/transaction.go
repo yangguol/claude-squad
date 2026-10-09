@@ -84,6 +84,7 @@ type TransactionManifest struct {
 	AppliedAt      string             `json:"applied_at,omitempty"`
 	AppliedEntries map[string]Entry   `json:"applied_entries,omitempty"`
 	Entries        []TransactionEntry `json:"entries"`
+	RecoveryIssues []RecoveryIssue    `json:"recovery_issues,omitempty"`
 }
 
 func WriteManifestDurable(manifest TransactionManifest, transactionDir string) error {
