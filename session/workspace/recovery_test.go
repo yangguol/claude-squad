@@ -1169,6 +1169,60 @@ func TestCleanupBlockedReportsActualRetainedLocation(t *testing.T) {
 	})
 }
 
+func TestCleaningRecoverySyncsExistingPrivateCaptureBeforeCheckpoint(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })
+	entry := manifest.Entries[index]
+	manifest.State = TransactionCleaning
+	entry.CleanupPhase = CleanupPhaseQuarantined
+	manifest.Entries[index] = entry
+	require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+
+	quarantine := filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.QuarantinePath))
+	require.NoError(t, os.MkdirAll(filepath.Dir(quarantine), 0o700))
+	require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, entry.CaptureName), quarantine))
+	removing := filepath.Join(plan.TransactionDir, filepath.FromSlash(privateRemovingPath(entry.QuarantinePath)))
+	require.NoError(t, os.Rename(quarantine, removing))
+
+	parentSynced := false
+	cleanupAfterPrivateParentSyncHook = func(path string) error {
+		if path == entry.QuarantinePath {
+			parentSynced = true
+		}
+		return nil
+	}
+	cleanupAfterPrivateCaptureHook = func(path string) error {
+		if path != entry.QuarantinePath {
+			return nil
+		}
+		require.True(t, parentSynced, "existing private capture parent must be synced before checkpoint")
+		_, err := os.Lstat(removing)
+		require.NoError(t, err, "checkpoint must precede destructive removal")
+		return errors.New("simulated crash after recovered capture sync")
+	}
+	t.Cleanup(func() {
+		cleanupAfterPrivateParentSyncHook = nil
+		cleanupAfterPrivateCaptureHook = nil
+	})
+
+	err := QuarantineSourceTemporary(&manifest, index, plan.TransactionDir)
+	require.ErrorContains(t, err, "simulated crash")
+	require.True(t, parentSynced)
+	require.NoError(t, func() error { _, err := os.Lstat(removing); return err }())
+	reloaded, err := ReadManifestStrict(filepath.Dir(filepath.Dir(plan.TransactionDir)), plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, CleanupPhaseQuarantined, reloaded.Entries[index].CleanupPhase)
+
+	cleanupAfterPrivateParentSyncHook = nil
+	cleanupAfterPrivateCaptureHook = nil
+	warning, err := CleanCommittedTransaction(&reloaded, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Nil(t, warning)
+	require.NoFileExists(t, removing)
+	require.Equal(t, TransactionComplete, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
 func TestCommittedCleanupCrashPointsRecoverIdempotently(t *testing.T) {
 	points := []string{"intent-before-rename", "intent-after-rename", "quarantined-durable-before-removal", "private-capture-before-removal", "removal-before-removed", "final-complete-write"}
 	for _, point := range points {

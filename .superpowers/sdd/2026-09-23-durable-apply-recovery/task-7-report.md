@@ -163,3 +163,31 @@ PASS for all repository packages; workspace completed in 356.951s.
 PASS, no output.
 
 Durable manifest publication now completes the bound transaction-directory sync before exposing the post-publication checkpoint or allowing cleanup mutation. Private no-replace capture now syncs the affected parent directory before its crash checkpoint and before any recursive removal. Crash tests inject only at these true post-sync seams, strictly reload the manifest, and resume cleanup idempotently while retaining all existing identity and exact-path assertions.
+
+## Fix Round 4
+
+### RED
+
+`go test ./session/workspace -run '^TestCleaningRecoverySyncsExistingPrivateCaptureBeforeCheckpoint$' -count=1`
+
+Failed to compile as expected because no deterministic post-parent-sync seam existed. Inspection confirmed that an identity-validated existing `.removing-*` capture skipped its governing parent sync before the private-capture checkpoint and recursive deletion.
+
+### GREEN
+
+`go test ./session/workspace -run '^(TestApplyCleanupBlocked|TestCleanup|TestCommittedCleanup|TestCleaningRecovery|TestCompleteTransaction|TestAcknowledgeApply)' -count=1 -v`
+
+PASS (`ok claude-squad/session/workspace`, 56.114s).
+
+`go test ./session/workspace -count=1`
+
+PASS (`ok claude-squad/session/workspace`, 345.379s).
+
+`go test ./... -count=1`
+
+PASS for all repository packages; workspace completed in 358.763s.
+
+`git diff --check`
+
+PASS, no output.
+
+Every accepted private `.removing-*` identity now triggers a sync of its descriptor-bound governing parent before the checkpoint and any destructive recursion, whether the capture was freshly renamed or discovered during recovery. Deterministic coverage starts with the original quarantine path absent and the expected `.removing-*` entry present, asserts sync precedes both checkpoint and removal, simulates a crash at that checkpoint, strictly reloads the unchanged quarantined phase, and verifies cleanup resumes to `complete` without weakening identity or replacement checks.
