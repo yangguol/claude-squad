@@ -26,6 +26,11 @@ var transactionAfterManifestRenameHook func(TransactionState) error
 var transactionAfterCreatedParentMkdirHook func(string)
 var transactionAfterCreatedParentOpenHook func(string)
 var replacementScanAfterRootReadHook func()
+var cleanupAfterSourceQuarantineHook func(string)
+var cleanupAfterQuarantineValidationHook func(string)
+var cleanupAfterPrivateCaptureHook func(string)
+var cleanupAfterPrivateRemovalHook func(string)
+var acknowledgeAfterValidationHook func()
 
 // CleanupBlockedWarning reports committed apply material that could not be
 // proven transaction-owned. The apply itself remains successful.
@@ -610,6 +615,9 @@ func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex in
 		if err := renameRelativeNoReplaceBound(roots.source, entry.CaptureName, roots.tx, entry.QuarantinePath, &observed); err != nil {
 			return err
 		}
+		if cleanupAfterSourceQuarantineHook != nil {
+			cleanupAfterSourceQuarantineHook(entry.QuarantinePath)
+		}
 		quarantineExists = true
 	}
 	if entry.CleanupPhase == CleanupPhaseQuarantineIntent {
@@ -625,12 +633,37 @@ func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex in
 		}
 	}
 	if entry.CleanupPhase == CleanupPhaseQuarantined {
-		if quarantineExists {
-			if err := validateCleanupQuarantineBound(*entry, roots.tx); err != nil {
-				return fmt.Errorf("cleanup quarantine identity mismatch: %w", err)
+		if !quarantineExists {
+			removing := privateRemovingPath(entry.QuarantinePath)
+			identity, err := entryStatAt(roots.tx, removing)
+			if errors.Is(err, os.ErrNotExist) {
+				entry.CleanupPhase = CleanupPhaseRemoved
+				return writeManifestBound(*manifest, roots.tx)
 			}
+			if err != nil {
+				return err
+			}
+			if err := validateCleanupPathBound(*entry, roots.tx, removing); err != nil {
+				return fmt.Errorf("private cleanup capture identity mismatch: %w", err)
+			}
+			if err := removePrivateRelativeBound(roots.tx, entry.QuarantinePath, identity, true); err != nil {
+				return err
+			}
+			entry.CleanupPhase = CleanupPhaseRemoved
+			return writeManifestBound(*manifest, roots.tx)
 		}
-		if err := removePrivateRelativeBound(roots.tx, entry.QuarantinePath); err != nil {
+		identity, err := entryStatAt(roots.tx, entry.QuarantinePath)
+		if err != nil {
+			return err
+		}
+		if err := validateCleanupQuarantineBound(*entry, roots.tx); err != nil {
+			return fmt.Errorf("cleanup quarantine identity mismatch: %w", err)
+		}
+		validated, err := entryStatAt(roots.tx, entry.QuarantinePath)
+		if err != nil || !sameOrphanIdentity(identity, validated) {
+			return errors.Join(err, errors.New("cleanup quarantine changed while validating"))
+		}
+		if err := removePrivateRelativeBound(roots.tx, entry.QuarantinePath, validated, false); err != nil {
 			return err
 		}
 		entry.CleanupPhase = CleanupPhaseRemoved
@@ -639,11 +672,34 @@ func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex in
 	return nil
 }
 
-func validateCleanupQuarantineBound(entry TransactionEntry, root *os.File) error {
-	if entry.Expected != nil {
-		return validateIdentityBound(root, entry.QuarantinePath, *entry.Expected)
+func cleanupRetainedPaths(manifest TransactionManifest, entry TransactionEntry, transactionDir string) []string {
+	retained := make([]string, 0, 2)
+	if entry.CleanupPhase == CleanupPhasePending || entry.CleanupPhase == CleanupPhaseQuarantineIntent {
+		if _, err := os.Lstat(filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.CaptureName))); err == nil {
+			retained = append(retained, entry.CaptureName)
+		}
 	}
-	actual, err := snapshotSubtreeAt(root, entry.QuarantinePath)
+	if _, err := os.Lstat(filepath.Join(transactionDir, filepath.FromSlash(entry.QuarantinePath))); err == nil {
+		retained = append(retained, entry.QuarantinePath)
+	}
+	removing := privateRemovingPath(entry.QuarantinePath)
+	if _, err := os.Lstat(filepath.Join(transactionDir, filepath.FromSlash(removing))); err == nil {
+		retained = append(retained, removing)
+	}
+	return retained
+}
+
+func validateCleanupQuarantineBound(entry TransactionEntry, root *os.File) error {
+	return validateCleanupPathBound(entry, root, entry.QuarantinePath)
+}
+
+func validateCleanupPathBound(entry TransactionEntry, root *os.File, relative string) error {
+	if entry.Expected != nil {
+		expected := *entry.Expected
+		expected.Path = relative
+		return validateIdentityBound(root, relative, expected)
+	}
+	actual, err := snapshotSubtreeAt(root, relative)
 	if err != nil || !reflect.DeepEqual(actual, entry.ExpectedTree) {
 		return errors.Join(err, errors.New("captured source tree identity mismatch"))
 	}
@@ -685,7 +741,8 @@ func CleanCommittedTransaction(manifest *TransactionManifest, transactionDir str
 			continue
 		}
 		if err := QuarantineSourceTemporary(manifest, index, transactionDir); err != nil {
-			warning := &CleanupBlockedWarning{TransactionID: manifest.TransactionID, Paths: []string{entry.Path}, RetainedPaths: []string{entry.CaptureName}}
+			retained := cleanupRetainedPaths(*manifest, *entry, transactionDir)
+			warning := &CleanupBlockedWarning{TransactionID: manifest.TransactionID, Paths: []string{entry.Path}, RetainedPaths: retained}
 			manifest.State = TransactionCleanupBlocked
 			manifest.RecoveryIssues = []RecoveryIssue{{TransactionID: manifest.TransactionID, State: manifest.State, Message: err.Error(), Paths: warning.Paths, RetainedPaths: warning.RetainedPaths}}
 			if writeErr := writeManifestAtBoundDirectory(*manifest, transactionDir); writeErr != nil {

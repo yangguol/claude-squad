@@ -226,14 +226,7 @@ func (w *shadowWorkspace) AcknowledgeApply(transactionID string) error {
 	}
 	projectPath := filepath.Dir(w.data.RepoPath)
 	transactionDir := filepath.Join(projectPath, "transactions", transactionID)
-	manifest, err := ReadManifestStrict(projectPath, transactionDir)
-	if err != nil {
-		return err
-	}
-	if manifest.TransactionID != transactionID || manifest.State != TransactionComplete {
-		return errors.New("only a complete transaction may be acknowledged")
-	}
-	return removeCompleteTransaction(projectPath, transactionID)
+	return acknowledgeCompleteTransaction(projectPath, transactionDir, transactionID)
 }
 
 func preflightNoReplace(transaction Transaction) error {

@@ -485,6 +485,41 @@ func TestAcknowledgeApplyRemovesOnlyCompleteTransaction(t *testing.T) {
 	require.Error(t, workspace.AcknowledgeApply("not-complete"))
 }
 
+func TestAcknowledgeApplyPreservesReplacementAfterValidation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	writeApplyFile(t, source, "file", "before", 0o644)
+	workspace := newApplyWorkspace(t, source)
+	writeApplyFile(t, workspace.WorkDir(), "file", "after", 0o644)
+	result, err := workspace.Apply()
+	require.NoError(t, err)
+	transactionDir := filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", result.TransactionID)
+	retained := transactionDir + "-validated"
+	acknowledgeAfterValidationHook = func() {
+		acknowledgeAfterValidationHook = nil
+		require.NoError(t, os.Rename(transactionDir, retained))
+		require.NoError(t, os.Mkdir(transactionDir, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(transactionDir, "replacement"), []byte("keep"), 0o600))
+	}
+	t.Cleanup(func() { acknowledgeAfterValidationHook = nil })
+	require.Error(t, workspace.AcknowledgeApply(result.TransactionID))
+	require.FileExists(t, filepath.Join(transactionDir, "replacement"))
+	require.FileExists(t, filepath.Join(retained, "manifest.json"))
+}
+
+func TestAcknowledgeApplyRejectsExistingNonCompleteTransaction(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	workspace := newApplyWorkspace(t, source)
+	projectPath := filepath.Dir(workspace.data.RepoPath)
+	transactionDir := filepath.Join(projectPath, "transactions", "pending")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "pending", ProjectID: workspace.data.ProjectID, SessionID: workspace.data.SessionID, SourcePath: source, State: TransactionPrepared, Entries: []TransactionEntry{}}
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+	require.Error(t, workspace.AcknowledgeApply("pending"))
+	require.FileExists(t, filepath.Join(transactionDir, "manifest.json"))
+}
+
 func TestApplyReportsCommittedCleanupFailure(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := t.TempDir()

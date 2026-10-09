@@ -295,6 +295,59 @@ func removeOrphanDirectoryContents(directory *os.File) error {
 	return nil
 }
 
+func acknowledgeCompleteTransaction(projectPath, transactionDir, transactionID string) error {
+	rootPath := filepath.Join(projectPath, "transactions")
+	root, err := platformOpenTrustedDirectory(rootPath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	directory, identity, err := openOrphanDirectoryAt(root, transactionID)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	manifest, err := readManifestBoundStrict(directory)
+	if err != nil {
+		return err
+	}
+	if err := ValidateManifest(projectPath, transactionDir, manifest); err != nil {
+		return err
+	}
+	if manifest.TransactionID != transactionID || manifest.State != TransactionComplete {
+		return errors.New("only a complete transaction may be acknowledged")
+	}
+	if acknowledgeAfterValidationHook != nil {
+		acknowledgeAfterValidationHook()
+	}
+	if err := verifyOrphanDirectoryEntry(root, transactionID, identity); err != nil {
+		return errors.New("complete transaction changed after validation")
+	}
+	quarantine, err := randomProbeName(".acknowledge-")
+	if err != nil {
+		return err
+	}
+	if err := platformAtomicRenameNoReplace(int(root.Fd()), transactionID, quarantine); err != nil {
+		return err
+	}
+	if err := verifyOrphanDirectoryEntry(root, quarantine, identity); err != nil {
+		return errors.New("acknowledgement captured a different transaction")
+	}
+	if err := removeOrphanDirectoryContents(directory); err != nil {
+		return err
+	}
+	if err := directory.Close(); err != nil {
+		return err
+	}
+	if err := verifyOrphanDirectoryEntry(root, quarantine, identity); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(int(root.Fd()), quarantine, unix.AT_REMOVEDIR); err != nil {
+		return err
+	}
+	return root.Sync()
+}
+
 func removeCompleteTransaction(projectPath, transactionID string) error {
 	rootPath := filepath.Join(projectPath, "transactions")
 	root, err := platformOpenTrustedDirectory(rootPath)

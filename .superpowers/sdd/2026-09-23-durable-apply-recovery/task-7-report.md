@@ -69,3 +69,41 @@ Implementation commit: `feat(workspace): quarantine committed apply cleanup` (SH
 ## Concerns
 
 The descriptor-relative implementation is supported on the repository's current Darwin/Linux build targets, consistent with the existing v2 transaction executor. Task 8 still needs to consume recovery/cleanup-blocked lifecycle state under the project lock.
+
+## Fix Round 1
+
+### RED
+
+```bash
+go test ./session/workspace -run '^(TestCleanupQuarantineReplacementAfterValidationIsPreserved|TestCleanupBlockedReportsActualRetainedLocation|TestAcknowledgeApplyPreservesReplacementAfterValidation|TestAcknowledgeApplyRejectsExistingNonCompleteTransaction)$' -count=1
+```
+
+Failed deterministically: regular, symlink, and directory replacements at a validated quarantine name were deleted; a replacement transaction directory was acknowledged; and quarantine-occupant warnings omitted the private retained path.
+
+### GREEN
+
+```bash
+go test ./session/workspace -run '^(TestApplyCleanupBlocked|TestCleanup|TestCommittedCleanup|TestCleaningRecovery|TestCompleteTransaction|TestAcknowledgeApply)' -count=1
+```
+
+PASS (`ok claude-squad/session/workspace`, 50.134s).
+
+```bash
+go test ./session/workspace -count=1
+```
+
+PASS (`ok claude-squad/session/workspace`, 345.206s).
+
+```bash
+go test ./... -count=1
+```
+
+PASS for all repository packages; workspace completed in 346.912s.
+
+```bash
+git diff --check
+```
+
+PASS, no output.
+
+Private cleanup now atomically recaptures the validated inode under a descriptor-owned removing name before recursive deletion and rechecks identity across every name-based mutation. Acknowledgement reads and validates the complete receipt through the retained transaction descriptor, verifies the original binding, atomically captures it under a private root name, and only removes that captured inode. Cleanup-blocked receipts record every actual retained capture and/or quarantine path and reproduce the same typed warning after strict reload. Crash tests cover intent before/after rename, quarantined before removal, removal before durable removed, and final complete persistence.

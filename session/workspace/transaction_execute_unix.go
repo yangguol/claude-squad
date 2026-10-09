@@ -258,24 +258,42 @@ func ensurePrivateParentBound(root *os.File, relative string) error {
 	return root.Sync()
 }
 
-func removePrivateRelativeBound(root *os.File, relative string) error {
+func privateRemovingPath(relative string) string {
+	return filepath.ToSlash(filepath.Join(filepath.Dir(filepath.FromSlash(relative)), ".removing-"+filepath.Base(filepath.FromSlash(relative))))
+}
+
+func removePrivateRelativeBound(root *os.File, relative string, expected unix.Stat_t, alreadyCaptured bool) error {
 	parent, leaf, err := openRelativeParent(root, relative)
 	if err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return nil
-		}
 		return err
 	}
 	defer parent.Close()
-	stat, err := orphanEntryInfoAt(parent, leaf)
-	if errors.Is(err, unix.ENOENT) {
-		return nil
+	removing := ".removing-" + leaf
+	if !alreadyCaptured {
+		stat, err := orphanEntryInfoAt(parent, leaf)
+		if err != nil || !sameOrphanIdentity(expected, stat) {
+			return errors.Join(err, errors.New("private cleanup entry changed before capture"))
+		}
+		if cleanupAfterQuarantineValidationHook != nil {
+			cleanupAfterQuarantineValidationHook(relative)
+		}
+		current, err := orphanEntryInfoAt(parent, leaf)
+		if err != nil || !sameOrphanIdentity(expected, current) {
+			return errors.Join(err, errors.New("private cleanup entry changed before capture"))
+		}
+		if err := platformRenameatNoReplaceBetween(int(parent.Fd()), leaf, int(parent.Fd()), removing); err != nil {
+			return err
+		}
 	}
-	if err != nil {
-		return err
+	captured, err := orphanEntryInfoAt(parent, removing)
+	if err != nil || !sameOrphanIdentity(expected, captured) {
+		return errors.Join(err, errors.New("private cleanup captured a different inode"))
 	}
-	if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
-		directory, opened, err := openOrphanDirectoryAt(parent, leaf)
+	if cleanupAfterPrivateCaptureHook != nil {
+		cleanupAfterPrivateCaptureHook(relative)
+	}
+	if captured.Mode&unix.S_IFMT == unix.S_IFDIR {
+		directory, opened, err := openOrphanDirectoryAt(parent, removing)
 		if err != nil {
 			return err
 		}
@@ -286,14 +304,23 @@ func removePrivateRelativeBound(root *os.File, relative string) error {
 		if err := directory.Close(); err != nil {
 			return err
 		}
-		if err := verifyOrphanDirectoryEntry(parent, leaf, opened); err != nil {
+		if err := verifyOrphanDirectoryEntry(parent, removing, opened); err != nil {
 			return err
 		}
-		if err := unix.Unlinkat(int(parent.Fd()), leaf, unix.AT_REMOVEDIR); err != nil {
+		if err := unix.Unlinkat(int(parent.Fd()), removing, unix.AT_REMOVEDIR); err != nil {
 			return err
 		}
-	} else if err := unix.Unlinkat(int(parent.Fd()), leaf, 0); err != nil {
-		return err
+	} else {
+		current, err := orphanEntryInfoAt(parent, removing)
+		if err != nil || !sameOrphanIdentity(expected, current) {
+			return errors.Join(err, errors.New("private cleanup capture changed before unlink"))
+		}
+		if err := unix.Unlinkat(int(parent.Fd()), removing, 0); err != nil {
+			return err
+		}
+	}
+	if cleanupAfterPrivateRemovalHook != nil {
+		cleanupAfterPrivateRemovalHook(relative)
 	}
 	return parent.Sync()
 }

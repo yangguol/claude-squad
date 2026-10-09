@@ -1006,6 +1006,149 @@ func TestCleanupReplacementBecomesCleanupBlocked(t *testing.T) {
 	require.Equal(t, TransactionCleanupBlocked, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
+func TestCleanupQuarantineReplacementAfterValidationIsPreserved(t *testing.T) {
+	for _, kind := range []string{"regular", "symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			_, plan, manifest := preparedForwardTransaction(t)
+			require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+			index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })
+			entry := manifest.Entries[index]
+			quarantine := filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.QuarantinePath))
+			cleanupAfterQuarantineValidationHook = func(path string) {
+				if path != entry.QuarantinePath {
+					return
+				}
+				cleanupAfterQuarantineValidationHook = nil
+				require.NoError(t, os.Remove(quarantine))
+				switch kind {
+				case "regular":
+					require.NoError(t, os.WriteFile(quarantine, []byte("external"), 0o600))
+				case "symlink":
+					require.NoError(t, os.Symlink("external-target", quarantine))
+				case "directory":
+					require.NoError(t, os.Mkdir(quarantine, 0o700))
+					require.NoError(t, os.WriteFile(filepath.Join(quarantine, "external"), []byte("keep"), 0o600))
+				}
+			}
+			t.Cleanup(func() { cleanupAfterQuarantineValidationHook = nil })
+			warning, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+			require.NoError(t, err)
+			require.NotNil(t, warning)
+			require.Equal(t, []string{entry.QuarantinePath}, warning.RetainedPaths)
+			require.Equal(t, TransactionCleanupBlocked, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+			_, err = os.Lstat(quarantine)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestCleanupBlockedReportsActualRetainedLocation(t *testing.T) {
+	t.Run("capture never occurred", func(t *testing.T) {
+		_, plan, manifest := preparedForwardTransaction(t)
+		require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+		entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+		require.NoError(t, os.Remove(filepath.Join(manifest.SourcePath, entry.CaptureName)))
+		writeApplyFile(t, manifest.SourcePath, entry.CaptureName, "external", 0o600)
+		warning, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+		require.NoError(t, err)
+		require.Equal(t, []string{entry.CaptureName}, warning.RetainedPaths)
+	})
+	t.Run("quarantine occupant", func(t *testing.T) {
+		_, plan, manifest := preparedForwardTransaction(t)
+		require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+		entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+		quarantine := filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.QuarantinePath))
+		require.NoError(t, os.MkdirAll(filepath.Dir(quarantine), 0o700))
+		require.NoError(t, os.WriteFile(quarantine, []byte("occupant"), 0o600))
+		warning, err := CleanCommittedTransaction(&manifest, plan.TransactionDir)
+		require.NoError(t, err)
+		require.Equal(t, []string{entry.CaptureName, entry.QuarantinePath}, warning.RetainedPaths)
+		persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+		require.Equal(t, warning.RetainedPaths, persisted.RecoveryIssues[0].RetainedPaths)
+		reloaded, err := ReadManifestStrict(filepath.Dir(filepath.Dir(plan.TransactionDir)), plan.TransactionDir)
+		require.NoError(t, err)
+		recovered, err := CleanCommittedTransaction(&reloaded, plan.TransactionDir)
+		require.NoError(t, err)
+		require.Equal(t, warning, recovered)
+	})
+}
+
+func TestCommittedCleanupCrashPointsRecoverIdempotently(t *testing.T) {
+	points := []string{"intent-before-rename", "intent-after-rename", "quarantined-before-removal", "removal-before-removed", "final-complete-write"}
+	for _, point := range points {
+		t.Run(point, func(t *testing.T) {
+			_, plan, manifest := preparedForwardTransaction(t)
+			require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+			index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })
+			entry := manifest.Entries[index]
+			crash := "simulated cleanup crash"
+			manifest.State = TransactionCleaning
+			require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+			switch point {
+			case "intent-before-rename":
+				transactionManifestWriteHook = func(state TransactionState) error {
+					if manifest.Entries[index].CleanupPhase == CleanupPhaseQuarantineIntent {
+						transactionManifestWriteHook = nil
+						return errors.New(crash)
+					}
+					return nil
+				}
+			case "intent-after-rename":
+				cleanupAfterSourceQuarantineHook = func(path string) {
+					if path == entry.QuarantinePath {
+						cleanupAfterSourceQuarantineHook = nil
+						transactionManifestWriteHook = func(TransactionState) error { transactionManifestWriteHook = nil; return errors.New(crash) }
+					}
+				}
+			case "quarantined-before-removal":
+				transactionManifestWriteHook = func(state TransactionState) error {
+					if manifest.Entries[index].CleanupPhase == CleanupPhaseQuarantined {
+						transactionManifestWriteHook = nil
+						return errors.New(crash)
+					}
+					return nil
+				}
+			case "removal-before-removed":
+				cleanupAfterPrivateRemovalHook = func(path string) {
+					if path == entry.QuarantinePath {
+						cleanupAfterPrivateRemovalHook = nil
+						transactionManifestWriteHook = func(TransactionState) error { transactionManifestWriteHook = nil; return errors.New(crash) }
+					}
+				}
+			case "final-complete-write":
+				transactionManifestWriteHook = func(state TransactionState) error {
+					if state == TransactionComplete {
+						transactionManifestWriteHook = nil
+						return errors.New(crash)
+					}
+					return nil
+				}
+			}
+			t.Cleanup(func() {
+				transactionManifestWriteHook = nil
+				cleanupAfterSourceQuarantineHook = nil
+				cleanupAfterPrivateRemovalHook = nil
+			})
+			var err error
+			if point == "final-complete-write" {
+				_, err = CleanCommittedTransaction(&manifest, plan.TransactionDir)
+			} else {
+				err = QuarantineSourceTemporary(&manifest, index, plan.TransactionDir)
+			}
+			require.Error(t, err)
+			persisted, err := ReadManifestStrict(filepath.Dir(filepath.Dir(plan.TransactionDir)), plan.TransactionDir)
+			require.NoError(t, err)
+			warning, err := CleanCommittedTransaction(&persisted, plan.TransactionDir)
+			require.NoError(t, err)
+			require.Nil(t, warning)
+			require.Equal(t, TransactionComplete, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+			report, err := RecoverTransaction(&persisted, plan.TransactionDir)
+			require.NoError(t, err)
+			require.Equal(t, RecoveryUnchanged, report.Disposition)
+		})
+	}
+}
+
 func TestCleaningRecoveryResumesIdempotently(t *testing.T) {
 	_, plan, manifest := preparedForwardTransaction(t)
 	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
