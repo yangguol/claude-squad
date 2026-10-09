@@ -23,6 +23,7 @@ var transactionBeforeCommitHook func() error
 var transactionAfterCommitHook func()
 var transactionManifestWriteHook func(TransactionState) error
 var transactionAfterManifestRenameHook func(TransactionState) error
+var transactionAfterManifestSyncHook func(TransactionState) error
 var transactionAfterCreatedParentMkdirHook func(string)
 var transactionAfterCreatedParentOpenHook func(string)
 var replacementScanAfterRootReadHook func()
@@ -490,7 +491,15 @@ func writeManifestBound(manifest TransactionManifest, directory *os.File) error 
 			return err
 		}
 	}
-	return directory.Sync()
+	if err := directory.Sync(); err != nil {
+		return err
+	}
+	if transactionAfterManifestSyncHook != nil {
+		if err := transactionAfterManifestSyncHook(manifest.State); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ObserveEntryState snapshots every predeclared location through bound roots.

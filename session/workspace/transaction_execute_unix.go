@@ -289,6 +289,11 @@ func removePrivateRelativeBound(root *os.File, relative string, expected unix.St
 	if err != nil || !sameOrphanIdentity(expected, captured) {
 		return errors.Join(err, errors.New("private cleanup captured a different inode"))
 	}
+	if !alreadyCaptured {
+		if err := parent.Sync(); err != nil {
+			return err
+		}
+	}
 	if cleanupAfterPrivateCaptureHook != nil {
 		if err := cleanupAfterPrivateCaptureHook(relative); err != nil {
 			return err

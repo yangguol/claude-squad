@@ -135,3 +135,31 @@ PASS for all repository packages; workspace completed in 355.684s.
 PASS, no output.
 
 Private directory recursion now begins only after the opened directory descriptor's device/inode matches the expected captured identity. Deterministic post-private-capture replacement tests cover regular files, symlinks, and directories; replacements survive and Apply-level reconciliation durably records exact quarantine and `.removing-*` paths. Crash coverage now interrupts after the `quarantined` manifest rename has succeeded and after private capture, then strictly reloads and safely resumes. Source-safety coverage exercises descriptor-relative private cleanup and proves published results and unrelated source entries remain untouched.
+
+## Fix Round 3
+
+### RED
+
+`go test ./session/workspace -run '^TestCommittedCleanupCrashPointsRecoverIdempotently$' -count=1`
+
+Failed to compile after moving the quarantined crash injection to a post-sync hook because no post-transaction-directory-sync seam existed. Inspection also confirmed private capture invoked its checkpoint immediately after rename without first syncing the affected parent directory.
+
+### GREEN
+
+`go test ./session/workspace -run '^(TestApplyCleanupBlocked|TestCleanup|TestCommittedCleanup|TestCleaningRecovery|TestCompleteTransaction|TestAcknowledgeApply)' -count=1 -v`
+
+PASS (`ok claude-squad/session/workspace`, 54.427s).
+
+`go test ./session/workspace -count=1`
+
+PASS (`ok claude-squad/session/workspace`, 349.022s).
+
+`go test ./... -count=1`
+
+PASS for all repository packages; workspace completed in 356.951s.
+
+`git diff --check`
+
+PASS, no output.
+
+Durable manifest publication now completes the bound transaction-directory sync before exposing the post-publication checkpoint or allowing cleanup mutation. Private no-replace capture now syncs the affected parent directory before its crash checkpoint and before any recursive removal. Crash tests inject only at these true post-sync seams, strictly reload the manifest, and resume cleanup idempotently while retaining all existing identity and exact-path assertions.

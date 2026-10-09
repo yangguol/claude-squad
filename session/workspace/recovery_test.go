@@ -1197,9 +1197,9 @@ func TestCommittedCleanupCrashPointsRecoverIdempotently(t *testing.T) {
 					}
 				}
 			case "quarantined-durable-before-removal":
-				transactionAfterManifestRenameHook = func(state TransactionState) error {
+				transactionAfterManifestSyncHook = func(state TransactionState) error {
 					if manifest.Entries[index].CleanupPhase == CleanupPhaseQuarantined {
-						transactionAfterManifestRenameHook = nil
+						transactionAfterManifestSyncHook = nil
 						return errors.New(crash)
 					}
 					return nil
@@ -1231,6 +1231,7 @@ func TestCommittedCleanupCrashPointsRecoverIdempotently(t *testing.T) {
 			t.Cleanup(func() {
 				transactionManifestWriteHook = nil
 				transactionAfterManifestRenameHook = nil
+				transactionAfterManifestSyncHook = nil
 				cleanupAfterSourceQuarantineHook = nil
 				cleanupAfterPrivateCaptureHook = nil
 				cleanupAfterPrivateRemovalHook = nil
