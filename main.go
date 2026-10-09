@@ -88,14 +88,16 @@ var (
 			if err != nil {
 				return fmt.Errorf("failed to initialize storage: %w", err)
 			}
-			return resetAll(
-				workspace.ValidateStoredShadowReferences,
-				storage.DeleteAllInstances,
-				func() error { return tmux.CleanupSessions(cmd2.MakeExecutor()) },
-				git.CleanupWorktrees,
-				workspace.CleanupShadowProjects,
-				daemon.StopDaemon,
-			)
+			return workspace.WithResetPreflight(func() error {
+				return resetAll(
+					func() error { return nil },
+					storage.DeleteAllInstances,
+					func() error { return tmux.CleanupSessions(cmd2.MakeExecutor()) },
+					git.CleanupWorktrees,
+					workspace.CleanupShadowProjects,
+					daemon.StopDaemon,
+				)
+			})
 		},
 	}
 

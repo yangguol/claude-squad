@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -729,6 +730,72 @@ func ValidateStoredShadowReferences() error {
 	}
 	_, err = storedShadowProjectReferences(root)
 	return err
+}
+
+var resetProjectLockedHook func(string)
+
+// WithResetPreflight validates stored references, locks every shadow project in
+// canonical path order, recovers safe transactions, and keeps the locks held
+// while run performs destructive reset cleanup.
+func WithResetPreflight(run func() error) (returnErr error) {
+	root, err := shadowRoot()
+	if err != nil {
+		return err
+	}
+	if _, err := storedShadowProjectReferences(root); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("read shadow project root: %w", err)
+	}
+	projects := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name() == ".locks" {
+			continue
+		}
+		projectPath := filepath.Join(root, entry.Name())
+		if err := validateShadowProjectCandidate(root, projectPath, entry); err != nil {
+			return err
+		}
+		projects = append(projects, projectPath)
+	}
+	sort.Strings(projects)
+
+	locks := make([]*ProjectLock, 0, len(projects))
+	defer func() {
+		for index := len(locks) - 1; index >= 0; index-- {
+			returnErr = errors.Join(returnErr, locks[index].Close())
+		}
+	}()
+	for _, projectPath := range projects {
+		lock, err := AcquireProjectLock(projectPath, "reset")
+		if err != nil {
+			return err
+		}
+		locks = append(locks, lock)
+		if resetProjectLockedHook != nil {
+			resetProjectLockedHook(projectPath)
+		}
+	}
+	for _, projectPath := range projects {
+		metadata, err := readProjectMetadata(projectPath)
+		if err != nil {
+			return fmt.Errorf("validate shadow project %q: %w", filepath.Base(projectPath), err)
+		}
+		if err := validateCleanupMetadata(metadata, filepath.Base(projectPath)); err != nil {
+			return err
+		}
+		report, err := recoverProjectLocked(projectPath, nil)
+		if err != nil {
+			return fmt.Errorf("recover shadow project %q: %w", filepath.Base(projectPath), err)
+		}
+		access := accessStateFromReport(report)
+		if access.ReadOnly {
+			return fmt.Errorf("shadow project %q requires explicit recovery: %s", filepath.Base(projectPath), access.Message)
+		}
+	}
+	return run()
 }
 
 // CleanupShadowProjects removes validated shadow projects that are not referenced

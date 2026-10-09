@@ -6,12 +6,119 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestResetHoldsProjectLockAcrossStorageAndShadowCleanup(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	projectPath := filepath.Dir(ws.data.RepoPath)
+	var callbacks int
+
+	err := WithResetPreflight(func() error {
+		for range 2 {
+			_, lockErr := AcquireProjectLock(projectPath, "reset probe")
+			var busy *OperationInProgressError
+			require.ErrorAs(t, lockErr, &busy)
+			callbacks++
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, callbacks)
+	lock, err := AcquireProjectLock(projectPath, "after reset")
+	require.NoError(t, err)
+	require.NoError(t, lock.Close())
+}
+
+func TestResetLockContentionPreservesStorageAndProjects(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	projectPath := filepath.Dir(ws.data.RepoPath)
+	lock, err := AcquireProjectLock(projectPath, "concurrent operation")
+	require.NoError(t, err)
+	defer lock.Close()
+	mutated := false
+
+	err = WithResetPreflight(func() error { mutated = true; return nil })
+	var busy *OperationInProgressError
+	require.ErrorAs(t, err, &busy)
+	require.False(t, mutated)
+	require.DirExists(t, projectPath)
+}
+
+func TestResetPreservesRecoveryBlockedTransaction(t *testing.T) {
+	testResetPreservesBlockedTransaction(t, TransactionRecoveryBlocked)
+}
+
+func TestResetPreservesCleanupBlockedTransaction(t *testing.T) {
+	testResetPreservesBlockedTransaction(t, TransactionCleanupBlocked)
+}
+
+func testResetPreservesBlockedTransaction(t *testing.T, state TransactionState) {
+	t.Helper()
+	ws := lifecycleWorkspace(t)
+	projectPath := filepath.Dir(ws.data.RepoPath)
+	transactionDir := filepath.Join(projectPath, "transactions", "blocked")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "blocked", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: state, Entries: []TransactionEntry{}, RecoveryIssues: []RecoveryIssue{{TransactionID: "blocked", State: state, Message: "manual recovery required"}}}
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+	mutated := false
+
+	err := WithResetPreflight(func() error { mutated = true; return nil })
+	require.ErrorContains(t, err, "manual recovery required")
+	require.False(t, mutated)
+	require.DirExists(t, projectPath)
+	require.FileExists(t, filepath.Join(transactionDir, "manifest.json"))
+}
+
+func TestResetPreservesLegacyIncompleteManifest(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	projectPath := filepath.Dir(ws.data.RepoPath)
+	transactionDir := filepath.Join(projectPath, "transactions", "legacy")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifestPath := filepath.Join(transactionDir, "manifest.json")
+	require.NoError(t, os.WriteFile(manifestPath, []byte(`{"version":1}`), 0o600))
+
+	err := WithResetPreflight(func() error { return os.ErrInvalid })
+	require.ErrorContains(t, err, "legacy transaction")
+	require.NotErrorIs(t, err, os.ErrInvalid)
+	require.FileExists(t, manifestPath)
+	require.DirExists(t, projectPath)
+}
+
+func TestResetRecoversOrdinaryPreCommitTransactionBeforeCleanup(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	projectPath := filepath.Dir(ws.data.RepoPath)
+	transactionDir := filepath.Join(projectPath, "transactions", "prepared")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "prepared", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionPrepared, Entries: []TransactionEntry{}}
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+
+	require.NoError(t, WithResetPreflight(func() error {
+		require.Equal(t, TransactionRolledBack, readPersistedTransactionManifest(t, transactionDir).State)
+		return nil
+	}))
+}
+
+func TestResetAcquiresMultipleProjectLocksInSortedOrder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, source := range []string{t.TempDir(), t.TempDir(), t.TempDir()} {
+		require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o644))
+		_, _, err := NewShadow(source, "reset-order")
+		require.NoError(t, err)
+	}
+	var acquired []string
+	resetProjectLockedHook = func(path string) { acquired = append(acquired, path) }
+	t.Cleanup(func() { resetProjectLockedHook = nil })
+
+	require.NoError(t, WithResetPreflight(func() error { return nil }))
+	require.True(t, sort.StringsAreSorted(acquired))
+	require.Len(t, acquired, 3)
+}
 
 func TestNewShadowHoldsProjectLockAcrossBaselineScan(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
