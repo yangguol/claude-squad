@@ -117,7 +117,6 @@ type TransactionManifest struct {
 }
 
 func WriteManifestDurable(manifest TransactionManifest, transactionDir string) error {
-	durabilityCheckpoint(DurabilityInitialManifestBeforePublication)
 	contents, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode transaction manifest: %w", err)
@@ -163,6 +162,7 @@ func WriteManifestDurable(manifest TransactionManifest, transactionDir string) e
 		return fmt.Errorf("close transaction manifest temporary: %w", err)
 	}
 
+	durabilityCheckpoint(DurabilityInitialManifestBeforePublication)
 	manifestPath := filepath.Join(transactionDir, "manifest.json")
 	if err := applyFS.Rename(temporary, manifestPath); err != nil {
 		return fmt.Errorf("publish transaction manifest: %w", err)

@@ -43,9 +43,24 @@ func TestCrashRecoveryInitialManifestPublication(t *testing.T) {
 		fixture := runCrashHelperAt(t, "apply", DurabilityInitialManifestBeforePublication, 1, "")
 		_, err := os.Lstat(filepath.Join(fixture.TransactionDir, "manifest.json"))
 		require.ErrorIs(t, err, os.ErrNotExist)
+		temporaries, err := filepath.Glob(filepath.Join(fixture.TransactionDir, ".manifest-*"))
+		require.NoError(t, err)
+		require.Len(t, temporaries, 1, "crash boundary must retain the completely written private manifest")
+		require.NoError(t, os.WriteFile(temporaries[0], []byte("untrusted temporary bytes"), 0o600))
 		runCrashHelper(t, "discover", "", fixture.TransactionDir)
 		_, err = os.Lstat(fixture.TransactionDir)
 		require.ErrorIs(t, err, os.ErrNotExist)
+		rootEntries, err := os.ReadDir(filepath.Dir(fixture.TransactionDir))
+		require.NoError(t, err)
+		for _, entry := range rootEntries {
+			require.False(t, strings.HasPrefix(entry.Name(), ".manifest-"), "manifest temporary escaped transaction directory: %s", entry.Name())
+			if strings.HasPrefix(entry.Name(), ".orphan-") {
+				retained, readErr := os.ReadDir(filepath.Join(filepath.Dir(fixture.TransactionDir), entry.Name()))
+				require.NoError(t, readErr)
+				require.Len(t, retained, 1, "quarantine must retain only its safety marker")
+				require.Equal(t, orphanCleanupMarker, retained[0].Name())
+			}
+		}
 		require.Equal(t, fixture.Before, mustSnapshot(t, fixture.Source))
 	})
 	t.Run("after publication is a prepared transaction", func(t *testing.T) {

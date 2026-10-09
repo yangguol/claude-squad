@@ -86,3 +86,23 @@ git diff --check                                                         PASS
 ```
 
 Concern: the expanded real-process matrix increases focused runtime to about two minutes once and six minutes at `-count=3` on this Darwin host.
+
+## Fix Round 2
+
+Moved `initial-manifest.before-publication` to the actual publication boundary: after the private manifest temporary has been fully written, synced, and closed, immediately before the atomic rename to `manifest.json`. The post-publication checkpoint remains after rename and transaction-directory sync.
+
+The subprocess regression now proves that a crash at the pre-publication boundary leaves exactly one private `.manifest-*` file and no `manifest.json`. It deliberately corrupts those temporary bytes before launching fresh-process discovery, demonstrating that discovery classifies by the absence of the published manifest rather than trusting private temporary content. Recovery removes the transaction namespace, leaves at most an empty marked orphan tombstone with no temporary/orphan payload, and preserves the exact source snapshot.
+
+TDD evidence and verification:
+
+```text
+go test ./session/workspace -run '^TestCrashRecoveryInitialManifestPublication$/before_publication' -count=1  RED (expected one .manifest-*; found none)
+go test ./session/workspace -run '^TestCrashRecoveryInitialManifestPublication$' -count=1                     PASS (5.727s)
+go test ./session/workspace -run '^TestCrashRecovery' -count=1 -timeout=15m                                   PASS (119.172s)
+go test ./session/workspace -run '^TestCrashRecovery' -count=3 -timeout=30m                                   PASS (362.654s)
+go test ./session/workspace -count=1 -timeout=20m                                                             PASS (526.689s)
+go test ./... -count=1 -timeout=30m                                                                           PASS
+git diff --check                                                                                              PASS
+```
+
+Concern: identity-safe orphan deletion intentionally retains an empty `.orphan-*` tombstone containing only its cleanup marker; no manifest temporary or untrusted orphan payload remains after recovery.
