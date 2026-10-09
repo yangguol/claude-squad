@@ -1524,3 +1524,96 @@ func TestCreatedParentConcurrentCreatorIsNotClaimed(t *testing.T) {
 	require.Zero(t, persisted.Entries[index].CreatedInode)
 	require.DirExists(t, filepath.Join(manifest.SourcePath, "new"))
 }
+
+func TestFinalValidationRejectsUnexpectedChildInExistingAppliedDirectory(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, os.Mkdir(filepath.Join(manifest.SourcePath, "existing"), 0o755))
+	manifest.AppliedEntries["existing"] = Entry{Path: "existing", Type: EntryType("directory"), Mode: 0o755}
+	transactionBeforeCommitHook = func() error {
+		writeApplyFile(t, manifest.SourcePath, "existing/unexpected", "unexpected", 0o600)
+		return nil
+	}
+	t.Cleanup(func() { transactionBeforeCommitHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestFinalDirectoryScanRejectsReboundTopLevelChild(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	old := filepath.Join(manifest.SourcePath, "new.old")
+	replacementScanAfterRootReadHook = func() {
+		replacementScanAfterRootReadHook = nil
+		require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, "new"), old))
+		require.NoError(t, os.Mkdir(filepath.Join(manifest.SourcePath, "new"), 0o755))
+	}
+	t.Cleanup(func() { replacementScanAfterRootReadHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestCreatedParentReplacementAfterMkdirIsNotClaimed(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionAfterCreatedParentOpenHook = func(path string) {
+		if path != "new" {
+			return
+		}
+		transactionAfterCreatedParentOpenHook = nil
+		require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, path), filepath.Join(manifest.SourcePath, path+".old")))
+		require.NoError(t, os.Mkdir(filepath.Join(manifest.SourcePath, path), 0o755))
+	}
+	t.Cleanup(func() { transactionAfterCreatedParentOpenHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	require.Equal(t, TransactionRollingBack, persisted.State)
+	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
+	require.Zero(t, persisted.Entries[index].CreatedDevice)
+	require.Zero(t, persisted.Entries[index].CreatedInode)
+}
+
+func TestCommitUncertainReadbackRequiresExactCanonicalManifest(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionAfterManifestRenameHook = func(state TransactionState) error {
+		if state != TransactionCommitted {
+			return nil
+		}
+		persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+		persisted.AppliedTree = "forged"
+		contents, err := json.Marshal(persisted)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(plan.TransactionDir, "manifest.json"), contents, 0o600))
+		return errors.New("injected uncertain commit")
+	}
+	t.Cleanup(func() { transactionAfterManifestRenameHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestCommitUncertainReadbackRejectsUnknownManifestField(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionAfterManifestRenameHook = func(state TransactionState) error {
+		if state != TransactionCommitted {
+			return nil
+		}
+		name := filepath.Join(plan.TransactionDir, "manifest.json")
+		contents, err := os.ReadFile(name)
+		require.NoError(t, err)
+		contents = append(contents[:len(contents)-2], []byte(",\n  \"unknown\": true\n}")...)
+		require.NoError(t, os.WriteFile(name, contents, 0o600))
+		return errors.New("injected uncertain commit")
+	}
+	t.Cleanup(func() { transactionAfterManifestRenameHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+}
+
+func TestPreparedSourceRootOpenFailureDurablyEntersRollingBack(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	require.NoError(t, os.Rename(manifest.SourcePath, manifest.SourcePath+".moved"))
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}

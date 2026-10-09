@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -318,6 +319,10 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 		return err
 	}
 
+	if err := validateAppliedEntries(manifest); err != nil {
+		return err
+	}
+
 	sourcePaths, transactionPaths := []manifestNamespacePath{}, []manifestNamespacePath{}
 	for index, entry := range manifest.Entries {
 		phaseOK := phaseAllowed(entry.Operation, entry.Phase) || entry.Operation == EntryOperationCreate && entry.CaptureName != "" && len(entry.ExpectedTree) != 0 && (entry.Phase == EntryPhaseCaptureIntent || entry.Phase == EntryPhaseCaptured)
@@ -402,6 +407,28 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 				return fmt.Errorf("transaction entry %d result identity: %w", index, err)
 			}
 		}
+		if (entry.CreatedDevice == 0) != (entry.CreatedInode == 0) {
+			return fmt.Errorf("transaction entry %d has partial created-parent ownership", index)
+		}
+		hasOwnership := entry.CreatedDevice != 0
+		if entry.Operation != EntryOperationCreatedParent && hasOwnership {
+			return fmt.Errorf("transaction entry %d has invalid created-parent ownership", index)
+		}
+		if entry.Operation == EntryOperationCreatedParent {
+			switch entry.Phase {
+			case EntryPhasePending:
+				if hasOwnership {
+					return fmt.Errorf("transaction entry %d has ownership before created-parent intent", index)
+				}
+			case EntryPhasePublishIntent:
+				// Both forms are durable: intent is written before mkdir, then ownership
+				// is written after the created inode has been opened and verified.
+			case EntryPhasePublished, EntryPhaseRollbackCaptureIntent, EntryPhaseRollbackCaptured, EntryPhaseRestored:
+				if !hasOwnership {
+					return fmt.Errorf("transaction entry %d is missing created-parent ownership", index)
+				}
+			}
+		}
 		treePaths := make([]string, 0, len(entry.ExpectedTree))
 		for name, treeEntry := range entry.ExpectedTree {
 			if err := validateRelativeManifestPath(name); err != nil || treeEntry.Path != name {
@@ -421,6 +448,44 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 				if strings.HasPrefix(other, name+"/") && entry.ExpectedTree[name].Type != EntryType("directory") {
 					return fmt.Errorf("transaction entry %d expected tree paths %q and %q overlap below a non-directory", index, name, other)
 				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateAppliedEntries(manifest TransactionManifest) error {
+	if manifest.AppliedEntries == nil {
+		return nil
+	}
+	paths := make([]string, 0, len(manifest.AppliedEntries))
+	for path, entry := range manifest.AppliedEntries {
+		if err := validateRelativeManifestPath(path); err != nil || entry.Path != path {
+			return fmt.Errorf("invalid applied entry path %q", path)
+		}
+		if err := validateEntryIdentity(entry, true); err != nil {
+			return fmt.Errorf("invalid applied entry identity %q: %w", path, err)
+		}
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for index, path := range paths {
+		for _, descendant := range paths[index+1:] {
+			if strings.HasPrefix(descendant, path+"/") && manifest.AppliedEntries[path].Type != EntryType("directory") {
+				return fmt.Errorf("applied paths %q and %q overlap below a non-directory", path, descendant)
+			}
+		}
+	}
+	for index, transactionEntry := range manifest.Entries {
+		applied, exists := manifest.AppliedEntries[transactionEntry.Path]
+		switch transactionEntry.Operation {
+		case EntryOperationCreate, EntryOperationUpdate:
+			if transactionEntry.Result == nil || !exists || !reflect.DeepEqual(applied, *transactionEntry.Result) {
+				return fmt.Errorf("transaction entry %d result is inconsistent with applied entries", index)
+			}
+		case EntryOperationDelete:
+			if exists && !publishedCreatedParentAt(manifest, transactionEntry.Path) {
+				return fmt.Errorf("transaction entry %d delete remains in applied entries", index)
 			}
 		}
 	}

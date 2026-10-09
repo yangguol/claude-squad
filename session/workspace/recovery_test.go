@@ -2,9 +2,11 @@ package workspace
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -625,6 +627,58 @@ func TestValidateManifestRejectsMalformedEntryIdentities(t *testing.T) {
 		"child": {Path: "child", Type: EntryRegular, Mode: 0o600, ContentHash: "bad"},
 	}
 	require.Error(t, ValidateManifest(project, directory, manifest))
+}
+
+func TestValidateManifestValidatesAppliedEntriesAndCreatedOwnership(t *testing.T) {
+	project, source := recoveryProject(t)
+	directory := filepath.Join(project, "transactions", "tx")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	valid := validRecoveryManifest(project, source, "tx")
+	valid.AppliedEntries = map[string]Entry{"file": *recoveryIdentity("file")}
+	require.NoError(t, ValidateManifest(project, directory, valid), "prepared manifests need no created ownership")
+	createdParentIntent := valid
+	createdParentIntent.AppliedEntries = maps.Clone(valid.AppliedEntries)
+	createdParentIntent.Entries = []TransactionEntry{validRecoveryEntry("parent", EntryOperationCreatedParent)}
+	createdParentIntent.Entries[0].Phase = EntryPhasePublishIntent
+	require.NoError(t, ValidateManifest(project, directory, createdParentIntent), "durable intent before mkdir has no ownership yet")
+
+	tests := map[string]func(*TransactionManifest){
+		"unsafe applied key": func(m *TransactionManifest) {
+			m.AppliedEntries["../escape"] = *recoveryIdentity("../escape")
+		},
+		"applied path mismatch": func(m *TransactionManifest) {
+			m.AppliedEntries["other"] = *recoveryIdentity("different")
+		},
+		"malformed applied identity": func(m *TransactionManifest) {
+			m.AppliedEntries["bad"] = Entry{Path: "bad", Type: EntryRegular, Mode: 0o600, ContentHash: "bad"}
+		},
+		"applied descendant below file": func(m *TransactionManifest) {
+			m.AppliedEntries["file/child"] = *recoveryIdentity("file/child")
+		},
+		"partial ownership": func(m *TransactionManifest) {
+			m.Entries[0].CreatedDevice = 1
+		},
+		"ownership on update": func(m *TransactionManifest) {
+			m.Entries[0].CreatedDevice, m.Entries[0].CreatedInode = 1, 2
+		},
+		"ownership in created-parent pending": func(m *TransactionManifest) {
+			m.Entries[0] = validRecoveryEntry("parent", EntryOperationCreatedParent)
+			m.Entries[0].CreatedDevice, m.Entries[0].CreatedInode = 1, 2
+		},
+		"missing ownership in created-parent published": func(m *TransactionManifest) {
+			m.Entries[0] = validRecoveryEntry("parent", EntryOperationCreatedParent)
+			m.Entries[0].Phase = EntryPhasePublished
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			manifest := valid
+			manifest.AppliedEntries = maps.Clone(valid.AppliedEntries)
+			manifest.Entries = slices.Clone(valid.Entries)
+			mutate(&manifest)
+			require.Error(t, ValidateManifest(project, directory, manifest))
+		})
+	}
 }
 
 func TestDiscoverySkipsOnlyValidatedRetainedOrphanTombstones(t *testing.T) {

@@ -3,6 +3,7 @@
 package workspace
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ var transactionBeforeCommitHook func() error
 var transactionAfterCommitHook func()
 var transactionManifestWriteHook func(TransactionState) error
 var transactionAfterManifestRenameHook func(TransactionState) error
+var transactionAfterCreatedParentOpenHook func(string)
+var replacementScanAfterRootReadHook func()
 
 // ExecuteTransaction advances a prepared v2 transaction through its durable
 // forward WAL and commits only after every published result is revalidated.
@@ -32,7 +35,8 @@ func ExecuteTransaction(manifest *TransactionManifest, transactionDir string) (r
 	}
 	roots, err := openForwardRoots(manifest.SourcePath, transactionDir)
 	if err != nil {
-		return err
+		manifest.State = TransactionRollingBack
+		return errors.Join(err, writeManifestAtBoundDirectory(*manifest, transactionDir))
 	}
 	defer func() { returnErr = errors.Join(returnErr, roots.close()) }()
 
@@ -88,8 +92,8 @@ func ExecuteTransaction(manifest *TransactionManifest, transactionDir string) (r
 
 	manifest.State = TransactionCommitted
 	if err := writeManifestBound(*manifest, roots.tx); err != nil {
-		persisted, readErr := readManifestBound(roots.tx)
-		if readErr == nil && persisted.State == TransactionCommitted && persisted.TransactionID == manifest.TransactionID {
+		persisted, readErr := readManifestBoundStrict(roots.tx)
+		if readErr == nil && manifestsCanonicallyEqual(persisted, *manifest) {
 			committedDurably = true
 			if transactionAfterCommitHook != nil {
 				transactionAfterCommitHook()
@@ -301,17 +305,29 @@ func validatePublishedResultsBound(manifest TransactionManifest, roots *forwardR
 			return fmt.Errorf("result %q: %w", entry.Path, err)
 		}
 	}
+	directories := make([]string, 0)
+	for path, entry := range manifest.AppliedEntries {
+		if entry.Type == EntryType("directory") {
+			directories = append(directories, path)
+		}
+	}
 	for _, entry := range manifest.Entries {
-		if entry.Operation != EntryOperationCreatedParent {
+		if entry.Operation == EntryOperationCreatedParent {
+			directories = append(directories, entry.Path)
+		}
+	}
+	sort.Strings(directories)
+	for index, path := range directories {
+		if index != 0 && path == directories[index-1] {
 			continue
 		}
-		actual, err := snapshotSubtreeAt(roots.source, entry.Path)
+		actual, err := snapshotSubtreeAt(roots.source, path)
 		if err != nil {
 			return err
 		}
-		expected := expectedSubtree(manifest.AppliedEntries, entry.Path)
+		expected := expectedSubtree(manifest.AppliedEntries, path)
 		if !reflect.DeepEqual(actual, expected) {
-			return fmt.Errorf("created parent %q has unexpected complete tree", entry.Path)
+			return fmt.Errorf("applied directory %q has unexpected complete tree", path)
 		}
 	}
 	return roots.verify()
@@ -437,12 +453,16 @@ func writeManifestBound(manifest TransactionManifest, directory *os.File) error 
 	return directory.Sync()
 }
 
-func readManifestBound(directory *os.File) (TransactionManifest, error) {
+func manifestsCanonicallyEqual(left, right TransactionManifest) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+}
+
+func readManifestBoundStrict(directory *os.File) (TransactionManifest, error) {
 	contents, err := readFileAt(directory, "manifest.json")
 	if err != nil {
 		return TransactionManifest{}, err
 	}
-	var manifest TransactionManifest
-	err = json.Unmarshal(contents, &manifest)
-	return manifest, err
+	return decodeManifestStrict(contents)
 }

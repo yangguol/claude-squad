@@ -135,14 +135,39 @@ func mkdirRelative(root *os.File, relative string, mode os.FileMode) (unix.Stat_
 	if err := unix.Mkdirat(int(parent.Fd()), leaf, uint32(mode.Perm())); err != nil {
 		return unix.Stat_t{}, err
 	}
+	fd, err := unix.Openat(int(parent.Fd()), leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return unix.Stat_t{}, err
+	}
+	created := os.NewFile(uintptr(fd), leaf)
+	defer created.Close()
+	var opened unix.Stat_t
+	if err := unix.Fstat(fd, &opened); err != nil {
+		return unix.Stat_t{}, err
+	}
+	if transactionAfterCreatedParentOpenHook != nil {
+		transactionAfterCreatedParentOpenHook(relative)
+	}
+	verify := func() error {
+		var rebound unix.Stat_t
+		if err := unix.Fstatat(int(parent.Fd()), leaf, &rebound, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return err
+		}
+		if !sameOrphanIdentity(opened, rebound) {
+			return errors.New("created parent changed binding")
+		}
+		return nil
+	}
+	if err := verify(); err != nil {
+		return unix.Stat_t{}, err
+	}
 	if err := parent.Sync(); err != nil {
 		return unix.Stat_t{}, err
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), leaf, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := verify(); err != nil {
 		return unix.Stat_t{}, err
 	}
-	return stat, nil
+	return opened, nil
 }
 
 func snapshotEntryAt(root *os.File, relative string) (Entry, bool, error) {
@@ -219,20 +244,40 @@ func readFileAt(directory *os.File, name string) ([]byte, error) {
 	return contents, errors.Join(readErr, file.Close())
 }
 
-func snapshotSubtreeAt(root *os.File, relative string) (map[string]Entry, error) {
-	parent, leaf, err := openRelativeParent(root, relative)
+func snapshotSubtreeAt(root *os.File, relative string) (result map[string]Entry, returnErr error) {
+	clean := filepath.ToSlash(relative)
+	parts := strings.Split(clean, "/")
+	if clean == "" || filepath.IsAbs(relative) || strings.Contains(relative, "\\") || filepath.ToSlash(filepath.Clean(filepath.FromSlash(clean))) != clean {
+		return nil, errors.New("unsafe relative path")
+	}
+	fd, err := unix.Dup(int(root.Fd()))
 	if err != nil {
 		return nil, err
 	}
-	defer parent.Close()
-	child, _, err := openOrphanDirectoryAt(parent, leaf)
-	if err != nil {
+	anchor := os.NewFile(uintptr(fd), relative)
+	bindings := make([]openedDirectoryBinding, 0, len(parts))
+	defer func() { returnErr = errors.Join(returnErr, closeOpenedDirectoryBindings(anchor, bindings)) }()
+	parent := anchor
+	for index, component := range parts {
+		child, identity, err := openOrphanDirectoryAt(parent, component)
+		if err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, openedDirectoryBinding{parent: parent, name: component, identity: identity, child: child})
+		if err := verifyOrphanDirectoryEntry(parent, component, identity); err != nil {
+			return nil, fmt.Errorf("bind subtree directory %q: %w", strings.Join(parts[:index+1], "/"), err)
+		}
+		parent = child
+	}
+	result = make(map[string]Entry)
+	if err := scanReplacementDirectory(parent, "", result); err != nil {
 		return nil, err
 	}
-	defer child.Close()
-	result := make(map[string]Entry)
-	if err := scanReplacementDirectory(child, "", result); err != nil {
-		return nil, err
+	if replacementScanAfterRootReadHook != nil {
+		replacementScanAfterRootReadHook()
+	}
+	if err := verifyOpenedDirectoryBindings(bindings); err != nil {
+		return nil, fmt.Errorf("subtree root or ancestor changed binding: %w", err)
 	}
 	return result, nil
 }
