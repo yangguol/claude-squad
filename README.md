@@ -77,7 +77,11 @@ cs
 
 Claude Squad detects the workspace mode automatically. Inside a Git repository it keeps the existing Git worktree and branch workflow. In any other directory it shows `Directory (isolated)` and gives each session an independent copy backed by data under `~/.claude-squad/shadow-projects/`; it does not create `.git` in your source directory.
 
-In directory mode, agent edits stay isolated until you select the session and press `c` to **Apply**. Apply performs a three-way merge against the session's starting snapshot and the current source. If the same content changed incompatibly, Claude Squad reports the conflicting paths and leaves the source unchanged; resolve the source or session edit before retrying. In Git mode, `c` checks out the session branch and `p` commits and pushes it; push and branch checkout are unavailable in directory mode.
+In directory mode, agent edits stay isolated until you select the session and explicitly press `c` to **Apply**. Apply performs a three-way merge against the session's starting snapshot and the current source. If the same content changed incompatibly, Claude Squad reports the conflicting paths and leaves the source unchanged; resolve the source or session edit before retrying. In Git mode, `c` checks out the session branch and `p` commits and pushes it; push and branch checkout are unavailable in directory mode.
+
+Directory Apply is supported on Darwin and Linux when the source directory and transaction storage under `~/.claude-squad/shadow-projects/` are on the same filesystem and that filesystem supplies the required atomic no-replace rename and durable directory operations. Unsupported platforms or filesystems fail before an Apply manifest is published or the source is mutated; there is no degraded rename fallback. Apply, recovery, resume, kill, acknowledgement, and reset serialize through a per-project lock. If another Claude Squad process holds it, the operation reports that another operation is in progress rather than proceeding concurrently. This coordination does not claim protection against arbitrary hostile processes that directly rewrite source or transaction storage.
+
+An interrupted pre-commit Apply is automatically discovered and rolled back on restore; a durably committed Apply is completed and its private transaction material is cleaned. If recovery cannot prove that a path is transaction-owned, Claude Squad preserves the questionable data, reports the affected and retained paths, and restores the session read-only: Apply and resume remain blocked until the filesystem conflict is resolved and recovery succeeds. A successful Apply may likewise carry a cleanup warning after its source changes are committed; do not delete the listed retained paths blindly. Inspect them, remove or relocate only the external blocker, then restart or retry recovery. Complete transaction receipts may be acknowledged through the application once they are safe to remove.
 
 Directory mode classifies files as included, excluded, shared, or generated. Included files are isolated and can be applied. Excluded and generated files are neither copied nor applied. Shared dependency directories are linked to the source to avoid expensive copies, so writes inside them are immediately visible to every session and are not isolated or applied. By default, `node_modules/`, `.venv/`, and `venv/` are shared; common build output, cache, editor, and OS-artifact paths are generated and omitted (`dist/`, `build/`, `target/`, `out/`, `.cache/`, Python caches, `.idea/`, `.vscode/`, `.DS_Store`, `Thumbs.db`, `Desktop.ini`, and `*.sw?`).
 
@@ -97,7 +101,7 @@ coverage/
 *.tmp
 ```
 
-Killing a session removes its isolated worktree. `cs reset` removes stored sessions and safely cleans unreferenced directory-mode shadow projects; it refuses unsafe or recoverable cleanup rather than deleting questionable state. The startup fallback logo also displays a subtle `ygl` mark when the terminal is wide enough.
+Killing a session removes its isolated worktree. `cs reset` removes stored sessions and cleans only unreferenced directory-mode shadow projects that pass the same locked recovery preflight; it preserves blocked, incomplete, or otherwise questionable transaction state for later recovery instead of deleting it. The startup fallback logo also displays a subtle `ygl` mark when the terminal is wide enough.
 
 NOTE: The default program is `claude` and we recommend using the latest version.
 
@@ -175,7 +179,7 @@ underlying program (ex. `claude`) to the latest version.
 ### How It Works
 
 1. **tmux** to create isolated terminal sessions for each agent
-2. **git worktrees** to isolate codebases so each session works on its own branch
+2. **git worktrees** for Git repositories, or copied shadow workspaces for arbitrary directories
 3. A simple TUI interface for easy navigation and management
 
 ### License

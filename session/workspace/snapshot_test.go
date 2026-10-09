@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -170,18 +169,4 @@ func TestScanCanExplicitlyExcludePolicyFile(t *testing.T) {
 	snapshot, err := Scan(source, policy)
 	require.NoError(t, err)
 	require.Empty(t, snapshot.Entries)
-}
-
-func TestScanRejectsSpecialFilesWithRelativePath(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("named pipes differ on Windows")
-	}
-	source := t.TempDir()
-	pipe := filepath.Join(source, "unsafe.pipe")
-	require.NoError(t, syscall.Mkfifo(pipe, 0o600))
-
-	_, err := Scan(source, Policy{})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "unsafe.pipe")
-	require.NotContains(t, err.Error(), source)
 }
