@@ -235,28 +235,41 @@ func publishCreatedParentBound(manifest *TransactionManifest, index int, roots *
 		if absent, err := absentAt(roots.source, entry.Path); err != nil || !absent {
 			return errors.Join(err, os.ErrExist)
 		}
-		entry.Phase = EntryPhasePublishIntent
-		if err := writeManifestBound(*manifest, roots.tx); err != nil {
-			return err
-		}
-		if transactionBeforeFilesystemHook != nil {
-			transactionBeforeFilesystemHook("create-parent", entry.Path)
-		}
-		stat, err := mkdirRelative(roots.source, entry.Path, roots.tx, entry.StagePath, entry.Result.Mode)
+		stat, err := mkdirRelative(roots.tx, entry.StagePath, entry.Path, entry.Result.Mode)
 		if err != nil {
 			return err
 		}
 		entry.CreatedDevice, entry.CreatedInode = uint64(stat.Dev), uint64(stat.Ino)
+		entry.Phase = EntryPhasePublishIntent
 		if err := writeManifestBound(*manifest, roots.tx); err != nil {
 			return err
-		}
-		if transactionAfterFilesystemHook != nil {
-			transactionAfterFilesystemHook("create-parent", entry.Path)
 		}
 	}
 	if entry.Phase == EntryPhasePublishIntent {
 		if entry.CreatedDevice == 0 || entry.CreatedInode == 0 {
 			return errors.New("created-parent publish intent has no durable ownership identity")
+		}
+		stageStat, stageErr := entryStatAt(roots.tx, entry.StagePath)
+		sourceStat, sourceErr := entryStatAt(roots.source, entry.Path)
+		stageOwned := stageErr == nil && uint64(stageStat.Dev) == entry.CreatedDevice && uint64(stageStat.Ino) == entry.CreatedInode
+		sourceOwned := sourceErr == nil && uint64(sourceStat.Dev) == entry.CreatedDevice && uint64(sourceStat.Ino) == entry.CreatedInode
+		switch {
+		case stageOwned && errors.Is(sourceErr, os.ErrNotExist):
+			if transactionBeforeFilesystemHook != nil {
+				transactionBeforeFilesystemHook("create-parent", entry.Path)
+			}
+			if err := renameRelativeNoReplace(roots.tx, entry.StagePath, roots.source, entry.Path); err != nil {
+				return err
+			}
+			if transactionAfterFilesystemHook != nil {
+				transactionAfterFilesystemHook("create-parent", entry.Path)
+			}
+		case sourceOwned:
+			if !errors.Is(stageErr, os.ErrNotExist) {
+				return errors.New("created parent ownership exists at both stage and source")
+			}
+		default:
+			return errors.Join(stageErr, sourceErr, errors.New("created parent ownership is not safely reconcilable"))
 		}
 		stat, err := entryStatAt(roots.source, entry.Path)
 		if err != nil || uint64(stat.Dev) != entry.CreatedDevice || uint64(stat.Ino) != entry.CreatedInode {

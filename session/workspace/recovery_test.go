@@ -588,6 +588,7 @@ func TestValidateManifestRequiresOperationSpecificRecoveryFields(t *testing.T) {
 		{"delete capture", EntryOperationDelete, func(e *TransactionEntry) { e.CaptureName = "" }},
 		{"delete quarantine", EntryOperationDelete, func(e *TransactionEntry) { e.QuarantinePath = "" }},
 		{"delete expected", EntryOperationDelete, func(e *TransactionEntry) { e.Expected = nil }},
+		{"created parent stage", EntryOperationCreatedParent, func(e *TransactionEntry) { e.StagePath = "" }},
 		{"created parent rollback capture", EntryOperationCreatedParent, func(e *TransactionEntry) { e.RollbackCaptureName = "" }},
 		{"created parent result", EntryOperationCreatedParent, func(e *TransactionEntry) { e.Result = nil }},
 	}
@@ -641,7 +642,8 @@ func TestValidateManifestValidatesAppliedEntriesAndCreatedOwnership(t *testing.T
 	createdParentIntent.AppliedEntries = maps.Clone(valid.AppliedEntries)
 	createdParentIntent.Entries = []TransactionEntry{validRecoveryEntry("parent", EntryOperationCreatedParent)}
 	createdParentIntent.Entries[0].Phase = EntryPhasePublishIntent
-	require.NoError(t, ValidateManifest(project, directory, createdParentIntent), "durable intent before mkdir has no ownership yet")
+	createdParentIntent.Entries[0].CreatedDevice, createdParentIntent.Entries[0].CreatedInode = 1, 2
+	require.NoError(t, ValidateManifest(project, directory, createdParentIntent), "durable ownership may identify the private staged inode before publication")
 
 	tests := map[string]func(*TransactionManifest){
 		"unsafe applied key": func(m *TransactionManifest) {
@@ -665,6 +667,10 @@ func TestValidateManifestValidatesAppliedEntriesAndCreatedOwnership(t *testing.T
 		"ownership in created-parent pending": func(m *TransactionManifest) {
 			m.Entries[0] = validRecoveryEntry("parent", EntryOperationCreatedParent)
 			m.Entries[0].CreatedDevice, m.Entries[0].CreatedInode = 1, 2
+		},
+		"missing ownership in created-parent publish intent": func(m *TransactionManifest) {
+			m.Entries[0] = validRecoveryEntry("parent", EntryOperationCreatedParent)
+			m.Entries[0].Phase = EntryPhasePublishIntent
 		},
 		"missing ownership in created-parent published": func(m *TransactionManifest) {
 			m.Entries[0] = validRecoveryEntry("parent", EntryOperationCreatedParent)

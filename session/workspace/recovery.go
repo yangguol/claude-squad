@@ -420,10 +420,7 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 				if hasOwnership {
 					return fmt.Errorf("transaction entry %d has ownership before created-parent intent", index)
 				}
-			case EntryPhasePublishIntent:
-				// Both forms are durable: intent is written before mkdir, then ownership
-				// is written after the created inode has been opened and verified.
-			case EntryPhasePublished, EntryPhaseRollbackCaptureIntent, EntryPhaseRollbackCaptured, EntryPhaseRestored:
+			case EntryPhasePublishIntent, EntryPhasePublished, EntryPhaseRollbackCaptureIntent, EntryPhaseRollbackCaptured, EntryPhaseRestored:
 				if !hasOwnership {
 					return fmt.Errorf("transaction entry %d is missing created-parent ownership", index)
 				}

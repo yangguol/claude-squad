@@ -152,3 +152,30 @@ Exact commands and results:
 ### Concerns
 
 Created-parent stage paths are now required v2 WAL fields and remain as transaction materials when publication fails; their later removal belongs to Task 7. Reverse rollback and cleanup remain intentionally unimplemented here. The implementation relies on the existing cross-directory same-filesystem atomic no-replace preflight and platform primitive.
+
+## Fix Round 4
+
+### Status
+
+Verified both reviewer findings. Created-parent publication previously occurred inside `mkdirRelative` before the caller persisted the opened inode identity, and validation allowed identity-less `publish-intent`. Forward execution now creates, opens, and syncs the private staged directory, durably persists its device/inode together with `publish-intent`, and only then invokes atomic no-replace publication. Recovery-safe reconciliation accepts either the exact owned inode at the stage path before publication or at the source path after publication, and rejects ambiguous, missing, duplicated, or mismatched ownership.
+
+### RED
+
+Added deterministic coverage asserting that the publication checkpoint observes a durable nonzero identity while the exact directory remains privately staged and the source is absent, that an injected identity-manifest write failure cannot publish the source directory, and that identity-less created-parent `publish-intent` is invalid.
+
+- `/Users/yangguoliang/.local/bin/go test ./session/workspace -run '^(TestForwardCreatedParentUsesWALState|TestCreatedParentIdentityWriteFailurePreventsPublication|TestValidateManifestValidatesAppliedEntriesAndCreatedOwnership)$' -count=1` — FAIL: publication checkpoint was not reached before rename; identity-write failure left the source published; validator accepted missing ownership.
+
+### GREEN
+
+- `/Users/yangguoliang/.local/bin/go test ./session/workspace -run '^(TestCreatedParent|TestForward|TestFinalValidation|TestOpenDescriptor|TestCommitted|TestApplyPreserves|TestApplyDirectory|TestValidateManifestRequiresOperationSpecificRecoveryFields|TestValidateManifestValidatesAppliedEntriesAndCreatedOwnership)' -count=1` — PASS
+- `/Users/yangguoliang/.local/bin/go test ./session/workspace -count=1` — PASS
+- `/Users/yangguoliang/.local/bin/go test ./... -count=1` — PASS
+- `git diff --check` — PASS
+
+### v2 compatibility decision
+
+No version bump, migration, or optional-field derivation was added. The approved binding spec fixes `CurrentTransactionVersion = 2` and requires every recovery-critical name to be durable before source mutation. Task 5 is not released, and the coordinator confirms older manifests exist only as artifacts of this in-progress branch/test sequence, not as supported deployed WALs. The smallest fail-closed design is therefore to keep v2, require `StagePath` for every reachable current created-parent manifest, and reject obsolete intermediate v2 shapes rather than weaken recovery or invent an unsafe stage path. The operation-specific validator test now explicitly covers the created-parent stage requirement.
+
+### Concerns
+
+Reverse rollback and cleanup remain intentionally deferred to Tasks 6 and 7. A failed prepublication identity write may subsequently persist `rolling-back` with the in-memory identity; this is safe and useful because the owned inode remains private at the staged path. Transaction-private staged directories remain until those later lifecycle tasks process them.

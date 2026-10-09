@@ -126,12 +126,7 @@ func renameRelativeNoReplace(fromRoot *os.File, fromRelative string, toRoot *os.
 	return errors.Join(fromParent.Sync(), toParent.Sync())
 }
 
-func mkdirRelative(root *os.File, relative string, stageRoot *os.File, temporary string, mode os.FileMode) (unix.Stat_t, error) {
-	parent, leaf, err := openRelativeParent(root, relative)
-	if err != nil {
-		return unix.Stat_t{}, err
-	}
-	defer parent.Close()
+func mkdirRelative(stageRoot *os.File, temporary, relative string, mode os.FileMode) (unix.Stat_t, error) {
 	temporaryParent, temporaryLeaf, err := openRelativeParent(stageRoot, temporary)
 	if err != nil {
 		return unix.Stat_t{}, err
@@ -153,30 +148,11 @@ func mkdirRelative(root *os.File, relative string, stageRoot *os.File, temporary
 	if err := unix.Fstat(fd, &opened); err != nil {
 		return unix.Stat_t{}, err
 	}
-	if err := platformRenameatNoReplaceBetween(int(temporaryParent.Fd()), temporaryLeaf, int(parent.Fd()), leaf); err != nil {
+	if err := temporaryParent.Sync(); err != nil {
 		return unix.Stat_t{}, err
 	}
 	if transactionAfterCreatedParentOpenHook != nil {
 		transactionAfterCreatedParentOpenHook(relative)
-	}
-	verify := func() error {
-		var rebound unix.Stat_t
-		if err := unix.Fstatat(int(parent.Fd()), leaf, &rebound, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return err
-		}
-		if !sameOrphanIdentity(opened, rebound) {
-			return errors.New("created parent changed binding")
-		}
-		return nil
-	}
-	if err := verify(); err != nil {
-		return unix.Stat_t{}, err
-	}
-	if err := errors.Join(temporaryParent.Sync(), parent.Sync()); err != nil {
-		return unix.Stat_t{}, err
-	}
-	if err := verify(); err != nil {
-		return unix.Stat_t{}, err
 	}
 	return opened, nil
 }

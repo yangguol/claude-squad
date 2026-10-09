@@ -1310,15 +1310,54 @@ func TestForwardDeletePersistsCaptureBeforeTargetAbsence(t *testing.T) {
 
 func TestForwardCreatedParentUsesWALState(t *testing.T) {
 	_, plan, manifest := preparedForwardTransaction(t)
+	checked := false
 	transactionBeforeFilesystemHook = func(action, path string) {
-		if action == "create-parent" && path == "new" {
-			persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
-			require.Equal(t, EntryPhasePublishIntent, persisted.Entries[slices.IndexFunc(persisted.Entries, func(e TransactionEntry) bool { return e.Path == path })].Phase)
+		if action != "create-parent" || path != "new" {
+			return
 		}
+		persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+		entry := persisted.Entries[slices.IndexFunc(persisted.Entries, func(e TransactionEntry) bool { return e.Path == path })]
+		require.Equal(t, EntryPhasePublishIntent, entry.Phase)
+		require.NotZero(t, entry.CreatedDevice)
+		require.NotZero(t, entry.CreatedInode)
+		require.DirExists(t, filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)))
+		require.NoDirExists(t, filepath.Join(manifest.SourcePath, path))
+		checked = true
 	}
 	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
 	require.NoError(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	require.True(t, checked)
 	require.DirExists(t, filepath.Join(manifest.SourcePath, "new"))
+}
+
+func TestCreatedParentIdentityWriteFailurePreventsPublication(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	opened := false
+	transactionAfterCreatedParentOpenHook = func(path string) {
+		if path == "new" {
+			opened = true
+		}
+	}
+	transactionManifestWriteHook = func(state TransactionState) error {
+		if state == TransactionApplying && opened {
+			opened = false
+			return errors.New("injected ownership identity write failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		transactionAfterCreatedParentOpenHook = nil
+		transactionManifestWriteHook = nil
+	})
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
+	require.Equal(t, TransactionRollingBack, persisted.State)
+	require.NotZero(t, persisted.Entries[index].CreatedDevice)
+	require.NotZero(t, persisted.Entries[index].CreatedInode)
+	require.NoDirExists(t, filepath.Join(manifest.SourcePath, "new"))
+	require.DirExists(t, filepath.Join(plan.TransactionDir, filepath.FromSlash(persisted.Entries[index].StagePath)))
 }
 
 func TestForwardCaptureValidationFailureRollsBack(t *testing.T) {
@@ -1520,8 +1559,8 @@ func TestCreatedParentConcurrentCreatorIsNotClaimed(t *testing.T) {
 	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
 	require.Equal(t, TransactionRollingBack, persisted.State)
 	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
-	require.Zero(t, persisted.Entries[index].CreatedDevice)
-	require.Zero(t, persisted.Entries[index].CreatedInode)
+	require.NotZero(t, persisted.Entries[index].CreatedDevice)
+	require.NotZero(t, persisted.Entries[index].CreatedInode)
 	require.DirExists(t, filepath.Join(manifest.SourcePath, "new"))
 }
 
@@ -1569,8 +1608,8 @@ func TestCreatedParentReplacementBeforeOwnershipOpenIsNotClaimed(t *testing.T) {
 	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
 	require.Equal(t, TransactionRollingBack, persisted.State)
 	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
-	require.Zero(t, persisted.Entries[index].CreatedDevice)
-	require.Zero(t, persisted.Entries[index].CreatedInode)
+	require.NotZero(t, persisted.Entries[index].CreatedDevice)
+	require.NotZero(t, persisted.Entries[index].CreatedInode)
 	require.Equal(t, "external", mustReadFile(t, filepath.Join(manifest.SourcePath, "new/external")))
 }
 
@@ -1581,7 +1620,6 @@ func TestCreatedParentReplacementAfterOwnershipOpenIsNotClaimed(t *testing.T) {
 			return
 		}
 		transactionAfterCreatedParentOpenHook = nil
-		require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, path), filepath.Join(manifest.SourcePath, path+".old")))
 		require.NoError(t, os.Mkdir(filepath.Join(manifest.SourcePath, path), 0o755))
 	}
 	t.Cleanup(func() { transactionAfterCreatedParentOpenHook = nil })
@@ -1590,8 +1628,10 @@ func TestCreatedParentReplacementAfterOwnershipOpenIsNotClaimed(t *testing.T) {
 	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
 	require.Equal(t, TransactionRollingBack, persisted.State)
 	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
-	require.Zero(t, persisted.Entries[index].CreatedDevice)
-	require.Zero(t, persisted.Entries[index].CreatedInode)
+	require.NotZero(t, persisted.Entries[index].CreatedDevice)
+	require.NotZero(t, persisted.Entries[index].CreatedInode)
+	require.DirExists(t, filepath.Join(plan.TransactionDir, filepath.FromSlash(persisted.Entries[index].StagePath)))
+	require.DirExists(t, filepath.Join(manifest.SourcePath, "new"))
 }
 
 func TestCommitUncertainReadbackRequiresExactCanonicalManifest(t *testing.T) {
