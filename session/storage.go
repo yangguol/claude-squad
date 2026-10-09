@@ -5,6 +5,8 @@ import (
 	"claude-squad/session/workspace"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -102,13 +104,86 @@ func (s *Storage) LoadInstances() ([]*Instance, error) {
 		return nil, fmt.Errorf("failed to unmarshal instances: %w", err)
 	}
 
+	type projectRecovery struct {
+		report workspace.RecoveryReport
+		data   map[string]*workspace.ShadowData
+	}
+	projects := make(map[string]*projectRecovery)
+	for i := range instancesData {
+		data := &instancesData[i]
+		if data.Workspace == nil || data.Workspace.Mode != workspace.ModeDirectory || data.Workspace.Shadow == nil {
+			continue
+		}
+		projectPath := filepath.Dir(data.Workspace.Shadow.RepoPath)
+		project := projects[projectPath]
+		if project == nil {
+			project = &projectRecovery{data: make(map[string]*workspace.ShadowData)}
+			projects[projectPath] = project
+		}
+		project.data[data.Workspace.Shadow.SessionID] = data.Workspace.Shadow
+	}
+
+	projectPaths := make([]string, 0, len(projects))
+	for projectPath := range projects {
+		projectPaths = append(projectPaths, projectPath)
+	}
+	sort.Strings(projectPaths)
+	acknowledgements := make(map[string][]workspace.ApplyMetadataRepair)
+	repaired := false
+	for _, projectPath := range projectPaths {
+		project := projects[projectPath]
+		report, err := workspace.RecoverProject(projectPath, project.data)
+		if err != nil {
+			return nil, fmt.Errorf("recover project %s: %w", projectPath, err)
+		}
+		project.report = report
+		for _, repair := range report.Repairs {
+			shadow := project.data[repair.SessionID]
+			if shadow == nil {
+				continue
+			}
+			shadow.LastAppliedTree = repair.AppliedTree
+			shadow.LastAppliedAt = repair.AppliedAt
+			shadow.LastAppliedTransactionID = repair.TransactionID
+			acknowledgements[projectPath] = append(acknowledgements[projectPath], repair)
+			repaired = true
+		}
+	}
+	if repaired {
+		updated, err := json.Marshal(instancesData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal repaired instances: %w", err)
+		}
+		if err := s.state.SaveInstances(updated); err != nil {
+			return nil, fmt.Errorf("failed to save repaired instances: %w", err)
+		}
+	}
+
 	instances := make([]*Instance, len(instancesData))
 	for i, data := range instancesData {
-		instance, err := FromInstanceData(data)
+		var access *workspace.AccessState
+		if data.Workspace != nil && data.Workspace.Mode == workspace.ModeDirectory && data.Workspace.Shadow != nil {
+			state := workspace.AccessStateFromRecovery(projects[filepath.Dir(data.Workspace.Shadow.RepoPath)].report)
+			access = &state
+		}
+		instance, err := fromInstanceData(data, access)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create instance %s: %w", data.Title, err)
 		}
 		instances[i] = instance
+	}
+	for _, projectPath := range projectPaths {
+		for _, repair := range acknowledgements[projectPath] {
+			for _, instance := range instances {
+				data := instance.ToInstanceData()
+				if data.Workspace != nil && data.Workspace.Shadow != nil && data.Workspace.Shadow.SessionID == repair.SessionID {
+					if err := instance.AcknowledgeApply(repair.TransactionID); err != nil {
+						return nil, fmt.Errorf("acknowledge transaction %s: %w", repair.TransactionID, err)
+					}
+					break
+				}
+			}
+		}
 	}
 
 	return instances, nil

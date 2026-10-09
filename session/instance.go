@@ -102,6 +102,10 @@ func (i *Instance) ToInstanceData() InstanceData {
 
 // FromInstanceData creates a new Instance from serialized data
 func FromInstanceData(data InstanceData) (*Instance, error) {
+	return fromInstanceData(data, nil)
+}
+
+func fromInstanceData(data InstanceData, recoveredAccess *workspace.AccessState) (*Instance, error) {
 	var workspaceData workspace.Data
 	if data.Workspace != nil {
 		workspaceData = *data.Workspace
@@ -128,7 +132,11 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 	case workspace.ModeGit:
 		restored, err = workspace.RestoreGit(workspaceData)
 	case workspace.ModeDirectory:
-		restored, err = workspace.RestoreShadow(workspaceData)
+		if recoveredAccess != nil {
+			restored, err = workspace.RestoreShadowRecovered(workspaceData, *recoveredAccess)
+		} else {
+			restored, err = workspace.RestoreShadow(workspaceData)
+		}
 	default:
 		err = fmt.Errorf("unsupported workspace mode %q", workspaceData.Mode)
 	}
@@ -406,6 +414,20 @@ func (i *Instance) Capabilities() workspace.Capabilities {
 		return workspace.Capabilities{}
 	}
 	return i.workspace.Capabilities()
+}
+
+func (i *Instance) AccessState() workspace.AccessState {
+	if i.workspace == nil {
+		return workspace.AccessState{}
+	}
+	return i.workspace.AccessState()
+}
+
+func (i *Instance) AcknowledgeApply(transactionID string) error {
+	if i.workspace == nil {
+		return fmt.Errorf("workspace is not initialized")
+	}
+	return i.workspace.AcknowledgeApply(transactionID)
 }
 
 func (i *Instance) Apply() (*workspace.ApplyResult, error) {

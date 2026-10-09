@@ -103,6 +103,16 @@ func NewShadow(source, sessionName string) (result Workspace, branchName string,
 }
 
 func RestoreShadow(data Data) (result Workspace, returnErr error) {
+	return restoreShadow(data, nil)
+}
+
+// RestoreShadowRecovered constructs a shadow workspace after the caller has
+// already recovered the entire project and supplies that project's access state.
+func RestoreShadowRecovered(data Data, access AccessState) (Workspace, error) {
+	return restoreShadow(data, &access)
+}
+
+func restoreShadow(data Data, recoveredAccess *AccessState) (result Workspace, returnErr error) {
 	if data.Version != CurrentVersion {
 		return nil, fmt.Errorf("unsupported workspace data version %d", data.Version)
 	}
@@ -125,11 +135,16 @@ func RestoreShadow(data Data) (result Workspace, returnErr error) {
 		return nil, err
 	}
 	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
-	report, err := recoverProjectLocked(projectPath, map[string]*ShadowData{stored.SessionID: &stored})
-	if err != nil {
-		return nil, fmt.Errorf("recover project: %w", err)
+	access := AccessState{}
+	if recoveredAccess != nil {
+		access = *recoveredAccess
+	} else {
+		report, err := recoverProjectLocked(projectPath, map[string]*ShadowData{stored.SessionID: &stored})
+		if err != nil {
+			return nil, fmt.Errorf("recover project: %w", err)
+		}
+		access = accessStateFromReport(report)
 	}
-	access := accessStateFromReport(report)
 	if _, err := os.Lstat(stored.WorktreePath); err == nil {
 		valid, validateErr := validateWorktreeIdentity(stored)
 		if validateErr != nil || !valid {

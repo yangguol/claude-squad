@@ -37,6 +37,7 @@ const (
 // ApplyMetadataRepair is populated by the later metadata-repair phase. It is
 // part of the recovery report now so callers can consume one stable shape.
 type ApplyMetadataRepair struct {
+	SessionID     string
 	TransactionID string
 	AppliedTree   string
 	AppliedAt     string
@@ -105,8 +106,16 @@ func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (
 			return RecoveryReport{}, err
 		}
 		report.Issues = append(report.Issues, transactionReport.Issues...)
-		report.Repairs = append(report.Repairs, transactionReport.Repairs...)
 		report.Orphans = append(report.Orphans, transactionReport.Orphans...)
+		if len(transactionReport.Repairs) != 0 {
+			if _, exists := sessions[manifest.SessionID]; !exists {
+				if err := acknowledgeCompleteTransaction(projectPath, transaction.Directory, manifest.TransactionID); err != nil {
+					return RecoveryReport{}, err
+				}
+				continue
+			}
+		}
+		report.Repairs = append(report.Repairs, transactionReport.Repairs...)
 		switch transactionReport.Disposition {
 		case RecoveryBlocked:
 			report.Disposition = RecoveryBlocked
@@ -117,6 +126,11 @@ func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (
 		}
 	}
 	return report, nil
+}
+
+// AccessStateFromRecovery reports whether a recovered project must remain read-only.
+func AccessStateFromRecovery(report RecoveryReport) AccessState {
+	return accessStateFromReport(report)
 }
 
 func accessStateFromReport(report RecoveryReport) AccessState {

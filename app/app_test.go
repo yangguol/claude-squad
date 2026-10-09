@@ -443,11 +443,13 @@ type appTestWorkspace struct {
 	applyResult  *workspace.ApplyResult
 	applyErr     error
 	applyCalls   int
+	access       workspace.AccessState
+	acknowledged []string
 }
 
 func (w *appTestWorkspace) Mode() workspace.Mode                 { return w.mode }
 func (w *appTestWorkspace) Capabilities() workspace.Capabilities { return w.capabilities }
-func (w *appTestWorkspace) AccessState() workspace.AccessState   { return workspace.AccessState{} }
+func (w *appTestWorkspace) AccessState() workspace.AccessState   { return w.access }
 func (w *appTestWorkspace) WorkDir() string                      { return "/internal/worktree" }
 func (w *appTestWorkspace) DisplayName() string                  { return w.displayName }
 func (w *appTestWorkspace) BranchName() string                   { return "internal-shadow-branch" }
@@ -466,11 +468,14 @@ func (w *appTestWorkspace) Apply() (*workspace.ApplyResult, error) {
 	}
 	return w.applyResult, w.applyErr
 }
-func (w *appTestWorkspace) AcknowledgeApply(string) error { return nil }
-func (w *appTestWorkspace) Remove() error                 { return nil }
-func (w *appTestWorkspace) Prune() error                  { return nil }
-func (w *appTestWorkspace) Cleanup() error                { return nil }
-func (w *appTestWorkspace) Serialize() workspace.Data     { return workspace.Data{Mode: w.mode} }
+func (w *appTestWorkspace) AcknowledgeApply(transactionID string) error {
+	w.acknowledged = append(w.acknowledged, transactionID)
+	return nil
+}
+func (w *appTestWorkspace) Remove() error             { return nil }
+func (w *appTestWorkspace) Prune() error              { return nil }
+func (w *appTestWorkspace) Cleanup() error            { return nil }
+func (w *appTestWorkspace) Serialize() workspace.Data { return workspace.Data{Mode: w.mode} }
 
 func newDirectoryHome(t *testing.T) (*home, *session.Instance) {
 	h, instance, _ := newDirectoryHomeWithWorkspace(t)
@@ -652,6 +657,76 @@ func runApplyFlow(t *testing.T, h *home, result *workspace.ApplyResult, applyErr
 		msg = cmd()
 	}
 	return events
+}
+
+func TestApplyCleanupWarningStillSavesPausesAndAcknowledges(t *testing.T) {
+	h, instance, backend := newDirectoryHomeWithWorkspace(t)
+	warning := &workspace.CleanupBlockedWarning{
+		TransactionID: "tx-warning",
+		Paths:         []string{"changed.txt"},
+		RetainedPaths: []string{"/shadow/transactions/tx-warning"},
+	}
+	backend.applyResult = &workspace.ApplyResult{Changed: []string{"changed.txt"}, TransactionID: "tx-warning", Warning: warning}
+	events := []string{}
+	h.saveInstances = func([]*session.Instance) error {
+		events = append(events, "save")
+		return nil
+	}
+	h.pauseInstance = func(*session.Instance) (bool, error) {
+		events = append(events, "pause")
+		return true, nil
+	}
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	msg := cmd()
+	for cmd != nil {
+		_, cmd = h.Update(msg)
+		if cmd != nil {
+			msg = cmd()
+		}
+	}
+
+	require.Equal(t, []string{"save", "pause", "save"}, events)
+	require.Equal(t, []string{"tx-warning"}, backend.acknowledged)
+	require.Equal(t, session.Paused, instance.Status)
+	require.Contains(t, h.textOverlay.Render(), "Apply Complete")
+	require.NotContains(t, h.textOverlay.Render(), "Apply Failed")
+}
+
+func TestApplyCleanupWarningRendersRetainedPaths(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	h.showApplyResult(applyFinalMsg{
+		instance: instance,
+		result: &workspace.ApplyResult{
+			Changed:       []string{"changed.txt"},
+			TransactionID: "tx-warning",
+			Warning: &workspace.CleanupBlockedWarning{
+				TransactionID: "tx-warning",
+				Paths:         []string{"changed.txt"},
+				RetainedPaths: []string{"/shadow/transactions/tx-warning", "/source/.capture"},
+			},
+		},
+		paused: true,
+	})
+
+	rendered := h.textOverlay.Render()
+	require.Contains(t, rendered, "Cleanup warning")
+	require.Contains(t, rendered, "tx-warning")
+	require.Contains(t, rendered, "/shadow/transactions/tx-warning")
+	require.Contains(t, rendered, "/source/.capture")
+}
+
+func TestBlockedSessionMenuDisablesApplyAndResume(t *testing.T) {
+	h, instance, backend := newDirectoryHomeWithWorkspace(t)
+	backend.capabilities = workspace.Capabilities{}
+	backend.access = workspace.AccessState{ReadOnly: true, Message: "recovery blocked"}
+	instance.SetStatus(session.Paused)
+	h.instanceChanged()
+
+	rendered := h.menu.String()
+	require.NotContains(t, rendered, "apply")
+	require.NotContains(t, rendered, "resume")
 }
 
 func TestApplyFlowUsesWorkspaceApplyBackend(t *testing.T) {

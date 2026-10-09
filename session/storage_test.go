@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -117,9 +118,15 @@ func TestStorageRejectsNullWorkspaceInsteadOfLegacyFallback(t *testing.T) {
 
 type memoryInstanceStorage struct {
 	instances json.RawMessage
+	saveErr   error
+	saves     int
 }
 
 func (s *memoryInstanceStorage) SaveInstances(instances json.RawMessage) error {
+	s.saves++
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	s.instances = instances
 	return nil
 }
@@ -127,6 +134,129 @@ func (s *memoryInstanceStorage) GetInstances() json.RawMessage { return s.instan
 func (s *memoryInstanceStorage) DeleteAllInstances() error {
 	s.instances = nil
 	return nil
+}
+
+func appliedDirectoryRecord(t *testing.T) (*memoryInstanceStorage, workspace.Data, workspace.Data, string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	source := filepath.Join(t.TempDir(), "source")
+	require.NoError(t, os.MkdirAll(source, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file.txt"), []byte("before\n"), 0o644))
+	ws, branch, err := workspace.NewShadow(source, "repair-session")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	require.NoError(t, os.WriteFile(filepath.Join(ws.WorkDir(), "file.txt"), []byte("after\n"), 0o644))
+	result, err := ws.Apply()
+	require.NoError(t, err)
+	require.NotEmpty(t, result.TransactionID)
+	authoritative := ws.Serialize()
+	transactionDir := filepath.Join(filepath.Dir(authoritative.Shadow.RepoPath), "transactions", result.TransactionID)
+	stored := authoritative
+	shadowCopy := *authoritative.Shadow
+	stored.Shadow = &shadowCopy
+	stored.Shadow.LastAppliedTree = "stale-tree"
+	stored.Shadow.LastAppliedAt = "stale-time"
+	stored.Shadow.LastAppliedTransactionID = "stale-transaction"
+	records, err := json.Marshal([]InstanceData{{
+		Title: "repair-session", Path: source, Branch: branch, Status: Paused, Program: "false", Workspace: &stored,
+	}})
+	require.NoError(t, err)
+	return &memoryInstanceStorage{instances: records}, stored, authoritative, transactionDir
+}
+
+func TestLoadInstancesRepairsLastAppliedMetadataFromWAL(t *testing.T) {
+	state, _, _, transactionDir := appliedDirectoryRecord(t)
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+
+	instances, err := storage.LoadInstances()
+	require.NoError(t, err)
+	require.Len(t, instances, 1)
+	repaired := instances[0].ToInstanceData().Workspace.Shadow
+	manifest, err := workspace.ReadManifestStrict(filepath.Dir(filepath.Dir(transactionDir)), transactionDir)
+	require.Error(t, err, "matching complete receipt must be acknowledged after persistence")
+	require.NotEqual(t, "stale-tree", repaired.LastAppliedTree)
+	require.NotEqual(t, "stale-time", repaired.LastAppliedAt)
+	require.NotEqual(t, "stale-transaction", repaired.LastAppliedTransactionID)
+	require.NotEmpty(t, repaired.LastAppliedTree)
+	require.NotEmpty(t, repaired.LastAppliedAt)
+	require.NotEmpty(t, repaired.LastAppliedTransactionID)
+	_ = manifest
+}
+
+func TestLoadInstancesWALMetadataOverridesStaleSessionMetadata(t *testing.T) {
+	state, _, _, _ := appliedDirectoryRecord(t)
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+	require.NotEmpty(t, state.instances)
+
+	_, err = storage.LoadInstances()
+	require.NoError(t, err)
+	var saved []InstanceData
+	require.NoError(t, json.Unmarshal(state.instances, &saved))
+	require.NotEqual(t, "stale-tree", saved[0].Workspace.Shadow.LastAppliedTree)
+	require.NotEqual(t, "stale-time", saved[0].Workspace.Shadow.LastAppliedAt)
+	require.NotEqual(t, "stale-transaction", saved[0].Workspace.Shadow.LastAppliedTransactionID)
+}
+
+func TestLoadInstancesPersistsRepairBeforeAcknowledgingTransaction(t *testing.T) {
+	state, _, _, transactionDir := appliedDirectoryRecord(t)
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+
+	_, err = storage.LoadInstances()
+	require.NoError(t, err)
+	require.Equal(t, 1, state.saves)
+	require.NoDirExists(t, transactionDir)
+}
+
+func TestApplyMetadataSaveFailureLeavesCompleteWALForRecovery(t *testing.T) {
+	state, _, _, transactionDir := appliedDirectoryRecord(t)
+	state.saveErr = fmt.Errorf("save unavailable")
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+
+	_, err = storage.LoadInstances()
+	require.ErrorContains(t, err, "save unavailable")
+	require.DirExists(t, transactionDir)
+}
+
+func TestLoadInstancesReportsOrphanCommittedTransaction(t *testing.T) {
+	state, stored, authoritative, firstTransactionDir := appliedDirectoryRecord(t)
+	firstWorkspace, err := workspace.RestoreShadow(authoritative)
+	require.NoError(t, err)
+	require.NoError(t, firstWorkspace.AcknowledgeApply(filepath.Base(firstTransactionDir)))
+	orphan, _, err := workspace.NewShadow(stored.Shadow.SourcePath, "orphan-apply")
+	require.NoError(t, err)
+	require.NoError(t, orphan.Setup())
+	require.NoError(t, os.WriteFile(filepath.Join(orphan.WorkDir(), "orphan.txt"), []byte("orphan\n"), 0o644))
+	result, err := orphan.Apply()
+	require.NoError(t, err)
+	require.NotEmpty(t, result.TransactionID)
+	transactionDir := filepath.Join(filepath.Dir(stored.Shadow.RepoPath), "transactions", result.TransactionID)
+
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+	instances, err := storage.LoadInstances()
+	require.NoError(t, err)
+	require.Len(t, instances, 1)
+	require.False(t, instances[0].AccessState().ReadOnly)
+	require.NoDirExists(t, transactionDir)
+}
+
+func TestLoadInstancesRestoresBlockedSessionsReadOnly(t *testing.T) {
+	state, stored, _, _ := appliedDirectoryRecord(t)
+	invalid := filepath.Join(filepath.Dir(stored.Shadow.RepoPath), "transactions", "invalid")
+	require.NoError(t, os.MkdirAll(invalid, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(invalid, "manifest.json"), []byte(`{"version":2,"unexpected":true}`), 0o600))
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+
+	instances, err := storage.LoadInstances()
+	require.NoError(t, err)
+	require.True(t, instances[0].AccessState().ReadOnly)
+	require.False(t, instances[0].Capabilities().Apply)
+	require.False(t, instances[0].Capabilities().Resume)
 }
 
 func TestLegacyWorktreeRecordRestoresAsGitWorkspace(t *testing.T) {

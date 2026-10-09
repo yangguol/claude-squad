@@ -219,6 +219,7 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 	}
 	w.data.LastAppliedTree = prepared.AppliedTree
 	w.data.LastAppliedAt = prepared.AppliedAt
+	w.data.LastAppliedTransactionID = prepared.TransactionID
 	return &ApplyResult{Changed: plan.ChangedPaths(), TransactionID: prepared.TransactionID, Warning: warning}, nil
 }
 

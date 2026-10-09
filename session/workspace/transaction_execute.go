@@ -781,13 +781,23 @@ func RecoverTransaction(manifest *TransactionManifest, transactionDir string) (R
 		if err != nil {
 			return RecoveryReport{}, err
 		}
-		report := RecoveryReport{Disposition: RecoveryUnchanged}
+		report := RecoveryReport{Disposition: RecoveryUnchanged, Repairs: []ApplyMetadataRepair{{
+			SessionID: manifest.SessionID, TransactionID: manifest.TransactionID,
+			AppliedTree: manifest.AppliedTree, AppliedAt: manifest.AppliedAt,
+		}}}
 		if warning != nil {
 			report.Issues = append([]RecoveryIssue(nil), manifest.RecoveryIssues...)
 		}
 		return report, nil
 	case TransactionComplete, TransactionCleanupBlocked:
-		return RecoveryReport{Disposition: RecoveryUnchanged, Issues: append([]RecoveryIssue(nil), manifest.RecoveryIssues...)}, nil
+		return RecoveryReport{
+			Disposition: RecoveryUnchanged,
+			Issues:      append([]RecoveryIssue(nil), manifest.RecoveryIssues...),
+			Repairs: []ApplyMetadataRepair{{
+				SessionID: manifest.SessionID, TransactionID: manifest.TransactionID,
+				AppliedTree: manifest.AppliedTree, AppliedAt: manifest.AppliedAt,
+			}},
+		}, nil
 	case TransactionRolledBack:
 		return RecoveryReport{Disposition: RecoveryRolledBack}, nil
 	case TransactionRecoveryBlocked:

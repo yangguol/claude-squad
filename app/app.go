@@ -831,7 +831,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, nil
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Status == session.Loading {
+		if selected == nil || selected.Status == session.Loading || !selected.Capabilities().Resume {
 			return m, nil
 		}
 		if err := selected.Resume(); err != nil {
@@ -1124,6 +1124,13 @@ func (m *home) handleApplyResult(msg applyResultMsg) tea.Cmd {
 		m.showApplyResult(applyFinalMsg{instance: msg.instance, result: msg.result, saveErr: err})
 		return nil
 	}
+	if msg.result != nil && msg.result.TransactionID != "" {
+		if err := msg.instance.AcknowledgeApply(msg.result.TransactionID); err != nil && msg.result.Warning == nil {
+			m.finishAction(msg.instance, actionApply)
+			m.showApplyResult(applyFinalMsg{instance: msg.instance, result: msg.result, saveErr: fmt.Errorf("acknowledge apply receipt: %w", err)})
+			return nil
+		}
+	}
 	pause := m.pauseInstance
 	if pause == nil {
 		pause = (*session.Instance).PreparePause
@@ -1191,6 +1198,16 @@ func (m *home) showApplyResult(msg applyFinalMsg) {
 		}
 		if msg.pauseErr != nil {
 			lines = append(lines, "", fmt.Sprintf("Pause cleanup failed: %v", msg.pauseErr))
+		}
+		if msg.result != nil && msg.result.Warning != nil {
+			warning := msg.result.Warning
+			lines = append(lines, "", fmt.Sprintf("Cleanup warning for transaction %s.", warning.TransactionID))
+			if len(warning.Paths) != 0 {
+				lines = append(lines, "Affected paths:", strings.Join(warning.Paths, "\n"))
+			}
+			if len(warning.RetainedPaths) != 0 {
+				lines = append(lines, "Retained paths:", strings.Join(warning.RetainedPaths, "\n"))
+			}
 		}
 		content = lipgloss.JoinVertical(lipgloss.Left, lines...)
 	}
