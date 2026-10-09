@@ -16,9 +16,10 @@ type EntryOperation string
 type EntryPhase string
 type CleanupPhase string
 
-// DurabilityPoint identifies a stable, post-durability crash boundary. The
-// callback is a package-private test seam; production execution leaves it as a
-// no-op.
+// DurabilityPoint identifies a stable crash boundary. Points explicitly named
+// "before" precede the described durable publication; all other points follow
+// the described filesystem and directory durability work. The callback is a
+// package-private test seam; production execution leaves it as a no-op.
 type DurabilityPoint string
 
 var durabilityCheckpoint = func(DurabilityPoint) {}
@@ -28,18 +29,20 @@ func durabilityPathPoint(point DurabilityPoint, path string) DurabilityPoint {
 }
 
 const (
-	DurabilityManifestBeforePersistence DurabilityPoint = "manifest.before-persistence"
-	DurabilityManifestAfterPersistence  DurabilityPoint = "manifest.after-persistence"
-	DurabilityForwardCapture            DurabilityPoint = "forward.capture"
-	DurabilityForwardPublish            DurabilityPoint = "forward.publish"
-	DurabilityForwardReadyToCommit      DurabilityPoint = "forward.ready-to-commit"
-	DurabilityForwardCommit             DurabilityPoint = "forward.commit"
-	DurabilityRollbackCapture           DurabilityPoint = "rollback.capture"
-	DurabilityRollbackRestore           DurabilityPoint = "rollback.restore"
-	DurabilityRollbackComplete          DurabilityPoint = "rollback.complete"
-	DurabilityCleanupQuarantine         DurabilityPoint = "cleanup.quarantine"
-	DurabilityCleanupRemoval            DurabilityPoint = "cleanup.removal"
-	DurabilityCleanupComplete           DurabilityPoint = "cleanup.complete"
+	DurabilityInitialManifestBeforePublication DurabilityPoint = "initial-manifest.before-publication"
+	DurabilityInitialManifestAfterPublication  DurabilityPoint = "initial-manifest.after-publication"
+	DurabilityManifestBeforePersistence        DurabilityPoint = "manifest.before-persistence"
+	DurabilityManifestAfterPersistence         DurabilityPoint = "manifest.after-persistence"
+	DurabilityForwardCapture                   DurabilityPoint = "forward.capture"
+	DurabilityForwardPublish                   DurabilityPoint = "forward.publish"
+	DurabilityForwardReadyToCommit             DurabilityPoint = "forward.ready-to-commit"
+	DurabilityForwardCommit                    DurabilityPoint = "forward.commit"
+	DurabilityRollbackCapture                  DurabilityPoint = "rollback.capture"
+	DurabilityRollbackRestore                  DurabilityPoint = "rollback.restore"
+	DurabilityRollbackComplete                 DurabilityPoint = "rollback.complete"
+	DurabilityCleanupQuarantine                DurabilityPoint = "cleanup.quarantine"
+	DurabilityCleanupRemoval                   DurabilityPoint = "cleanup.removal"
+	DurabilityCleanupComplete                  DurabilityPoint = "cleanup.complete"
 )
 
 const (
@@ -114,6 +117,7 @@ type TransactionManifest struct {
 }
 
 func WriteManifestDurable(manifest TransactionManifest, transactionDir string) error {
+	durabilityCheckpoint(DurabilityInitialManifestBeforePublication)
 	contents, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode transaction manifest: %w", err)
@@ -167,6 +171,7 @@ func WriteManifestDurable(manifest TransactionManifest, transactionDir string) e
 	if err := SyncDirectory(transactionDir); err != nil {
 		return fmt.Errorf("sync transaction directory: %w", err)
 	}
+	durabilityCheckpoint(DurabilityInitialManifestAfterPublication)
 	return nil
 }
 

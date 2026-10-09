@@ -720,8 +720,11 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			if err := validateEntryIdentity(treeEntry, true); err != nil {
 				return fmt.Errorf("transaction entry %d expected tree identity %q: %w", index, name, err)
 			}
-			if err := ensureReconstructiblePath(manifest.SourcePath, filepath.ToSlash(filepath.Join(filepath.FromSlash(entry.Path), filepath.FromSlash(name))), "expected tree"); err != nil {
-				return fmt.Errorf("transaction entry %d expected tree path %q: %w", index, name, err)
+			expectedTreePath := filepath.ToSlash(filepath.Join(filepath.FromSlash(entry.Path), filepath.FromSlash(name)))
+			if !manifestTargetParentWillBeReplaced(manifest, expectedTreePath) {
+				if err := ensureReconstructiblePath(manifest.SourcePath, expectedTreePath, "expected tree"); err != nil {
+					return fmt.Errorf("transaction entry %d expected tree path %q: %w", index, name, err)
+				}
 			}
 			treePaths = append(treePaths, name)
 		}

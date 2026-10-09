@@ -66,3 +66,23 @@ Pending at report creation.
 ## Concerns
 
 The matrix runs a full prepared fixture for each boundary, so the focused test takes roughly 42 seconds once and 125 seconds at `-count=3`; the complete workspace suite takes roughly seven minutes on this Darwin host.
+
+## Fix Round 1
+
+Expanded the disk-only subprocess matrix to exercise real create, update, delete, nested-parent, regular/symlink replacement, and directory-to-leaf replacement boundaries. Every crash now reads the strict on-disk manifest before recovery and asserts the explicitly mapped transaction state plus entry/cleanup phase; terminal points assert all relevant phases. Initial manifest publication has distinct pre-publication and post-rename/directory-sync checkpoints, proving orphan cleanup before publication and prepared rollback after publication.
+
+Blocked recovery cases now assert exact paths and retained paths, preserve external occupants and replacement temporaries, and prove an identical durable blocked manifest after a second fresh recovery subprocess. Expected symlink modes are normalized from a platform probe before comparison rather than copied from observed results.
+
+The expanded cases exposed and fixed two recovery bugs: pending directory-replacement creates were incorrectly treated as external targets before capture, and strict validation rejected expected directory-tree descendants after their parent had already been replaced by a leaf.
+
+Verification:
+
+```text
+go test ./session/workspace -run '^TestCrashRecovery' -count=1 -timeout=15m  PASS (114.997s)
+go test ./session/workspace -run '^TestCrashRecovery' -count=3 -timeout=30m  PASS (351.396s)
+go test ./session/workspace -count=1 -timeout=20m                         PASS (514.104s)
+go test ./... -count=1 -timeout=30m                                      PASS
+git diff --check                                                         PASS
+```
+
+Concern: the expanded real-process matrix increases focused runtime to about two minutes once and six minutes at `-count=3` on this Darwin host.

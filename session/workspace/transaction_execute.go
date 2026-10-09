@@ -1059,7 +1059,7 @@ func reconcileRollbackEntryBound(manifest *TransactionManifest, index int, roots
 	}
 	published := publicationPossible && state.TargetMatchesResult
 	simulatedCapture := false
-	if entry.Operation == EntryOperationCreate && entry.Phase == EntryPhasePending && state.TargetExists {
+	if entry.Operation == EntryOperationCreate && entry.CaptureName == "" && entry.Phase == EntryPhasePending && state.TargetExists {
 		return block("pending create target is externally owned", []string{entry.Path}, []string{entry.Path, entry.StagePath}), nil
 	}
 	if entry.Phase == EntryPhasePublishIntent && state.StageExists {
