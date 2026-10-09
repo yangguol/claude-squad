@@ -31,6 +31,8 @@ type shadowWorkspace struct {
 	access AccessState
 }
 
+var lifecycleAccessStatePublishedHook func()
+
 func NewShadow(source, sessionName string) (result Workspace, branchName string, returnErr error) {
 	canonical, err := resolveDirectory(source)
 	if err != nil {
@@ -163,18 +165,33 @@ func (w *shadowWorkspace) Setup() (returnErr error) {
 		return err
 	}
 	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
+	return w.setupLocked()
+}
+
+func (w *shadowWorkspace) refreshAccessLocked() error {
+	projectPath := filepath.Dir(w.data.RepoPath)
 	report, err := recoverProjectLocked(projectPath, map[string]*ShadowData{w.data.SessionID: &w.data})
 	if err != nil {
 		return err
 	}
 	w.access = accessStateFromReport(report)
+	if lifecycleAccessStatePublishedHook != nil {
+		lifecycleAccessStatePublishedHook()
+	}
 	if w.access.ReadOnly {
 		return fmt.Errorf("workspace is read-only: %s", w.access.Message)
 	}
-	return w.setupLocked()
+	return nil
 }
 
 func (w *shadowWorkspace) setupLocked() error {
+	if err := w.refreshAccessLocked(); err != nil {
+		return err
+	}
+	return w.ensureWorktreeLocked()
+}
+
+func (w *shadowWorkspace) ensureWorktreeLocked() error {
 	if err := validateShadowData(w.data); err != nil {
 		return err
 	}

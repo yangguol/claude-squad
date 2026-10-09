@@ -172,8 +172,8 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 	defer func() {
 		returnErr = errors.Join(returnErr, lock.Close())
 	}()
-	if w.access.ReadOnly {
-		return nil, fmt.Errorf("workspace is read-only: %s", w.access.Message)
+	if err := w.refreshAccessLocked(); err != nil {
+		return nil, err
 	}
 	transactionRoot := filepath.Join(projectPath, "transactions")
 	if err := atomicApplyPreflight(w.data.SourcePath, transactionRoot); err != nil {

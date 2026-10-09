@@ -412,9 +412,6 @@ func (i *Instance) Apply() (*workspace.ApplyResult, error) {
 	if i.workspace == nil {
 		return nil, fmt.Errorf("workspace is not initialized")
 	}
-	if i.workspace.AccessState().ReadOnly {
-		return nil, fmt.Errorf("workspace is read-only: %s", i.workspace.AccessState().Message)
-	}
 	return i.workspace.Apply()
 }
 
@@ -561,9 +558,6 @@ func (i *Instance) PreparePause() (paused bool, err error) {
 
 // Resume recreates the worktree and restarts the tmux session
 func (i *Instance) Resume() error {
-	if i.workspace != nil && i.workspace.AccessState().ReadOnly {
-		return fmt.Errorf("workspace is read-only: %s", i.workspace.AccessState().Message)
-	}
 	if !i.started {
 		return fmt.Errorf("cannot resume instance that has not been started")
 	}
@@ -585,7 +579,17 @@ func (i *Instance) Resume() error {
 	// and that is exactly what we want; but an instance paused because its tmux session
 	// died still has its worktree — and the work in it — sitting on disk, so leave it be.
 	workspaceAcquired := false
-	if valid, err := i.workspace.IsValid(); err != nil || !valid {
+	if i.workspace.Mode() == workspace.ModeDirectory {
+		valid, err := i.workspace.IsValid()
+		if err != nil {
+			log.WarningLog.Printf("could not validate workspace at %s, refreshing it: %v", i.workspace.WorkDir(), err)
+		}
+		if err := i.workspace.Setup(); err != nil {
+			log.ErrorLog.Print(err)
+			return fmt.Errorf("failed to setup workspace: %w", err)
+		}
+		workspaceAcquired = err != nil || !valid
+	} else if valid, err := i.workspace.IsValid(); err != nil || !valid {
 		if err != nil {
 			log.WarningLog.Printf("could not validate workspace at %s, recreating it: %v",
 				i.workspace.WorkDir(), err)

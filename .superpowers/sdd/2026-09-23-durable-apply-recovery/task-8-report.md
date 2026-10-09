@@ -68,3 +68,27 @@ Confirmed recovery remains fail-closed for invalid, legacy, and retained-orphan 
 ## Concerns
 
 `AccessState` is runtime-derived and intentionally not persisted. Task 9 still owns apply metadata repair, and Task 10 still owns reset integration.
+
+## Fix Round 1
+
+### Status
+
+Resolved all lifecycle review findings. Apply and directory Resume now refresh automatic recovery and publish the resulting access state while retaining the same project lock through rejection or subsequent mutation/setup. Instance-level cached read-only checks no longer bypass that refresh.
+
+### TDD and integration coverage
+
+Added deterministic tests proving:
+
+- Apply rolls back an actual interrupted transaction, publishes writable capabilities under the same lock, and immediately applies the pending worktree change.
+- Apply discovers a newly invalid manifest before source mutation and publishes exact retained paths.
+- Directory Resume refreshes a previously read-only restored workspace even when its worktree remains valid, preserves uncommitted worktree content, and becomes writable without restart.
+- Actual `RestoreShadow`/`FromInstanceData` blocked restores neither recreate a missing worktree nor create/restore tmux.
+- Recovery-blocked and cleanup-blocked manifests expose exact issue and retained paths.
+- A retained orphan produces one exact stable retained path rather than duplicate issue/orphan entries.
+- Automatic rollback and access-state publication reject deterministic lock probes with typed `OperationInProgressError`.
+
+The initial RED run failed because the publication hook and refresh behavior did not exist. After implementation, focused lifecycle tests, full `session/workspace`, full `session`, and `go test ./... -count=1` pass. `git diff --check` is clean.
+
+### Concerns
+
+None within Task 8 scope. Task 9 metadata repair and Task 10 reset integration remain intentionally unchanged.

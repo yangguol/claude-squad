@@ -67,6 +67,8 @@ func TestRestoreRecoveryBlockedSessionReadOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, restored.AccessState().ReadOnly)
 	require.Equal(t, RecoveryBlocked, restored.AccessState().Disposition)
+	require.Equal(t, []string{"file"}, restored.AccessState().Paths)
+	require.Equal(t, []string{"retained"}, restored.AccessState().RetainedPaths)
 	require.False(t, restored.Capabilities().Apply)
 	require.False(t, restored.Capabilities().Resume)
 }
@@ -75,13 +77,15 @@ func TestRestoreCleanupBlockedSessionReadOnly(t *testing.T) {
 	ws := lifecycleWorkspace(t)
 	transactionDir := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", "cleanup")
 	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
-	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "cleanup", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionCleanupBlocked, Entries: []TransactionEntry{}, RecoveryIssues: []RecoveryIssue{{TransactionID: "cleanup", State: TransactionCleanupBlocked, Message: "cleanup required"}}}
+	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "cleanup", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionCleanupBlocked, Entries: []TransactionEntry{}, RecoveryIssues: []RecoveryIssue{{TransactionID: "cleanup", State: TransactionCleanupBlocked, Message: "cleanup required", Paths: []string{"file"}, RetainedPaths: []string{"capture", "quarantine"}}}}
 	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
 
 	restored, err := RestoreShadow(ws.Serialize())
 	require.NoError(t, err)
 	require.True(t, restored.AccessState().ReadOnly)
 	require.Equal(t, RecoveryUnchanged, restored.AccessState().Disposition)
+	require.Equal(t, []string{"file"}, restored.AccessState().Paths)
+	require.Equal(t, []string{"capture", "quarantine"}, restored.AccessState().RetainedPaths)
 	require.False(t, restored.Capabilities().Apply)
 }
 
@@ -104,6 +108,78 @@ func TestHealthyRecoveredSessionRetainsNormalCapabilities(t *testing.T) {
 	require.False(t, restored.AccessState().ReadOnly)
 	require.True(t, restored.Capabilities().Apply)
 	require.True(t, restored.Capabilities().Resume)
+}
+
+func TestApplyRefreshesRecoveryAndPublishesAccessUnderContinuousLock(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	transactionDir := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", "interrupted")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifest := TransactionManifest{
+		Version: CurrentTransactionVersion, TransactionID: "interrupted", ProjectID: ws.data.ProjectID,
+		SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionPrepared,
+		Entries: []TransactionEntry{},
+	}
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+	require.NoError(t, os.WriteFile(filepath.Join(ws.data.WorktreePath, "file"), []byte("agent"), 0o644))
+
+	var probes int
+	probe := func() {
+		_, err := AcquireProjectLock(filepath.Dir(ws.data.RepoPath), "recovery probe")
+		var busy *OperationInProgressError
+		require.ErrorAs(t, err, &busy)
+		probes++
+	}
+	transactionManifestWriteHook = func(state TransactionState) error {
+		if state == TransactionRollingBack || state == TransactionRolledBack {
+			probe()
+		}
+		return nil
+	}
+	lifecycleAccessStatePublishedHook = probe
+	t.Cleanup(func() {
+		transactionManifestWriteHook = nil
+		lifecycleAccessStatePublishedHook = nil
+	})
+
+	result, err := ws.Apply()
+	require.NoError(t, err)
+	require.Equal(t, []string{"file"}, result.Changed)
+	require.Equal(t, "agent", mustReadFile(t, filepath.Join(ws.data.SourcePath, "file")))
+	require.False(t, ws.AccessState().ReadOnly)
+	require.True(t, ws.Capabilities().Apply)
+	require.GreaterOrEqual(t, probes, 3)
+}
+
+func TestApplyRefreshesNewBlockedStateBeforeMutation(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	transactionDir := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", "invalid")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifestPath := filepath.Join(transactionDir, "manifest.json")
+	require.NoError(t, os.WriteFile(manifestPath, []byte(`{"version":2,"unexpected":true}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(ws.data.WorktreePath, "file"), []byte("agent"), 0o644))
+
+	_, err := ws.Apply()
+	require.ErrorContains(t, err, "read-only")
+	require.Equal(t, "old", mustReadFile(t, filepath.Join(ws.data.SourcePath, "file")))
+	state := ws.AccessState()
+	require.True(t, state.ReadOnly)
+	require.Equal(t, []string{transactionDir}, state.RetainedPaths)
+	require.False(t, ws.Capabilities().Apply)
+}
+
+func TestRestoreRetainedOrphanReadOnlyWithExactDeduplicatedPath(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	path := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", ".orphan-0123456789abcdef0123456789abcdef")
+	require.NoError(t, os.MkdirAll(path, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(path, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.True(t, restored.AccessState().ReadOnly)
+	require.Equal(t, RecoveryBlocked, restored.AccessState().Disposition)
+	require.Equal(t, []string{path}, restored.AccessState().RetainedPaths)
+	require.False(t, restored.Capabilities().Apply)
+	require.False(t, restored.Capabilities().Resume)
 }
 
 func TestApplyAndResumeContendOnSameProjectLock(t *testing.T) {

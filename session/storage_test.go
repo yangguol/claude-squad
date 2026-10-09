@@ -49,6 +49,32 @@ func TestInstanceDataDirectoryWorkspaceRoundTrip(t *testing.T) {
 	require.Equal(t, filepath.Base(source), instance.DisplayWorkspace())
 }
 
+func TestFromInstanceDataReadOnlyShadowDoesNotRecreateWorktreeOrTmux(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := filepath.Join(t.TempDir(), "source")
+	require.NoError(t, os.MkdirAll(source, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file.txt"), []byte("content\n"), 0o644))
+	ws, branch, err := workspace.NewShadow(source, "blocked-directory")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	stored := ws.Serialize()
+	transactionDir := filepath.Join(filepath.Dir(stored.Shadow.RepoPath), "transactions", "invalid")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(transactionDir, "manifest.json"), []byte(`{"version":2,"unexpected":true}`), 0o600))
+	require.NoError(t, os.RemoveAll(stored.Shadow.WorktreePath))
+
+	instance, err := FromInstanceData(InstanceData{
+		Title: "blocked-directory", Path: source, Branch: branch, Status: Running, Program: "false", Workspace: &stored,
+	})
+	require.NoError(t, err)
+	require.Equal(t, Paused, instance.Status)
+	require.True(t, instance.Started())
+	require.False(t, instance.Capabilities().Apply)
+	require.False(t, instance.Capabilities().Resume)
+	require.NoDirExists(t, stored.Shadow.WorktreePath)
+	require.Nil(t, instance.tmuxSession)
+}
+
 func TestPresentEmptyWorkspaceDoesNotFallBackToLegacyWorktree(t *testing.T) {
 	record := `{
 		"title":"malformed","path":"/repo","branch":"feature","status":3,

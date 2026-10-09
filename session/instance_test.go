@@ -128,29 +128,74 @@ func (w *fakeWorkspace) Prune() error                           { w.pruneCalls++
 func (w *fakeWorkspace) Cleanup() error                         { w.cleanupCalls++; w.record("cleanup"); return w.cleanupErr }
 func (w *fakeWorkspace) Serialize() workspace.Data              { return w.serializeData }
 
-func TestReadOnlySessionDisablesApplyAndResume(t *testing.T) {
-	ws := &fakeWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: false, Resume: false}, accessState: workspace.AccessState{ReadOnly: true, Message: "manual recovery required"}}
-	instance, err := NewInstance(InstanceOptions{Title: "blocked", Path: t.TempDir(), Workspace: ws})
+func TestReadOnlyRestoreDoesNotStartTmuxOrRecreateWorktree(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := filepath.Join(t.TempDir(), "source")
+	require.NoError(t, os.MkdirAll(source, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("source"), 0o644))
+	ws, branch, err := workspace.NewShadow(source, "blocked")
 	require.NoError(t, err)
-	instance.started = true
-	instance.Status = Paused
+	require.NoError(t, ws.Setup())
+	stored := ws.Serialize()
+	require.NoError(t, os.WriteFile(filepath.Join(stored.Shadow.WorktreePath, "uncommitted"), []byte("preserve"), 0o644))
+	transactionDir := filepath.Join(filepath.Dir(stored.Shadow.RepoPath), "transactions", "invalid")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(transactionDir, "manifest.json"), []byte(`{"version":2,"unexpected":true}`), 0o600))
 
-	require.False(t, instance.Capabilities().Apply)
-	require.False(t, instance.Capabilities().Resume)
-	_, err = instance.Apply()
-	require.ErrorContains(t, err, "read-only")
-	require.ErrorContains(t, instance.Resume(), "read-only")
-	require.Zero(t, ws.setupCalls)
+	instance, err := FromInstanceData(InstanceData{Title: "blocked", Path: source, Branch: branch, Status: Running, Workspace: &stored})
+	require.NoError(t, err)
+	require.Equal(t, Paused, instance.Status)
+	require.Nil(t, instance.tmuxSession)
+	require.Equal(t, "preserve", mustReadSessionFile(t, filepath.Join(stored.Shadow.WorktreePath, "uncommitted")))
 }
 
-func TestReadOnlyRestoreDoesNotStartTmuxOrRecreateWorktree(t *testing.T) {
-	ws := &fakeWorkspace{mode: workspace.ModeDirectory, accessState: workspace.AccessState{ReadOnly: true, Message: "manual recovery required"}}
-	instance, err := NewInstance(InstanceOptions{Title: "blocked", Path: t.TempDir(), Workspace: ws})
+func TestResumeRefreshesReadOnlyShadowWithoutRecreatingValidWorktree(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := filepath.Join(t.TempDir(), "source")
+	require.NoError(t, os.MkdirAll(source, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("source"), 0o644))
+	ws, branch, err := workspace.NewShadow(source, "recoverable")
 	require.NoError(t, err)
-	instance.started = true
-	instance.Status = Paused
-	require.ErrorContains(t, instance.Resume(), "read-only")
-	require.Zero(t, ws.setupCalls)
+	require.NoError(t, ws.Setup())
+	stored := ws.Serialize()
+	marker := filepath.Join(stored.Shadow.WorktreePath, "uncommitted")
+	require.NoError(t, os.WriteFile(marker, []byte("preserve"), 0o644))
+	transactionDir := filepath.Join(filepath.Dir(stored.Shadow.RepoPath), "transactions", "invalid")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(transactionDir, "manifest.json"), []byte(`{"version":2,"unexpected":true}`), 0o600))
+
+	instance, err := FromInstanceData(InstanceData{Title: "recoverable", Path: source, Branch: branch, Status: Paused, Workspace: &stored})
+	require.NoError(t, err)
+	require.False(t, instance.Capabilities().Resume)
+	require.NoError(t, os.RemoveAll(transactionDir))
+	pty := &nullPtyFactory{t: t}
+	hasSessionCalls := 0
+	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps(instance.Title, "", pty, cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			if strings.Contains(cmd.String(), "has-session") {
+				hasSessionCalls++
+				if hasSessionCalls <= 2 {
+					return fmt.Errorf("missing")
+				}
+			}
+			return nil
+		},
+		OutputFunc: func(*exec.Cmd) ([]byte, error) { return nil, nil },
+	}))
+
+	require.NoError(t, instance.Resume())
+	require.Equal(t, Running, instance.Status)
+	require.True(t, instance.Capabilities().Apply)
+	require.True(t, instance.Capabilities().Resume)
+	require.Equal(t, "preserve", mustReadSessionFile(t, marker))
+	require.Equal(t, 2, pty.calls)
+}
+
+func mustReadSessionFile(t *testing.T, path string) string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(contents)
 }
 
 func TestInstanceWorkspaceSetupPrecedesTmuxStartAndUsesWorkDir(t *testing.T) {
@@ -227,7 +272,7 @@ func TestResumePreservesPreexistingValidWorkspaceWhenTmuxStartFails(t *testing.T
 
 	require.Error(t, instance.Resume())
 	require.Equal(t, Paused, instance.Status)
-	require.Zero(t, ws.setupCalls)
+	require.Equal(t, 1, ws.setupCalls, "directory resume always refreshes recovery state")
 	require.Zero(t, ws.cleanupCalls, "resume must not clean a workspace it did not acquire")
 }
 

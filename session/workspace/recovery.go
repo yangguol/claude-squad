@@ -74,7 +74,10 @@ func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (
 	}
 	report := RecoveryReport{Disposition: RecoveryUnchanged}
 	for _, transaction := range discovered {
-		if transaction.Invalid != nil || transaction.Legacy || transaction.Orphan {
+		if transaction.Orphan && transaction.Invalid == nil {
+			continue
+		}
+		if transaction.Invalid != nil || transaction.Legacy {
 			message := "transaction requires explicit recovery"
 			if transaction.Invalid != nil {
 				message = transaction.Invalid.Error()
@@ -118,17 +121,28 @@ func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (
 
 func accessStateFromReport(report RecoveryReport) AccessState {
 	state := AccessState{Disposition: report.Disposition}
+	pathSeen := make(map[string]struct{})
+	retainedSeen := make(map[string]struct{})
+	appendUnique := func(destination *[]string, seen map[string]struct{}, paths ...string) {
+		for _, path := range paths {
+			if _, exists := seen[path]; exists {
+				continue
+			}
+			seen[path] = struct{}{}
+			*destination = append(*destination, path)
+		}
+	}
 	for _, issue := range report.Issues {
 		state.ReadOnly = true
 		if state.Message == "" {
 			state.Message = issue.Message
 		}
-		state.Paths = append(state.Paths, issue.Paths...)
-		state.RetainedPaths = append(state.RetainedPaths, issue.RetainedPaths...)
+		appendUnique(&state.Paths, pathSeen, issue.Paths...)
+		appendUnique(&state.RetainedPaths, retainedSeen, issue.RetainedPaths...)
 	}
 	if len(report.Orphans) != 0 {
 		state.ReadOnly = true
-		state.RetainedPaths = append(state.RetainedPaths, report.Orphans...)
+		appendUnique(&state.RetainedPaths, retainedSeen, report.Orphans...)
 	}
 	if state.ReadOnly && state.Message == "" {
 		state.Message = "project requires explicit recovery"
@@ -168,7 +182,10 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 	if err != nil {
 		return nil, fmt.Errorf("inspect transaction root: %w", err)
 	}
-	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("transaction root is a symlink, not a real directory")
+	}
+	if !rootInfo.IsDir() {
 		return nil, errors.New("transaction root is not a real directory")
 	}
 	if err := validateCanonicalTrustedDirectory(transactionRoot, "transaction root"); err != nil {
