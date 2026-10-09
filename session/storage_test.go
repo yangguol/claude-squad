@@ -45,7 +45,7 @@ func TestInstanceDataDirectoryWorkspaceRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, workspace.ModeDirectory, instance.WorkspaceMode())
 	require.Equal(t, stored, *instance.ToInstanceData().Workspace)
-	require.Equal(t, workspace.Capabilities{Apply: true}, instance.Capabilities())
+	require.Equal(t, workspace.Capabilities{Apply: true, Resume: true}, instance.Capabilities())
 	require.Equal(t, filepath.Base(source), instance.DisplayWorkspace())
 }
 

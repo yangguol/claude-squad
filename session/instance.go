@@ -155,6 +155,11 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		},
 	}
 
+	if restored.AccessState().ReadOnly {
+		instance.Status = Paused
+		instance.started = true
+		return instance, nil
+	}
 	if instance.Paused() {
 		instance.started = true
 		instance.tmuxSession = tmux.NewTmuxSession(instance.Title, instance.Program)
@@ -407,6 +412,9 @@ func (i *Instance) Apply() (*workspace.ApplyResult, error) {
 	if i.workspace == nil {
 		return nil, fmt.Errorf("workspace is not initialized")
 	}
+	if i.workspace.AccessState().ReadOnly {
+		return nil, fmt.Errorf("workspace is read-only: %s", i.workspace.AccessState().Message)
+	}
 	return i.workspace.Apply()
 }
 
@@ -553,6 +561,9 @@ func (i *Instance) PreparePause() (paused bool, err error) {
 
 // Resume recreates the worktree and restarts the tmux session
 func (i *Instance) Resume() error {
+	if i.workspace != nil && i.workspace.AccessState().ReadOnly {
+		return fmt.Errorf("workspace is read-only: %s", i.workspace.AccessState().Message)
+	}
 	if !i.started {
 		return fmt.Errorf("cannot resume instance that has not been started")
 	}

@@ -447,6 +447,7 @@ type appTestWorkspace struct {
 
 func (w *appTestWorkspace) Mode() workspace.Mode                 { return w.mode }
 func (w *appTestWorkspace) Capabilities() workspace.Capabilities { return w.capabilities }
+func (w *appTestWorkspace) AccessState() workspace.AccessState   { return workspace.AccessState{} }
 func (w *appTestWorkspace) WorkDir() string                      { return "/internal/worktree" }
 func (w *appTestWorkspace) DisplayName() string                  { return w.displayName }
 func (w *appTestWorkspace) BranchName() string                   { return "internal-shadow-branch" }
@@ -465,10 +466,11 @@ func (w *appTestWorkspace) Apply() (*workspace.ApplyResult, error) {
 	}
 	return w.applyResult, w.applyErr
 }
-func (w *appTestWorkspace) Remove() error             { return nil }
-func (w *appTestWorkspace) Prune() error              { return nil }
-func (w *appTestWorkspace) Cleanup() error            { return nil }
-func (w *appTestWorkspace) Serialize() workspace.Data { return workspace.Data{Mode: w.mode} }
+func (w *appTestWorkspace) AcknowledgeApply(string) error { return nil }
+func (w *appTestWorkspace) Remove() error                 { return nil }
+func (w *appTestWorkspace) Prune() error                  { return nil }
+func (w *appTestWorkspace) Cleanup() error                { return nil }
+func (w *appTestWorkspace) Serialize() workspace.Data     { return workspace.Data{Mode: w.mode} }
 
 func newDirectoryHome(t *testing.T) (*home, *session.Instance) {
 	h, instance, _ := newDirectoryHomeWithWorkspace(t)

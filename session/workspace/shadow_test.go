@@ -12,6 +12,111 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNewShadowHoldsProjectLockAcrossBaselineScan(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o644))
+
+	var contention error
+	scanAfterLstatHook = func(string) {
+		if contention != nil {
+			return
+		}
+		canonical, err := filepath.EvalSymlinks(source)
+		require.NoError(t, err)
+		root, err := shadowRoot()
+		require.NoError(t, err)
+		_, contention = AcquireProjectLock(filepath.Join(root, shadowProjectID(canonical)), "probe")
+	}
+	t.Cleanup(func() { scanAfterLstatHook = nil })
+
+	_, _, err := NewShadow(source, "locked-scan")
+	require.NoError(t, err)
+	var busy *OperationInProgressError
+	require.ErrorAs(t, contention, &busy)
+}
+
+func lifecycleWorkspace(t *testing.T) *shadowWorkspace {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("old"), 0o644))
+	return newApplyWorkspace(t, source)
+}
+
+func TestNewSessionRejectedWhileProjectRecoveryBlocked(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	projectPath := filepath.Dir(ws.data.RepoPath)
+	transactionDir := filepath.Join(projectPath, "transactions", "blocked")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "blocked", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionRecoveryBlocked, Entries: []TransactionEntry{}, RecoveryIssues: []RecoveryIssue{{TransactionID: "blocked", State: TransactionRecoveryBlocked, Message: "manual recovery required"}}}
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+
+	_, _, err := NewShadow(ws.data.SourcePath, "rejected")
+	require.ErrorContains(t, err, "manual recovery required")
+}
+
+func TestRestoreRecoveryBlockedSessionReadOnly(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	transactionDir := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", "blocked")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "blocked", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionRecoveryBlocked, Entries: []TransactionEntry{}, RecoveryIssues: []RecoveryIssue{{TransactionID: "blocked", State: TransactionRecoveryBlocked, Message: "manual recovery required", Paths: []string{"file"}, RetainedPaths: []string{"retained"}}}}
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.True(t, restored.AccessState().ReadOnly)
+	require.Equal(t, RecoveryBlocked, restored.AccessState().Disposition)
+	require.False(t, restored.Capabilities().Apply)
+	require.False(t, restored.Capabilities().Resume)
+}
+
+func TestRestoreCleanupBlockedSessionReadOnly(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	transactionDir := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", "cleanup")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "cleanup", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionCleanupBlocked, Entries: []TransactionEntry{}, RecoveryIssues: []RecoveryIssue{{TransactionID: "cleanup", State: TransactionCleanupBlocked, Message: "cleanup required"}}}
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.True(t, restored.AccessState().ReadOnly)
+	require.Equal(t, RecoveryUnchanged, restored.AccessState().Disposition)
+	require.False(t, restored.Capabilities().Apply)
+}
+
+func TestRestoreLegacyIncompleteSessionReadOnly(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	transactionDir := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", "legacy")
+	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(transactionDir, "manifest.json"), []byte(`{"version":1}`), 0o600))
+
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.True(t, restored.AccessState().ReadOnly)
+	require.Contains(t, restored.AccessState().Message, "legacy")
+}
+
+func TestHealthyRecoveredSessionRetainsNormalCapabilities(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.False(t, restored.AccessState().ReadOnly)
+	require.True(t, restored.Capabilities().Apply)
+	require.True(t, restored.Capabilities().Resume)
+}
+
+func TestApplyAndResumeContendOnSameProjectLock(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	lock, err := AcquireProjectLock(filepath.Dir(ws.data.RepoPath), "holder")
+	require.NoError(t, err)
+	defer lock.Close()
+	_, err = ws.Apply()
+	var busy *OperationInProgressError
+	require.ErrorAs(t, err, &busy)
+	require.ErrorAs(t, ws.Setup(), &busy)
+}
+
 func TestShadowLayoutStableIdentityAndCanonicalSource(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -101,7 +206,7 @@ func TestShadowSharedLinksAndLifecycle(t *testing.T) {
 
 	data := ws.Serialize()
 	require.Equal(t, ModeDirectory, ws.Mode())
-	require.Equal(t, Capabilities{BranchPicker: false, Push: false, Apply: true}, ws.Capabilities())
+	require.Equal(t, Capabilities{BranchPicker: false, Push: false, Apply: true, Resume: true}, ws.Capabilities())
 	require.Equal(t, filepath.Base(source), ws.DisplayName())
 	require.ElementsMatch(t, []string{"node_modules", "vendor"}, data.Shadow.SharedLinks)
 	for _, name := range data.Shadow.SharedLinks {
@@ -340,8 +445,10 @@ func TestIncompleteTransactionReportedOnRestoreAndPreserved(t *testing.T) {
 	require.NoError(t, os.MkdirAll(directory, 0o700))
 	require.NoError(t, writeTransactionManifest(Transaction{Directory: directory, Version: 1, SessionID: data.Shadow.SessionID, SourcePath: source, State: transactionApplying}))
 
-	_, err := RestoreShadow(data)
-	require.ErrorContains(t, err, "incomplete apply transactions")
+	restored, err := RestoreShadow(data)
+	require.NoError(t, err)
+	require.True(t, restored.AccessState().ReadOnly)
+	require.Contains(t, restored.AccessState().Message, "legacy")
 	require.FileExists(t, filepath.Join(directory, "manifest.json"))
 }
 
@@ -358,8 +465,9 @@ func TestCommittedCleanupFailureReportedOnRestore(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(directory), 0o700))
 	require.NoError(t, os.WriteFile(directory+".cleanup.json", contents, 0o600))
 
-	_, err = RestoreShadow(data)
-	require.ErrorContains(t, err, "incomplete apply transactions")
+	restored, err := RestoreShadow(data)
+	require.NoError(t, err)
+	require.True(t, restored.AccessState().ReadOnly)
 	require.FileExists(t, directory+".cleanup.json")
 }
 

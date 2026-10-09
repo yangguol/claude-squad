@@ -21,6 +21,15 @@ type Capabilities struct {
 	BranchPicker bool
 	Push         bool
 	Apply        bool
+	Resume       bool
+}
+
+type AccessState struct {
+	ReadOnly      bool
+	Disposition   RecoveryDisposition
+	Message       string
+	Paths         []string
+	RetainedPaths []string
 }
 
 type ApplyResult struct {
@@ -88,6 +97,7 @@ type Data struct {
 type Workspace interface {
 	Mode() Mode
 	Capabilities() Capabilities
+	AccessState() AccessState
 	WorkDir() string
 	DisplayName() string
 	BranchName() string
@@ -100,6 +110,7 @@ type Workspace interface {
 	CommitChanges(string) error
 	PushChanges(string, bool) error
 	Apply() (*ApplyResult, error)
+	AcknowledgeApply(string) error
 	Remove() error
 	Prune() error
 	Cleanup() error

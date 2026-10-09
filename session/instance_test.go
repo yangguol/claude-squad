@@ -99,6 +99,7 @@ type fakeWorkspace struct {
 	removeCalls   int
 	pruneCalls    int
 	serializeData workspace.Data
+	accessState   workspace.AccessState
 }
 
 func (w *fakeWorkspace) record(event string) {
@@ -108,6 +109,7 @@ func (w *fakeWorkspace) record(event string) {
 }
 func (w *fakeWorkspace) Mode() workspace.Mode                   { return w.mode }
 func (w *fakeWorkspace) Capabilities() workspace.Capabilities   { return w.capabilities }
+func (w *fakeWorkspace) AccessState() workspace.AccessState     { return w.accessState }
 func (w *fakeWorkspace) WorkDir() string                        { return w.workDir }
 func (w *fakeWorkspace) DisplayName() string                    { return w.displayName }
 func (w *fakeWorkspace) BranchName() string                     { return w.branchName }
@@ -120,10 +122,36 @@ func (w *fakeWorkspace) DiffNumstat() *git.DiffStats            { return w.diff 
 func (w *fakeWorkspace) CommitChanges(string) error             { w.commitCalls++; w.record("commit"); return nil }
 func (w *fakeWorkspace) PushChanges(string, bool) error         { return nil }
 func (w *fakeWorkspace) Apply() (*workspace.ApplyResult, error) { return &workspace.ApplyResult{}, nil }
+func (w *fakeWorkspace) AcknowledgeApply(string) error          { return nil }
 func (w *fakeWorkspace) Remove() error                          { w.removeCalls++; w.record("remove"); return w.removeErr }
 func (w *fakeWorkspace) Prune() error                           { w.pruneCalls++; w.record("prune"); return w.pruneErr }
 func (w *fakeWorkspace) Cleanup() error                         { w.cleanupCalls++; w.record("cleanup"); return w.cleanupErr }
 func (w *fakeWorkspace) Serialize() workspace.Data              { return w.serializeData }
+
+func TestReadOnlySessionDisablesApplyAndResume(t *testing.T) {
+	ws := &fakeWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: false, Resume: false}, accessState: workspace.AccessState{ReadOnly: true, Message: "manual recovery required"}}
+	instance, err := NewInstance(InstanceOptions{Title: "blocked", Path: t.TempDir(), Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Paused
+
+	require.False(t, instance.Capabilities().Apply)
+	require.False(t, instance.Capabilities().Resume)
+	_, err = instance.Apply()
+	require.ErrorContains(t, err, "read-only")
+	require.ErrorContains(t, instance.Resume(), "read-only")
+	require.Zero(t, ws.setupCalls)
+}
+
+func TestReadOnlyRestoreDoesNotStartTmuxOrRecreateWorktree(t *testing.T) {
+	ws := &fakeWorkspace{mode: workspace.ModeDirectory, accessState: workspace.AccessState{ReadOnly: true, Message: "manual recovery required"}}
+	instance, err := NewInstance(InstanceOptions{Title: "blocked", Path: t.TempDir(), Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Paused
+	require.ErrorContains(t, instance.Resume(), "read-only")
+	require.Zero(t, ws.setupCalls)
+}
 
 func TestInstanceWorkspaceSetupPrecedesTmuxStartAndUsesWorkDir(t *testing.T) {
 	events := []string{}

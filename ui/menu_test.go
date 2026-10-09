@@ -19,6 +19,7 @@ type capabilityWorkspace struct {
 
 func (w *capabilityWorkspace) Mode() workspace.Mode                 { return w.mode }
 func (w *capabilityWorkspace) Capabilities() workspace.Capabilities { return w.capabilities }
+func (w *capabilityWorkspace) AccessState() workspace.AccessState   { return workspace.AccessState{} }
 func (w *capabilityWorkspace) WorkDir() string                      { return "/internal/worktree" }
 func (w *capabilityWorkspace) DisplayName() string                  { return w.displayName }
 func (w *capabilityWorkspace) BranchName() string                   { return w.branchName }
@@ -33,10 +34,11 @@ func (w *capabilityWorkspace) PushChanges(string, bool) error       { return nil
 func (w *capabilityWorkspace) Apply() (*workspace.ApplyResult, error) {
 	return &workspace.ApplyResult{}, nil
 }
-func (w *capabilityWorkspace) Remove() error             { return nil }
-func (w *capabilityWorkspace) Prune() error              { return nil }
-func (w *capabilityWorkspace) Cleanup() error            { return nil }
-func (w *capabilityWorkspace) Serialize() workspace.Data { return workspace.Data{Mode: w.mode} }
+func (w *capabilityWorkspace) AcknowledgeApply(string) error { return nil }
+func (w *capabilityWorkspace) Remove() error                 { return nil }
+func (w *capabilityWorkspace) Prune() error                  { return nil }
+func (w *capabilityWorkspace) Cleanup() error                { return nil }
+func (w *capabilityWorkspace) Serialize() workspace.Data     { return workspace.Data{Mode: w.mode} }
 
 func testInstanceWithWorkspace(t *testing.T, mode workspace.Mode, capabilities workspace.Capabilities, displayName, branchName string) *session.Instance {
 	t.Helper()

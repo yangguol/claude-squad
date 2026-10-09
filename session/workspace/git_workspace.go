@@ -76,6 +76,8 @@ func (w *gitWorkspace) Capabilities() Capabilities {
 	return Capabilities{BranchPicker: true, Push: true, Apply: false}
 }
 
+func (w *gitWorkspace) AccessState() AccessState { return AccessState{} }
+
 func (w *gitWorkspace) WorkDir() string { return w.worktree.GetWorktreePath() }
 
 func (w *gitWorkspace) DisplayName() string { return w.worktree.GetRepoName() }
@@ -107,6 +109,8 @@ func (w *gitWorkspace) PushChanges(message string, open bool) error {
 func (w *gitWorkspace) Apply() (*ApplyResult, error) {
 	return nil, &ErrUnsupported{Operation: "apply"}
 }
+
+func (w *gitWorkspace) AcknowledgeApply(string) error { return nil }
 
 func (w *gitWorkspace) Remove() error { return w.worktree.Remove() }
 

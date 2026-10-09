@@ -57,6 +57,85 @@ type RecoveryReport struct {
 	Orphans     []string
 }
 
+// RecoverProject serializes discovery and automatic recovery for one project.
+func RecoverProject(projectPath string, sessions map[string]*ShadowData) (report RecoveryReport, returnErr error) {
+	lock, err := AcquireProjectLock(projectPath, "recover")
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
+	return recoverProjectLocked(projectPath, sessions)
+}
+
+func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (RecoveryReport, error) {
+	discovered, err := DiscoverTransactions(projectPath)
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	report := RecoveryReport{Disposition: RecoveryUnchanged}
+	for _, transaction := range discovered {
+		if transaction.Invalid != nil || transaction.Legacy || transaction.Orphan {
+			message := "transaction requires explicit recovery"
+			if transaction.Invalid != nil {
+				message = transaction.Invalid.Error()
+			} else if transaction.Legacy {
+				message = "legacy transaction requires explicit recovery"
+			}
+			report.Disposition = RecoveryBlocked
+			report.Issues = append(report.Issues, RecoveryIssue{Message: message, RetainedPaths: []string{transaction.Directory}})
+			if transaction.Orphan {
+				report.Orphans = append(report.Orphans, transaction.Directory)
+			}
+			continue
+		}
+		manifest := transaction.Manifest
+		if manifest == nil {
+			continue
+		}
+		if session, ok := sessions[manifest.SessionID]; ok && session != nil && (session.ProjectID != manifest.ProjectID || session.SourcePath != manifest.SourcePath) {
+			report.Disposition = RecoveryBlocked
+			report.Issues = append(report.Issues, RecoveryIssue{TransactionID: manifest.TransactionID, State: manifest.State, Message: "transaction session metadata mismatch", RetainedPaths: []string{transaction.Directory}})
+			continue
+		}
+		transactionReport, err := RecoverTransaction(manifest, transaction.Directory)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		report.Issues = append(report.Issues, transactionReport.Issues...)
+		report.Repairs = append(report.Repairs, transactionReport.Repairs...)
+		report.Orphans = append(report.Orphans, transactionReport.Orphans...)
+		switch transactionReport.Disposition {
+		case RecoveryBlocked:
+			report.Disposition = RecoveryBlocked
+		case RecoveryRolledBack:
+			if report.Disposition != RecoveryBlocked {
+				report.Disposition = RecoveryRolledBack
+			}
+		}
+	}
+	return report, nil
+}
+
+func accessStateFromReport(report RecoveryReport) AccessState {
+	state := AccessState{Disposition: report.Disposition}
+	for _, issue := range report.Issues {
+		state.ReadOnly = true
+		if state.Message == "" {
+			state.Message = issue.Message
+		}
+		state.Paths = append(state.Paths, issue.Paths...)
+		state.RetainedPaths = append(state.RetainedPaths, issue.RetainedPaths...)
+	}
+	if len(report.Orphans) != 0 {
+		state.ReadOnly = true
+		state.RetainedPaths = append(state.RetainedPaths, report.Orphans...)
+	}
+	if state.ReadOnly && state.Message == "" {
+		state.Message = "project requires explicit recovery"
+	}
+	return state
+}
+
 // ObservedEntryState records the identity-bearing locations used to reconcile
 // an entry whose filesystem mutation may have completed before its phase write.
 type ObservedEntryState struct {
@@ -126,10 +205,11 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 			continue
 		}
 		if strings.HasSuffix(entry.Name(), ".cleanup.json") {
+			discovered.Legacy = true
 			if err := validateLegacyCleanupMarker(directory, entry); err != nil {
 				discovered.Invalid = err
-				result = append(result, discovered)
 			}
+			result = append(result, discovered)
 			continue
 		}
 		info, statErr := os.Lstat(directory)

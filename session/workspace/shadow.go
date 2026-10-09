@@ -27,10 +27,11 @@ type shadowProjectMetadata struct {
 }
 
 type shadowWorkspace struct {
-	data ShadowData
+	data   ShadowData
+	access AccessState
 }
 
-func NewShadow(source, sessionName string) (Workspace, string, error) {
+func NewShadow(source, sessionName string) (result Workspace, branchName string, returnErr error) {
 	canonical, err := resolveDirectory(source)
 	if err != nil {
 		return nil, "", err
@@ -44,6 +45,11 @@ func NewShadow(source, sessionName string) (Workspace, string, error) {
 		return nil, "", fmt.Errorf("create shadow root: %w", err)
 	}
 	projectPath := filepath.Join(root, projectID)
+	lock, err := AcquireProjectLock(projectPath, "create session")
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
 	repoPath := filepath.Join(projectPath, "repo")
 	if err := ensureRealContainedPath(root, projectPath, true, "project path"); err != nil {
 		return nil, "", err
@@ -52,6 +58,11 @@ func NewShadow(source, sessionName string) (Workspace, string, error) {
 		Version: CurrentVersion, ProjectID: projectID, SourcePath: canonical,
 	}); err != nil {
 		return nil, "", err
+	}
+	if report, err := recoverProjectLocked(projectPath, nil); err != nil {
+		return nil, "", err
+	} else if access := accessStateFromReport(report); access.ReadOnly {
+		return nil, "", errors.New(access.Message)
 	}
 
 	policy, err := LoadPolicy(canonical)
@@ -89,7 +100,7 @@ func NewShadow(source, sessionName string) (Workspace, string, error) {
 	return workspace, branch, nil
 }
 
-func RestoreShadow(data Data) (Workspace, error) {
+func RestoreShadow(data Data) (result Workspace, returnErr error) {
 	if data.Version != CurrentVersion {
 		return nil, fmt.Errorf("unsupported workspace data version %d", data.Version)
 	}
@@ -106,17 +117,17 @@ func RestoreShadow(data Data) (Workspace, error) {
 	if err := validateShadowIdentity(stored, false); err != nil {
 		return nil, err
 	}
-	incomplete, err := FindIncompleteTransactions(filepath.Dir(stored.RepoPath))
+	projectPath := filepath.Dir(stored.RepoPath)
+	lock, err := AcquireProjectLock(projectPath, "restore session")
 	if err != nil {
-		return nil, fmt.Errorf("inspect incomplete apply transactions: %w", err)
+		return nil, err
 	}
-	if len(incomplete) != 0 {
-		directories := make([]string, len(incomplete))
-		for index := range incomplete {
-			directories[index] = incomplete[index].Directory
-		}
-		return nil, fmt.Errorf("incomplete apply transactions require recovery: %s", strings.Join(directories, ", "))
+	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
+	report, err := recoverProjectLocked(projectPath, map[string]*ShadowData{stored.SessionID: &stored})
+	if err != nil {
+		return nil, fmt.Errorf("recover project: %w", err)
 	}
+	access := accessStateFromReport(report)
 	if _, err := os.Lstat(stored.WorktreePath); err == nil {
 		valid, validateErr := validateWorktreeIdentity(stored)
 		if validateErr != nil || !valid {
@@ -125,20 +136,45 @@ func RestoreShadow(data Data) (Workspace, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("stat shadow worktree: %w", err)
 	}
-	return &shadowWorkspace{data: stored}, nil
+	return &shadowWorkspace{data: stored, access: access}, nil
 }
 
 func (w *shadowWorkspace) Mode() Mode { return ModeDirectory }
 
 func (w *shadowWorkspace) Capabilities() Capabilities {
-	return Capabilities{BranchPicker: false, Push: false, Apply: true}
+	return Capabilities{Apply: !w.access.ReadOnly, Resume: !w.access.ReadOnly}
+}
+
+func (w *shadowWorkspace) AccessState() AccessState {
+	state := w.access
+	state.Paths = append([]string(nil), state.Paths...)
+	state.RetainedPaths = append([]string(nil), state.RetainedPaths...)
+	return state
 }
 
 func (w *shadowWorkspace) WorkDir() string     { return w.data.WorktreePath }
 func (w *shadowWorkspace) DisplayName() string { return filepath.Base(w.data.SourcePath) }
 func (w *shadowWorkspace) BranchName() string  { return w.data.BranchName }
 
-func (w *shadowWorkspace) Setup() error {
+func (w *shadowWorkspace) Setup() (returnErr error) {
+	projectPath := filepath.Dir(w.data.RepoPath)
+	lock, err := AcquireProjectLock(projectPath, "resume")
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
+	report, err := recoverProjectLocked(projectPath, map[string]*ShadowData{w.data.SessionID: &w.data})
+	if err != nil {
+		return err
+	}
+	w.access = accessStateFromReport(report)
+	if w.access.ReadOnly {
+		return fmt.Errorf("workspace is read-only: %s", w.access.Message)
+	}
+	return w.setupLocked()
+}
+
+func (w *shadowWorkspace) setupLocked() error {
 	if err := validateShadowData(w.data); err != nil {
 		return err
 	}
@@ -654,6 +690,9 @@ func CleanupShadowProjects() error {
 		errs = append(errs, referenceErr)
 	}
 	for _, entry := range entries {
+		if entry.Name() == ".locks" {
+			continue
+		}
 		projectPath := filepath.Join(root, entry.Name())
 		if err := validateShadowProjectCandidate(root, projectPath, entry); err != nil {
 			errs = append(errs, err)
