@@ -196,7 +196,11 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 	}
 	if err := w.revalidateTouched(plan); err != nil {
 		prepared.State = TransactionRollingBack
-		return nil, errors.Join(err, writeManifestAtBoundDirectory(prepared, plan.TransactionDir))
+		if writeErr := writeManifestAtBoundDirectory(prepared, plan.TransactionDir); writeErr != nil {
+			return nil, errors.Join(err, writeErr)
+		}
+		_, rollbackErr := RollbackTransaction(&prepared, plan.TransactionDir)
+		return nil, errors.Join(err, rollbackErr)
 	}
 	if err := ExecuteTransaction(&prepared, plan.TransactionDir); err != nil {
 		return nil, err

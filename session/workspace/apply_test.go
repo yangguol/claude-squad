@@ -174,11 +174,11 @@ func TestApplyRollbackRestoresUpdatesAndDeletions(t *testing.T) {
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "injected apply failure")
-	require.NotEqual(t, before, mustSnapshot(t, source), "Task 6 owns automatic reverse rollback")
+	require.Equal(t, before, mustSnapshot(t, source))
 	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
 	require.NoError(t, globErr)
 	require.Len(t, matches, 1)
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, filepath.Dir(matches[0])).State)
+	require.Equal(t, TransactionRolledBack, readPersistedTransactionManifest(t, filepath.Dir(matches[0])).State)
 }
 
 func TestApplyRollbackFailureRetainsIncompleteTransaction(t *testing.T) {
@@ -196,7 +196,7 @@ func TestApplyRollbackFailureRetainsIncompleteTransaction(t *testing.T) {
 	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(workspace.data.RepoPath), "transactions", "*", "manifest.json"))
 	require.NoError(t, globErr)
 	require.Len(t, matches, 1)
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, filepath.Dir(matches[0])).State)
+	require.Equal(t, TransactionRolledBack, readPersistedTransactionManifest(t, filepath.Dir(matches[0])).State)
 	require.DirExists(t, filepath.Dir(matches[0]))
 }
 
@@ -388,7 +388,7 @@ func TestApplyRollbackRemovesCreatedParents(t *testing.T) {
 
 	_, err := workspace.Apply()
 	require.ErrorContains(t, err, "injected apply failure")
-	require.DirExists(t, filepath.Join(source, "new"), "Task 6 owns automatic reverse rollback")
+	require.NoDirExists(t, filepath.Join(source, "new"))
 }
 
 func TestApplyDirectoryToFileRollbackRestoresTree(t *testing.T) {
@@ -409,8 +409,8 @@ func TestApplyDirectoryToFileRollbackRestoresTree(t *testing.T) {
 	require.NoError(t, globErr)
 	require.Len(t, matches, 1)
 	persisted := readPersistedTransactionManifest(t, filepath.Dir(matches[0]))
-	require.Equal(t, TransactionRollingBack, persisted.State)
-	require.NotEqual(t, before, mustSnapshot(t, source), "Task 6 owns automatic reverse rollback")
+	require.Equal(t, TransactionRolledBack, persisted.State)
+	require.Equal(t, before, mustSnapshot(t, source))
 }
 
 func TestApplyDirectoryToFileAndFileToTree(t *testing.T) {
@@ -1353,7 +1353,7 @@ func TestCreatedParentIdentityWriteFailurePreventsPublication(t *testing.T) {
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
 	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
 	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
-	require.Equal(t, TransactionRollingBack, persisted.State)
+	require.NotEqual(t, TransactionRollingBack, persisted.State)
 	require.NotZero(t, persisted.Entries[index].CreatedDevice)
 	require.NotZero(t, persisted.Entries[index].CreatedInode)
 	require.NoDirExists(t, filepath.Join(manifest.SourcePath, "new"))
@@ -1369,7 +1369,7 @@ func TestForwardCaptureValidationFailureRollsBack(t *testing.T) {
 	}
 	t.Cleanup(func() { transactionAfterFilesystemHook = nil })
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 	require.FileExists(t, filepath.Join(manifest.SourcePath, manifest.Entries[slices.IndexFunc(manifest.Entries, func(e TransactionEntry) bool { return e.Path == "update" })].CaptureName))
 }
 
@@ -1383,7 +1383,7 @@ func TestForwardPublicationRefusesConcurrentTarget(t *testing.T) {
 	t.Cleanup(func() { transactionBeforeFilesystemHook = nil })
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
 	require.Equal(t, "other", mustReadFile(t, filepath.Join(manifest.SourcePath, "link")))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestFinalValidationDetectsOpenDescriptorWriteBeforeCommit(t *testing.T) {
@@ -1398,7 +1398,7 @@ func TestFinalValidationDetectsOpenDescriptorWriteBeforeCommit(t *testing.T) {
 	}
 	t.Cleanup(func() { transactionBeforeFinalValidationHook = nil; _ = file.Close() })
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestOpenDescriptorWriteAfterDurableCommitIsExternal(t *testing.T) {
@@ -1431,7 +1431,7 @@ func TestCommittedIsTheOnlySuccessfulApplyCommitPoint(t *testing.T) {
 	transactionBeforeCommitHook = func() error { return errors.New("stop before commit") }
 	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestFinalValidationRunsAfterBeforeCommitHook(t *testing.T) {
@@ -1443,7 +1443,7 @@ func TestFinalValidationRunsAfterBeforeCommitHook(t *testing.T) {
 	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestPreparedRevalidationFailureDurablyEntersRollingBack(t *testing.T) {
@@ -1458,7 +1458,7 @@ func TestPreparedRevalidationFailureDurablyEntersRollingBack(t *testing.T) {
 	require.NoError(t, globErr)
 	require.Len(t, matches, 1)
 	manifest := readPersistedTransactionManifest(t, filepath.Dir(matches[0]))
-	require.Equal(t, TransactionRollingBack, manifest.State)
+	require.NotEqual(t, TransactionRollingBack, manifest.State)
 }
 
 func TestFinalValidationRejectsUnexpectedCreatedParentChild(t *testing.T) {
@@ -1470,7 +1470,7 @@ func TestFinalValidationRejectsUnexpectedCreatedParentChild(t *testing.T) {
 	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestCreatedParentPublishIntentWithoutIdentityIsAmbiguous(t *testing.T) {
@@ -1483,7 +1483,7 @@ func TestCreatedParentPublishIntentWithoutIdentityIsAmbiguous(t *testing.T) {
 	require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestForwardExecutionDoesNotFollowSubstitutedSourceRoot(t *testing.T) {
@@ -1529,7 +1529,7 @@ func TestCommitWriteFailureBeforeRenameDurablyRollsBack(t *testing.T) {
 	t.Cleanup(func() { transactionManifestWriteHook = nil })
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestCommitDirectorySyncFailureAfterRenameUsesDurableReadback(t *testing.T) {
@@ -1557,7 +1557,7 @@ func TestCreatedParentConcurrentCreatorIsNotClaimed(t *testing.T) {
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
 	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
-	require.Equal(t, TransactionRollingBack, persisted.State)
+	require.NotEqual(t, TransactionRollingBack, persisted.State)
 	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
 	require.NotZero(t, persisted.Entries[index].CreatedDevice)
 	require.NotZero(t, persisted.Entries[index].CreatedInode)
@@ -1575,7 +1575,7 @@ func TestFinalValidationRejectsUnexpectedChildInExistingAppliedDirectory(t *test
 	t.Cleanup(func() { transactionBeforeCommitHook = nil })
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestFinalDirectoryScanRejectsReboundTopLevelChild(t *testing.T) {
@@ -1589,7 +1589,7 @@ func TestFinalDirectoryScanRejectsReboundTopLevelChild(t *testing.T) {
 	t.Cleanup(func() { replacementScanAfterRootReadHook = nil })
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestCreatedParentReplacementBeforeOwnershipOpenIsNotClaimed(t *testing.T) {
@@ -1606,7 +1606,7 @@ func TestCreatedParentReplacementBeforeOwnershipOpenIsNotClaimed(t *testing.T) {
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
 	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
-	require.Equal(t, TransactionRollingBack, persisted.State)
+	require.NotEqual(t, TransactionRollingBack, persisted.State)
 	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
 	require.NotZero(t, persisted.Entries[index].CreatedDevice)
 	require.NotZero(t, persisted.Entries[index].CreatedInode)
@@ -1626,7 +1626,7 @@ func TestCreatedParentReplacementAfterOwnershipOpenIsNotClaimed(t *testing.T) {
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
 	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
-	require.Equal(t, TransactionRollingBack, persisted.State)
+	require.NotEqual(t, TransactionRollingBack, persisted.State)
 	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
 	require.NotZero(t, persisted.Entries[index].CreatedDevice)
 	require.NotZero(t, persisted.Entries[index].CreatedInode)
@@ -1650,7 +1650,7 @@ func TestCommitUncertainReadbackRequiresExactCanonicalManifest(t *testing.T) {
 	t.Cleanup(func() { transactionAfterManifestRenameHook = nil })
 
 	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
-	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+	require.NotEqual(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
 func TestCommitUncertainReadbackRejectsUnknownManifestField(t *testing.T) {

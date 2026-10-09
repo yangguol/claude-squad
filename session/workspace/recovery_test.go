@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"encoding/json"
+	"errors"
 	"maps"
 	"os"
 	"path/filepath"
@@ -904,4 +905,159 @@ func mustJSON(t *testing.T, value string) string {
 	contents, err := json.Marshal(value)
 	require.NoError(t, err)
 	return string(contents)
+}
+
+func failedRecoveryTransaction(t *testing.T) (applyPlan, TransactionManifest, Snapshot) {
+	t.Helper()
+	_, plan, manifest := preparedForwardTransaction(t)
+	before := mustSnapshot(t, manifest.SourcePath)
+	transactionBeforeCommitHook = func() error { return errors.New("stop for recovery") }
+	rollingWrites := 0
+	transactionManifestWriteHook = func(state TransactionState) error {
+		if state == TransactionRollingBack {
+			rollingWrites++
+			if rollingWrites == 2 {
+				return errors.New("simulate crash before automatic rollback")
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { transactionBeforeCommitHook = nil; transactionManifestWriteHook = nil })
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	transactionManifestWriteHook = nil
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	require.Equal(t, TransactionRollingBack, persisted.State)
+	return plan, persisted, before
+}
+
+func TestRecoveryPreparedTransactionRollsBack(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	before := mustSnapshot(t, manifest.SourcePath)
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryRolledBack, report.Disposition)
+	require.Equal(t, before, mustSnapshot(t, manifest.SourcePath))
+	require.Equal(t, TransactionRolledBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestRecoveryApplyingTransactionRollsBackInReverseOrder(t *testing.T) {
+	plan, manifest, before := failedRecoveryTransaction(t)
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryRolledBack, report.Disposition)
+	require.Equal(t, before, mustSnapshot(t, manifest.SourcePath))
+}
+
+func TestRecoveryRollingBackTransactionResumesIdempotently(t *testing.T) {
+	plan, manifest, before := failedRecoveryTransaction(t)
+	transactionManifestWriteHook = func(state TransactionState) error {
+		if state == TransactionRollingBack {
+			transactionManifestWriteHook = nil
+			return errors.New("interrupt rollback")
+		}
+		return nil
+	}
+	t.Cleanup(func() { transactionManifestWriteHook = nil })
+	_, err := RollbackTransaction(&manifest, plan.TransactionDir)
+	require.Error(t, err)
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	report, err := RecoverTransaction(&persisted, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryRolledBack, report.Disposition)
+	require.Equal(t, before, mustSnapshot(t, manifest.SourcePath))
+}
+
+func TestRecoveryInfersCaptureCompletedBeforePhaseWrite(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })
+	entry := &manifest.Entries[index]
+	require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, entry.Path), filepath.Join(manifest.SourcePath, entry.CaptureName)))
+	entry.Phase = EntryPhaseCaptureIntent
+	manifest.State = TransactionApplying
+	require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryRolledBack, report.Disposition)
+	require.Equal(t, "before", mustReadFile(t, filepath.Join(manifest.SourcePath, "update")))
+}
+
+func TestRecoveryInfersPublicationCompletedBeforePhaseWrite(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	index := slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "link" })
+	entry := &manifest.Entries[index]
+	require.NoError(t, os.Rename(filepath.Join(plan.TransactionDir, filepath.FromSlash(entry.StagePath)), filepath.Join(manifest.SourcePath, entry.Path)))
+	entry.Phase = EntryPhasePublishIntent
+	manifest.State = TransactionApplying
+	require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryRolledBack, report.Disposition)
+	require.NoFileExists(t, filepath.Join(manifest.SourcePath, "link"))
+}
+
+func TestRecoveryInfersRestorationCompletedBeforePhaseWrite(t *testing.T) {
+	plan, manifest, before := failedRecoveryTransaction(t)
+	entry := &manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, entry.Path), filepath.Join(manifest.SourcePath, entry.RollbackCaptureName)))
+	require.NoError(t, os.Rename(filepath.Join(manifest.SourcePath, entry.CaptureName), filepath.Join(manifest.SourcePath, entry.Path)))
+	entry.Phase = EntryPhaseRollbackCaptured
+	require.NoError(t, WriteManifestDurable(manifest, plan.TransactionDir))
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryRolledBack, report.Disposition)
+	require.Equal(t, before, mustSnapshot(t, manifest.SourcePath))
+}
+
+func TestRecoveryCreateUpdateDeleteAndTypeTransitions(t *testing.T) {
+	plan, manifest, before := failedRecoveryTransaction(t)
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryRolledBack, report.Disposition)
+	require.Equal(t, before, mustSnapshot(t, manifest.SourcePath))
+}
+
+func TestRecoveryRepeatedInvocationIsIdempotent(t *testing.T) {
+	plan, manifest, before := failedRecoveryTransaction(t)
+	first, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	second, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, first.Disposition, second.Disposition)
+	require.Equal(t, before, mustSnapshot(t, manifest.SourcePath))
+}
+
+func TestRecoveryExternalRestoreTargetBecomesRecoveryBlocked(t *testing.T) {
+	plan, manifest, _ := failedRecoveryTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	require.NoError(t, os.Remove(filepath.Join(manifest.SourcePath, entry.Path)))
+	writeApplyFile(t, manifest.SourcePath, entry.Path, "external", 0o600)
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryBlocked, report.Disposition)
+	require.Equal(t, "external", mustReadFile(t, filepath.Join(manifest.SourcePath, entry.Path)))
+	require.Equal(t, TransactionRecoveryBlocked, readPersistedTransactionManifest(t, plan.TransactionDir).State)
+}
+
+func TestRecoveryBlockedPreservesExternalAndRetainedContent(t *testing.T) {
+	plan, manifest, _ := failedRecoveryTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	writeApplyFile(t, manifest.SourcePath, entry.Path, "external", 0o600)
+	report, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryBlocked, report.Disposition)
+	require.NotEmpty(t, report.Issues)
+	require.Contains(t, report.Issues[0].RetainedPaths, entry.CaptureName)
+	require.Equal(t, "external", mustReadFile(t, filepath.Join(manifest.SourcePath, entry.Path)))
+	require.FileExists(t, filepath.Join(manifest.SourcePath, entry.CaptureName))
+}
+
+func TestRollbackNeverRemovesSourceTemporaryByPathname(t *testing.T) {
+	plan, manifest, _ := failedRecoveryTransaction(t)
+	entry := manifest.Entries[slices.IndexFunc(manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })]
+	require.NoError(t, os.Remove(filepath.Join(manifest.SourcePath, entry.Path)))
+	writeApplyFile(t, manifest.SourcePath, entry.Path, "external", 0o600)
+	writeApplyFile(t, manifest.SourcePath, entry.RollbackCaptureName, "temporary occupant", 0o600)
+	_, err := RecoverTransaction(&manifest, plan.TransactionDir)
+	require.NoError(t, err)
+	require.Equal(t, "temporary occupant", mustReadFile(t, filepath.Join(manifest.SourcePath, entry.RollbackCaptureName)))
 }

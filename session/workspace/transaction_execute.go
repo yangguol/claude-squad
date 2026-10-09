@@ -47,7 +47,11 @@ func ExecuteTransaction(manifest *TransactionManifest, transactionDir string) (r
 			return original
 		}
 		manifest.State = TransactionRollingBack
-		return errors.Join(original, writeManifestBound(*manifest, roots.tx))
+		if err := writeManifestBound(*manifest, roots.tx); err != nil {
+			return errors.Join(original, err)
+		}
+		_, rollbackErr := rollbackTransactionBound(manifest, roots)
+		return errors.Join(original, rollbackErr)
 	}
 	manifest.State = TransactionApplying
 	if err := writeManifestBound(*manifest, roots.tx); err != nil {
@@ -465,6 +469,289 @@ func writeManifestBound(manifest TransactionManifest, directory *os.File) error 
 		}
 	}
 	return directory.Sync()
+}
+
+// ObserveEntryState snapshots every predeclared location through bound roots.
+// Matching is identity based; callers must not infer ownership from a pathname.
+func ObserveEntryState(manifest TransactionManifest, entry TransactionEntry, transactionDir string) (state ObservedEntryState, returnErr error) {
+	roots, err := openForwardRoots(manifest.SourcePath, transactionDir)
+	if err != nil {
+		return state, err
+	}
+	defer func() { returnErr = errors.Join(returnErr, roots.close()) }()
+	observe := func(root *os.File, name string, expected *Entry) (bool, bool, error) {
+		if name == "" {
+			return false, false, nil
+		}
+		actual, exists, err := snapshotEntryAt(root, name)
+		if err != nil || !exists || expected == nil {
+			return exists, false, err
+		}
+		actual.Path = expected.Path
+		if expected.Type == EntrySymlink {
+			actual.Mode = expected.Mode
+		}
+		return true, reflect.DeepEqual(actual, *expected), nil
+	}
+	var errs []error
+	state.TargetExists, state.TargetMatchesExpected, err = observe(roots.source, entry.Path, entry.Expected)
+	errs = append(errs, err)
+	_, state.TargetMatchesResult, err = observe(roots.source, entry.Path, entry.Result)
+	errs = append(errs, err)
+	state.CaptureExists, state.CaptureMatchesExpected, err = observe(roots.source, entry.CaptureName, entry.Expected)
+	errs = append(errs, err)
+	state.RollbackExists, state.RollbackMatchesResult, err = observe(roots.source, entry.RollbackCaptureName, entry.Result)
+	errs = append(errs, err)
+	state.StageExists, state.StageMatchesResult, err = observe(roots.tx, entry.StagePath, entry.Result)
+	errs = append(errs, err)
+	state.QuarantineExists, _, err = observe(roots.tx, entry.QuarantinePath, nil)
+	errs = append(errs, err)
+	if entry.Operation == EntryOperationCreatedParent && entry.CreatedDevice != 0 {
+		if stat, statErr := entryStatAt(roots.source, entry.Path); statErr == nil {
+			state.TargetMatchesResult = uint64(stat.Dev) == entry.CreatedDevice && uint64(stat.Ino) == entry.CreatedInode
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			errs = append(errs, statErr)
+		}
+		if stat, statErr := entryStatAt(roots.tx, entry.StagePath); statErr == nil {
+			state.StageMatchesResult = uint64(stat.Dev) == entry.CreatedDevice && uint64(stat.Ino) == entry.CreatedInode
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			errs = append(errs, statErr)
+		}
+	}
+	return state, errors.Join(errs...)
+}
+
+// RecoverTransaction reverses every pre-commit state and leaves committed
+// transactions for the committed-cleanup path.
+func RecoverTransaction(manifest *TransactionManifest, transactionDir string) (RecoveryReport, error) {
+	if manifest == nil {
+		return RecoveryReport{}, errors.New("transaction manifest is nil")
+	}
+	switch manifest.State {
+	case TransactionCommitted, TransactionCleaning, TransactionComplete, TransactionCleanupBlocked:
+		return RecoveryReport{Disposition: RecoveryUnchanged}, nil
+	case TransactionRolledBack:
+		return RecoveryReport{Disposition: RecoveryRolledBack}, nil
+	case TransactionRecoveryBlocked:
+		return RecoveryReport{Disposition: RecoveryBlocked, Issues: []RecoveryIssue{{TransactionID: manifest.TransactionID, State: manifest.State, Message: "transaction remains recovery-blocked"}}}, nil
+	default:
+		return RollbackTransaction(manifest, transactionDir)
+	}
+}
+
+// RollbackTransaction durably reverses the forward WAL in reverse entry order.
+func RollbackTransaction(manifest *TransactionManifest, transactionDir string) (report RecoveryReport, returnErr error) {
+	if manifest == nil {
+		return RecoveryReport{}, errors.New("transaction manifest is nil")
+	}
+	roots, err := openForwardRoots(manifest.SourcePath, transactionDir)
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	defer func() { returnErr = errors.Join(returnErr, roots.close()) }()
+	return rollbackTransactionBound(manifest, roots)
+}
+
+func rollbackTransactionBound(manifest *TransactionManifest, roots *forwardRoots) (RecoveryReport, error) {
+	if manifest.State == TransactionRolledBack {
+		return RecoveryReport{Disposition: RecoveryRolledBack}, nil
+	}
+	manifest.State = TransactionRollingBack
+	if err := writeManifestBound(*manifest, roots.tx); err != nil {
+		return RecoveryReport{}, err
+	}
+	for index := len(manifest.Entries) - 1; index >= 0; index-- {
+		issue, err := rollbackEntryBound(manifest, index, roots)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		if issue != nil {
+			manifest.State = TransactionRecoveryBlocked
+			if err := writeManifestBound(*manifest, roots.tx); err != nil {
+				return RecoveryReport{}, err
+			}
+			issue.TransactionID, issue.State = manifest.TransactionID, manifest.State
+			return RecoveryReport{Disposition: RecoveryBlocked, Issues: []RecoveryIssue{*issue}}, nil
+		}
+	}
+	manifest.State = TransactionRolledBack
+	if err := writeManifestBound(*manifest, roots.tx); err != nil {
+		return RecoveryReport{}, err
+	}
+	return RecoveryReport{Disposition: RecoveryRolledBack}, nil
+}
+
+func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forwardRoots) (*RecoveryIssue, error) {
+	entry := &manifest.Entries[index]
+	observe := func() (ObservedEntryState, error) {
+		var state ObservedEntryState
+		var err error
+		match := func(root *os.File, name string, expected *Entry) (bool, bool, error) {
+			if name == "" {
+				return false, false, nil
+			}
+			actual, exists, err := snapshotEntryAt(root, name)
+			if err != nil || !exists || expected == nil {
+				return exists, false, err
+			}
+			actual.Path = expected.Path
+			if expected.Type == EntrySymlink {
+				actual.Mode = expected.Mode
+			}
+			return true, reflect.DeepEqual(actual, *expected), nil
+		}
+		state.TargetExists, state.TargetMatchesExpected, err = match(roots.source, entry.Path, entry.Expected)
+		if err != nil {
+			return state, err
+		}
+		_, state.TargetMatchesResult, err = match(roots.source, entry.Path, entry.Result)
+		if err != nil {
+			return state, err
+		}
+		if len(entry.ExpectedTree) != 0 && state.TargetExists && !state.TargetMatchesResult {
+			actual, treeErr := snapshotSubtreeAt(roots.source, entry.Path)
+			if treeErr != nil {
+				return state, treeErr
+			}
+			state.TargetMatchesExpected = reflect.DeepEqual(actual, entry.ExpectedTree)
+		}
+		state.CaptureExists, state.CaptureMatchesExpected, err = match(roots.source, entry.CaptureName, entry.Expected)
+		if err != nil {
+			return state, err
+		}
+		if len(entry.ExpectedTree) != 0 && state.CaptureExists {
+			actual, treeErr := snapshotSubtreeAt(roots.source, entry.CaptureName)
+			if treeErr != nil {
+				return state, treeErr
+			}
+			state.CaptureMatchesExpected = reflect.DeepEqual(actual, entry.ExpectedTree)
+		}
+		state.RollbackExists, state.RollbackMatchesResult, err = match(roots.source, entry.RollbackCaptureName, entry.Result)
+		if err != nil {
+			return state, err
+		}
+		state.StageExists, state.StageMatchesResult, err = match(roots.tx, entry.StagePath, entry.Result)
+		if err != nil {
+			return state, err
+		}
+		if entry.Operation == EntryOperationCreatedParent && entry.CreatedDevice != 0 {
+			if stat, statErr := entryStatAt(roots.source, entry.Path); statErr == nil {
+				state.TargetMatchesResult = uint64(stat.Dev) == entry.CreatedDevice && uint64(stat.Ino) == entry.CreatedInode
+			}
+			if stat, statErr := entryStatAt(roots.tx, entry.StagePath); statErr == nil {
+				state.StageMatchesResult = uint64(stat.Dev) == entry.CreatedDevice && uint64(stat.Ino) == entry.CreatedInode
+			}
+		}
+		return state, nil
+	}
+	block := func(message string, paths, retained []string) *RecoveryIssue {
+		return &RecoveryIssue{Message: message, Paths: paths, RetainedPaths: retained}
+	}
+	persist := func(phase EntryPhase) error { entry.Phase = phase; return writeManifestBound(*manifest, roots.tx) }
+
+	state, err := observe()
+	if err != nil {
+		return nil, err
+	}
+	if entry.Phase == EntryPhaseRestored {
+		return nil, nil
+	}
+
+	// First capture a published result. A pre-existing rollback name is never
+	// deleted or replaced, even if its pathname was validated earlier.
+	published := state.TargetMatchesResult
+	if published && !state.RollbackMatchesResult {
+		if state.RollbackExists {
+			return block("rollback capture is occupied", []string{entry.Path}, []string{entry.Path, entry.RollbackCaptureName, entry.CaptureName}), nil
+		}
+		if err := persist(EntryPhaseRollbackCaptureIntent); err != nil {
+			return nil, err
+		}
+		if err := renameRelativeNoReplace(roots.source, entry.Path, roots.source, entry.RollbackCaptureName); err != nil {
+			return nil, err
+		}
+		state, err = observe()
+		if err != nil {
+			return nil, err
+		}
+		if !state.RollbackMatchesResult || state.TargetExists {
+			return block("published result capture is ambiguous", []string{entry.Path}, []string{entry.RollbackCaptureName, entry.CaptureName}), nil
+		}
+		if err := persist(EntryPhaseRollbackCaptured); err != nil {
+			return nil, err
+		}
+	} else if state.RollbackMatchesResult && !state.TargetExists {
+		if entry.Phase != EntryPhaseRollbackCaptured {
+			if err := persist(EntryPhaseRollbackCaptured); err != nil {
+				return nil, err
+			}
+		}
+	} else if published && state.RollbackMatchesResult {
+		return block("result exists at both target and rollback capture", []string{entry.Path}, []string{entry.Path, entry.RollbackCaptureName, entry.CaptureName}), nil
+	}
+
+	state, err = observe()
+	if err != nil {
+		return nil, err
+	}
+	switch entry.Operation {
+	case EntryOperationUpdate, EntryOperationDelete, EntryOperationCreate:
+		if entry.Operation == EntryOperationCreate && entry.CaptureName == "" {
+			if state.TargetExists {
+				return block("created target has unowned or ambiguous content", []string{entry.Path}, []string{entry.Path, entry.RollbackCaptureName}), nil
+			}
+			if state.RollbackMatchesResult {
+				if err := removeRelativeIdentity(roots.source, entry.RollbackCaptureName, *entry.Result, 0, 0); err != nil {
+					return block("retained created result changed before removal", []string{entry.Path}, []string{entry.RollbackCaptureName}), nil
+				}
+			}
+			return nil, persist(EntryPhaseRestored)
+		}
+		if state.TargetMatchesExpected && !state.CaptureExists {
+			if state.RollbackMatchesResult {
+				if err := removeRelativeIdentity(roots.source, entry.RollbackCaptureName, *entry.Result, 0, 0); err != nil {
+					return block("retained published result changed before removal", []string{entry.Path}, []string{entry.RollbackCaptureName}), nil
+				}
+			}
+			return nil, persist(EntryPhaseRestored)
+		}
+		if state.TargetExists {
+			return block("restore target is occupied", []string{entry.Path}, []string{entry.CaptureName, entry.RollbackCaptureName}), nil
+		}
+		if !state.CaptureMatchesExpected {
+			// Pending capture means the original still belongs at the target. Any
+			// other absence is ambiguous and must be retained for inspection.
+			if entry.Phase == EntryPhasePending || entry.Phase == EntryPhaseCaptureIntent && !state.CaptureExists {
+				return nil, persist(EntryPhaseRestored)
+			}
+			return block("captured original is missing or changed", []string{entry.Path}, []string{entry.CaptureName, entry.RollbackCaptureName}), nil
+		}
+		if err := renameRelativeNoReplace(roots.source, entry.CaptureName, roots.source, entry.Path); err != nil {
+			return nil, err
+		}
+		if state.RollbackMatchesResult {
+			if err := removeRelativeIdentity(roots.source, entry.RollbackCaptureName, *entry.Result, 0, 0); err != nil {
+				return block("retained published result changed before removal", []string{entry.Path}, []string{entry.RollbackCaptureName}), nil
+			}
+		}
+		return nil, persist(EntryPhaseRestored)
+	case EntryOperationCreatedParent:
+		if state.TargetExists {
+			return block("created target has unowned or ambiguous content", []string{entry.Path}, []string{entry.Path, entry.RollbackCaptureName}), nil
+		}
+		if state.RollbackMatchesResult {
+			device, inode := uint64(0), uint64(0)
+			if entry.Operation == EntryOperationCreatedParent {
+				device, inode = entry.CreatedDevice, entry.CreatedInode
+			}
+			if err := removeRelativeIdentity(roots.source, entry.RollbackCaptureName, *entry.Result, device, inode); err != nil {
+				return block("retained created result changed before removal", []string{entry.Path}, []string{entry.RollbackCaptureName}), nil
+			}
+		}
+		return nil, persist(EntryPhaseRestored)
+	default:
+		return nil, fmt.Errorf("unsupported rollback operation %q", entry.Operation)
+	}
 }
 
 func manifestsCanonicallyEqual(left, right TransactionManifest) bool {

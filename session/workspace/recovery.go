@@ -24,6 +24,54 @@ type DiscoveredTransaction struct {
 	Invalid   error
 }
 
+// RecoveryDisposition summarizes whether recovery completed or retained a
+// transaction because continuing could overwrite content not owned by it.
+type RecoveryDisposition string
+
+const (
+	RecoveryRolledBack RecoveryDisposition = "rolled-back"
+	RecoveryBlocked    RecoveryDisposition = "recovery-blocked"
+	RecoveryUnchanged  RecoveryDisposition = "unchanged"
+)
+
+// ApplyMetadataRepair is populated by the later metadata-repair phase. It is
+// part of the recovery report now so callers can consume one stable shape.
+type ApplyMetadataRepair struct {
+	TransactionID string
+	AppliedTree   string
+	AppliedAt     string
+}
+
+type RecoveryIssue struct {
+	TransactionID string
+	State         TransactionState
+	Message       string
+	Paths         []string
+	RetainedPaths []string
+}
+
+type RecoveryReport struct {
+	Disposition RecoveryDisposition
+	Issues      []RecoveryIssue
+	Repairs     []ApplyMetadataRepair
+	Orphans     []string
+}
+
+// ObservedEntryState records the identity-bearing locations used to reconcile
+// an entry whose filesystem mutation may have completed before its phase write.
+type ObservedEntryState struct {
+	TargetExists           bool
+	TargetMatchesExpected  bool
+	TargetMatchesResult    bool
+	CaptureExists          bool
+	CaptureMatchesExpected bool
+	RollbackExists         bool
+	RollbackMatchesResult  bool
+	StageExists            bool
+	StageMatchesResult     bool
+	QuarantineExists       bool
+}
+
 // DiscoverTransactions classifies direct children of a validated transaction
 // root. Invalid and legacy manifests are retained unchanged.
 func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
