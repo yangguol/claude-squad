@@ -82,3 +82,25 @@ Addressed the independent review blockers with phase-constrained ownership infer
 ### Remaining boundaries
 
 Successful rollback still leaves transaction metadata and privately retained published results for Task 7 cleanup. Project locking and blocked-lifecycle orchestration remain Task 8.
+
+## Fix Round 2
+
+Hardened durable `publish-intent` reconciliation so content equality cannot establish publication while a stage still exists. If both target and stage exist, or the stage mismatches the durable result, recovery now preserves all observed content and durably enters `recovery-blocked` with exact paths. Created-parent rollback-capture observation now applies its durable device/inode ownership to the rollback location as well.
+
+Rollback coverage now records and asserts the actual descriptor-relative mutation sequence in reverse manifest order. Crash-idempotence tests inject manifest persistence failures immediately after rollback capture, created-parent rollback capture, and restoration; repeated recovery infers each completed filesystem mutation and finishes safely.
+
+### RED
+
+- `go test ./session/workspace -run '^(TestRecoveryApplyingTransactionRollsBackInReverseOrder|TestRecoveryPublishIntentDoesNotClaimEqualExternalTargetWhileStageRemains|TestRecoveryPublishIntentBlocksWhenStageMismatches|TestRecoveryInfersRollbackCaptureCompletedBeforePhaseWrite|TestRecoveryInfersRestorationCompletedBeforePhaseWrite)$' -count=1` — failed as expected: an equal external target was captured while its real stage remained, and a mismatched stage rolled back instead of blocking.
+
+### GREEN
+
+- `go test ./session/workspace -run '^(TestRecoveryApplyingTransactionRollsBackInReverseOrder|TestRecoveryPublishIntentDoesNotClaimEqualExternalTargetWhileStageRemains|TestRecoveryPublishIntentBlocksWhenStageMismatches|TestRecoveryInfersRollbackCaptureCompletedBeforePhaseWrite|TestRecoveryInfersCreatedParentRollbackCaptureBeforePhaseWrite|TestRecoveryInfersRestorationCompletedBeforePhaseWrite)$' -count=1` — pass, 12.684s
+- `go test ./session/workspace -run '^(TestRecovery|TestRollbackNever|TestApplyRollback)' -count=1` — pass, 54.535s
+- `go test ./session/workspace -count=1` — pass, 299.406s
+- `go test ./... -count=1` — pass; all repository packages, workspace 303.704s
+- `git diff --check` — pass
+
+### Remaining boundaries
+
+Successful rollback still leaves transaction metadata and privately retained published results for Task 7 cleanup. Project locking and blocked-lifecycle orchestration remain Task 8.

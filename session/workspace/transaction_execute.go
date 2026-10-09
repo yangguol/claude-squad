@@ -524,6 +524,11 @@ func observeEntryStateBound(entry TransactionEntry, roots *forwardRoots) (state 
 		} else if !errors.Is(statErr, os.ErrNotExist) {
 			errs = append(errs, statErr)
 		}
+		if stat, statErr := entryStatAt(roots.source, entry.RollbackCaptureName); statErr == nil {
+			state.RollbackMatchesResult = uint64(stat.Dev) == entry.CreatedDevice && uint64(stat.Ino) == entry.CreatedInode
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			errs = append(errs, statErr)
+		}
 	}
 	return state, errors.Join(errs...)
 }
@@ -656,8 +661,14 @@ func rollbackEntryBound(manifest *TransactionManifest, index int, roots *forward
 	if entry.Operation == EntryOperationCreate && entry.Phase == EntryPhasePending && state.TargetExists {
 		return block("pending create target is externally owned", []string{entry.Path}, []string{entry.Path, entry.StagePath}), nil
 	}
-	if entry.Operation == EntryOperationCreatedParent && entry.Phase == EntryPhasePublishIntent && state.StageExists && !state.StageMatchesResult {
-		return block("created-parent stage has ambiguous ownership", []string{entry.Path}, []string{entry.StagePath}), nil
+	if entry.Phase == EntryPhasePublishIntent && state.StageExists {
+		if state.TargetExists {
+			return block("publish intent has both target and stage", []string{entry.Path}, []string{entry.Path, entry.StagePath}), nil
+		}
+		if !state.StageMatchesResult {
+			return block("publish intent stage has ambiguous ownership", []string{entry.Path}, []string{entry.StagePath}), nil
+		}
+		published = false
 	}
 	if published && !state.RollbackMatchesResult {
 		if state.RollbackExists {
