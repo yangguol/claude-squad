@@ -55,7 +55,7 @@ Reviewed reverse ordering, intent-before-filesystem and filesystem-before-comple
 
 ## Commit
 
-Pending at report creation; recorded after commit below.
+`8c8bc7e feat(workspace): recover applies by durable rollback`
 
 ## Concerns
 
