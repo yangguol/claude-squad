@@ -119,6 +119,7 @@ func ExecuteTransaction(manifest *TransactionManifest, transactionDir string) (r
 		return fail(errors.New("transaction is missing applied tree or time"))
 	}
 
+	durabilityCheckpoint(DurabilityForwardReadyToCommit)
 	manifest.State = TransactionCommitted
 	if err := writeManifestBound(*manifest, roots.tx); err != nil {
 		persisted, readErr := readManifestBoundStrict(roots.tx)
@@ -132,6 +133,7 @@ func ExecuteTransaction(manifest *TransactionManifest, transactionDir string) (r
 		return fail(errors.Join(fmt.Errorf("commit transaction metadata: %w", err), readErr))
 	}
 	committedDurably = true
+	durabilityCheckpoint(DurabilityForwardCommit)
 	if transactionAfterCommitHook != nil {
 		transactionAfterCommitHook()
 	}
@@ -167,6 +169,7 @@ func captureEntryForwardBound(manifest *TransactionManifest, index int, roots *f
 		if transactionAfterFilesystemHook != nil {
 			transactionAfterFilesystemHook("capture", entry.Path)
 		}
+		durabilityCheckpoint(durabilityPathPoint(DurabilityForwardCapture, entry.Path))
 		fallthrough
 	case EntryPhaseCaptureIntent:
 		if err := validateCapturedSourceBound(*entry, roots.source); err != nil {
@@ -240,6 +243,7 @@ func applyEntryForwardBound(manifest *TransactionManifest, index int, roots *for
 		if transactionAfterFilesystemHook != nil {
 			transactionAfterFilesystemHook("publish", entry.Path)
 		}
+		durabilityCheckpoint(durabilityPathPoint(DurabilityForwardPublish, entry.Path))
 	}
 	if entry.Phase == EntryPhasePublishIntent {
 		if err := validateIdentityBound(roots.source, entry.Path, *entry.Result); err != nil {
@@ -292,6 +296,7 @@ func publishCreatedParentBound(manifest *TransactionManifest, index int, roots *
 			if transactionAfterFilesystemHook != nil {
 				transactionAfterFilesystemHook("create-parent", entry.Path)
 			}
+			durabilityCheckpoint(durabilityPathPoint(DurabilityForwardPublish, entry.Path))
 		case sourceOwned:
 			if !errors.Is(stageErr, os.ErrNotExist) {
 				return errors.New("created parent ownership exists at both stage and source")
@@ -453,6 +458,7 @@ func writeManifestAtBoundDirectory(manifest TransactionManifest, transactionDir 
 }
 
 func writeManifestBound(manifest TransactionManifest, directory *os.File) error {
+	durabilityCheckpoint(DurabilityManifestBeforePersistence)
 	if transactionManifestWriteHook != nil {
 		if err := transactionManifestWriteHook(manifest.State); err != nil {
 			return err
@@ -500,6 +506,7 @@ func writeManifestBound(manifest TransactionManifest, directory *os.File) error 
 			return err
 		}
 	}
+	durabilityCheckpoint(DurabilityManifestAfterPersistence)
 	return nil
 }
 
@@ -628,6 +635,7 @@ func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex in
 		if cleanupAfterSourceQuarantineHook != nil {
 			cleanupAfterSourceQuarantineHook(entry.QuarantinePath)
 		}
+		durabilityCheckpoint(durabilityPathPoint(DurabilityCleanupQuarantine, entry.Path))
 		quarantineExists = true
 	}
 	if entry.CleanupPhase == CleanupPhaseQuarantineIntent {
@@ -660,6 +668,7 @@ func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex in
 				return err
 			}
 			entry.CleanupPhase = CleanupPhaseRemoved
+			durabilityCheckpoint(durabilityPathPoint(DurabilityCleanupRemoval, entry.Path))
 			return writeManifestBound(*manifest, roots.tx)
 		}
 		identity, err := entryStatAt(roots.tx, entry.QuarantinePath)
@@ -677,6 +686,7 @@ func quarantineSourceTemporaryBound(manifest *TransactionManifest, entryIndex in
 			return err
 		}
 		entry.CleanupPhase = CleanupPhaseRemoved
+		durabilityCheckpoint(durabilityPathPoint(DurabilityCleanupRemoval, entry.Path))
 		return writeManifestBound(*manifest, roots.tx)
 	}
 	return nil
@@ -819,6 +829,7 @@ func CleanCommittedTransaction(manifest *TransactionManifest, transactionDir str
 	if err := writeManifestAtBoundDirectory(*manifest, transactionDir); err != nil {
 		return nil, err
 	}
+	durabilityCheckpoint(DurabilityCleanupComplete)
 	return nil, nil
 }
 
@@ -951,6 +962,7 @@ func rollbackTransactionBound(manifest *TransactionManifest, roots *forwardRoots
 	if err := writeManifestBound(*manifest, roots.tx); err != nil {
 		return RecoveryReport{}, err
 	}
+	durabilityCheckpoint(DurabilityRollbackComplete)
 	return RecoveryReport{Disposition: RecoveryRolledBack}, nil
 }
 
@@ -1090,6 +1102,7 @@ func reconcileRollbackEntryBound(manifest *TransactionManifest, index int, roots
 			if transactionAfterFilesystemHook != nil {
 				transactionAfterFilesystemHook("rollback-capture", entry.Path)
 			}
+			durabilityCheckpoint(durabilityPathPoint(DurabilityRollbackCapture, entry.Path))
 			state, err = observe()
 			if err != nil {
 				return nil, err
@@ -1176,6 +1189,7 @@ func reconcileRollbackEntryBound(manifest *TransactionManifest, index int, roots
 		if transactionAfterFilesystemHook != nil {
 			transactionAfterFilesystemHook("restore", entry.Path)
 		}
+		durabilityCheckpoint(durabilityPathPoint(DurabilityRollbackRestore, entry.Path))
 		if state.RollbackMatchesResult {
 			if issue := retainRollbackResult(); issue != nil {
 				return issue, nil

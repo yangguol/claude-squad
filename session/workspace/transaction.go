@@ -16,6 +16,32 @@ type EntryOperation string
 type EntryPhase string
 type CleanupPhase string
 
+// DurabilityPoint identifies a stable, post-durability crash boundary. The
+// callback is a package-private test seam; production execution leaves it as a
+// no-op.
+type DurabilityPoint string
+
+var durabilityCheckpoint = func(DurabilityPoint) {}
+
+func durabilityPathPoint(point DurabilityPoint, path string) DurabilityPoint {
+	return DurabilityPoint(string(point) + ":" + path)
+}
+
+const (
+	DurabilityManifestBeforePersistence DurabilityPoint = "manifest.before-persistence"
+	DurabilityManifestAfterPersistence  DurabilityPoint = "manifest.after-persistence"
+	DurabilityForwardCapture            DurabilityPoint = "forward.capture"
+	DurabilityForwardPublish            DurabilityPoint = "forward.publish"
+	DurabilityForwardReadyToCommit      DurabilityPoint = "forward.ready-to-commit"
+	DurabilityForwardCommit             DurabilityPoint = "forward.commit"
+	DurabilityRollbackCapture           DurabilityPoint = "rollback.capture"
+	DurabilityRollbackRestore           DurabilityPoint = "rollback.restore"
+	DurabilityRollbackComplete          DurabilityPoint = "rollback.complete"
+	DurabilityCleanupQuarantine         DurabilityPoint = "cleanup.quarantine"
+	DurabilityCleanupRemoval            DurabilityPoint = "cleanup.removal"
+	DurabilityCleanupComplete           DurabilityPoint = "cleanup.complete"
+)
+
 const (
 	TransactionPrepared        TransactionState = "prepared"
 	TransactionApplying        TransactionState = "applying"

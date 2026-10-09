@@ -704,7 +704,9 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 				if hasOwnership {
 					return fmt.Errorf("transaction entry %d has ownership before created-parent intent", index)
 				}
-			case EntryPhasePublishIntent, EntryPhasePublished, EntryPhaseRollbackCaptureIntent, EntryPhaseRollbackCaptured, EntryPhaseRestored:
+			case EntryPhaseRestored:
+				// A restored parent may have crashed before its terminal phase write.
+			case EntryPhasePublishIntent, EntryPhasePublished, EntryPhaseRollbackCaptureIntent, EntryPhaseRollbackCaptured:
 				if !hasOwnership {
 					return fmt.Errorf("transaction entry %d is missing created-parent ownership", index)
 				}
@@ -968,7 +970,7 @@ func validCleanupPhase(phase CleanupPhase) bool {
 func phaseAllowed(operation EntryOperation, phase EntryPhase) bool {
 	switch operation {
 	case EntryOperationCreate:
-		return phase == EntryPhasePending || phase == EntryPhasePublishIntent || phase == EntryPhasePublished
+		return phase == EntryPhasePending || phase == EntryPhasePublishIntent || phase == EntryPhasePublished || phase == EntryPhaseRollbackCaptureIntent || phase == EntryPhaseRollbackCaptured || phase == EntryPhaseRestored
 	case EntryOperationUpdate:
 		return validEntryPhase(phase)
 	case EntryOperationDelete:
