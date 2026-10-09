@@ -92,3 +92,23 @@ The initial RED run failed because the publication hook and refresh behavior did
 ### Concerns
 
 None within Task 8 scope. Task 9 metadata repair and Task 10 reset integration remain intentionally unchanged.
+
+## Fix Round 2
+
+### Status
+
+Closed the remaining lifecycle evidence gaps without production changes.
+
+### Evidence
+
+The Apply recovery test now constructs a real durable update transaction, moves the original source into its preallocated capture, publishes the staged interrupted result, and persists the applying state. It proves automatic recovery restores the original before writable access is published, then proves the same Apply proceeds and publishes the pending worktree result.
+
+A second deterministic test starts from an actually committed transaction with captured source material. Typed project-lock contention probes run during manifest discovery, cleanup quarantine mutation, cleaning/complete state persistence, and capability publication, proving the same project lock remains held across the entire recovery and publication interval.
+
+### Verification
+
+Focused lifecycle tests, full `session/workspace`, full `session`, and `go test ./... -count=1` pass. `git diff --check` is clean.
+
+### Concerns
+
+None. Cleanup-blocked access publication was already covered by exact read-only state tests and did not require production changes.

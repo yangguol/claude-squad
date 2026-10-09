@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -112,15 +113,31 @@ func TestHealthyRecoveredSessionRetainsNormalCapabilities(t *testing.T) {
 
 func TestApplyRefreshesRecoveryAndPublishesAccessUnderContinuousLock(t *testing.T) {
 	ws := lifecycleWorkspace(t)
-	transactionDir := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", "interrupted")
-	require.NoError(t, os.MkdirAll(transactionDir, 0o700))
-	manifest := TransactionManifest{
-		Version: CurrentTransactionVersion, TransactionID: "interrupted", ProjectID: ws.data.ProjectID,
-		SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionPrepared,
-		Entries: []TransactionEntry{},
-	}
-	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
 	require.NoError(t, os.WriteFile(filepath.Join(ws.data.WorktreePath, "file"), []byte("agent"), 0o644))
+	transactionRoot := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+	require.NoError(t, os.MkdirAll(transactionRoot, 0o700))
+	transactionDir, err := os.MkdirTemp(transactionRoot, ws.data.SessionID+"-interrupted-")
+	require.NoError(t, err)
+	plan := applyPlan{
+		TransactionDir: transactionDir,
+		SourcePath:     ws.data.SourcePath,
+		MergedTree:     strings.Repeat("a", 40),
+		OursSnapshot:   mustSnapshot(t, ws.data.SourcePath),
+		Updates: map[string]applyEntry{
+			"file": {Type: EntryRegular, Mode: 0o644, Contents: []byte("interrupted")},
+		},
+	}
+	manifest, err := ws.prepareTransaction(plan, time.Unix(100, 0).UTC())
+	require.NoError(t, err)
+	entry := &manifest.Entries[0]
+	require.Equal(t, EntryOperationUpdate, entry.Operation)
+	require.NoError(t, os.Rename(filepath.Join(ws.data.SourcePath, entry.Path), filepath.Join(ws.data.SourcePath, entry.CaptureName)))
+	require.NoError(t, os.Rename(filepath.Join(transactionDir, filepath.FromSlash(entry.StagePath)), filepath.Join(ws.data.SourcePath, entry.Path)))
+	entry.Phase = EntryPhasePublished
+	manifest.State = TransactionApplying
+	require.NoError(t, WriteManifestDurable(manifest, transactionDir))
+	require.Equal(t, "interrupted", mustReadFile(t, filepath.Join(ws.data.SourcePath, "file")))
+	require.Equal(t, "old", mustReadFile(t, filepath.Join(ws.data.SourcePath, entry.CaptureName)))
 
 	var probes int
 	probe := func() {
@@ -135,7 +152,10 @@ func TestApplyRefreshesRecoveryAndPublishesAccessUnderContinuousLock(t *testing.
 		}
 		return nil
 	}
-	lifecycleAccessStatePublishedHook = probe
+	lifecycleAccessStatePublishedHook = func() {
+		probe()
+		require.Equal(t, "old", mustReadFile(t, filepath.Join(ws.data.SourcePath, "file")), "rollback must restore source before writable access is published")
+	}
 	t.Cleanup(func() {
 		transactionManifestWriteHook = nil
 		lifecycleAccessStatePublishedHook = nil
@@ -145,9 +165,74 @@ func TestApplyRefreshesRecoveryAndPublishesAccessUnderContinuousLock(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, []string{"file"}, result.Changed)
 	require.Equal(t, "agent", mustReadFile(t, filepath.Join(ws.data.SourcePath, "file")))
+	require.Equal(t, TransactionRolledBack, readPersistedTransactionManifest(t, transactionDir).State)
 	require.False(t, ws.AccessState().ReadOnly)
 	require.True(t, ws.Capabilities().Apply)
 	require.GreaterOrEqual(t, probes, 3)
+}
+
+func TestApplyHoldsProjectLockAcrossCommittedRecoveryCleanupAndPublication(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	transactionRoot := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+	require.NoError(t, os.MkdirAll(transactionRoot, 0o700))
+	transactionDir, err := os.MkdirTemp(transactionRoot, ws.data.SessionID+"-committed-")
+	require.NoError(t, err)
+	plan := applyPlan{
+		TransactionDir: transactionDir,
+		SourcePath:     ws.data.SourcePath,
+		MergedTree:     strings.Repeat("b", 40),
+		OursSnapshot:   mustSnapshot(t, ws.data.SourcePath),
+		Updates: map[string]applyEntry{
+			"file": {Type: EntryRegular, Mode: 0o644, Contents: []byte("committed")},
+		},
+	}
+	manifest, err := ws.prepareTransaction(plan, time.Unix(200, 0).UTC())
+	require.NoError(t, err)
+	require.NoError(t, ExecuteTransaction(&manifest, transactionDir))
+	require.Equal(t, TransactionCommitted, readPersistedTransactionManifest(t, transactionDir).State)
+	require.Equal(t, "committed", mustReadFile(t, filepath.Join(ws.data.SourcePath, "file")))
+
+	var discovery, cleanupMutation, cleanupState, publication int
+	probe := func(stage string) {
+		_, err := AcquireProjectLock(filepath.Dir(ws.data.RepoPath), "committed cleanup "+stage+" probe")
+		var busy *OperationInProgressError
+		require.ErrorAs(t, err, &busy)
+		switch stage {
+		case "discovery":
+			discovery++
+		case "cleanup mutation":
+			cleanupMutation++
+		case "cleanup state":
+			cleanupState++
+		case "publication":
+			publication++
+		}
+	}
+	manifestComponentAfterOpenHook = func(string) { probe("discovery") }
+	cleanupAfterSourceQuarantineHook = func(string) { probe("cleanup mutation") }
+	transactionManifestWriteHook = func(state TransactionState) error {
+		if state == TransactionCleaning || state == TransactionComplete {
+			probe("cleanup state")
+		}
+		return nil
+	}
+	lifecycleAccessStatePublishedHook = func() { probe("publication") }
+	t.Cleanup(func() {
+		manifestComponentAfterOpenHook = nil
+		cleanupAfterSourceQuarantineHook = nil
+		transactionManifestWriteHook = nil
+		lifecycleAccessStatePublishedHook = nil
+	})
+
+	result, err := ws.Apply()
+	require.NoError(t, err)
+	require.Empty(t, result.Changed)
+	require.Equal(t, "committed", mustReadFile(t, filepath.Join(ws.data.SourcePath, "file")))
+	require.Equal(t, TransactionComplete, readPersistedTransactionManifest(t, transactionDir).State)
+	require.Positive(t, discovery)
+	require.Positive(t, cleanupMutation)
+	require.GreaterOrEqual(t, cleanupState, 2)
+	require.Equal(t, 1, publication)
 }
 
 func TestApplyRefreshesNewBlockedStateBeforeMutation(t *testing.T) {
