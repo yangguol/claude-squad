@@ -122,3 +122,33 @@ No failures remained in either the workspace package or full repository suite. E
 ### Concerns
 
 Reverse rollback and committed cleanup remain intentionally deferred to Tasks 6 and 7. If opening the transaction directory itself fails, the best-effort pathname rebind used to persist `rolling-back` can also fail; that error is joined and materials are not removed. The descriptor-bound subtree scan detects replacement of every opened authoritative root/ancestor at the final verification point, but cannot prevent external mutation after the durable commit boundary.
+
+## Fix Round 3
+
+### Status
+
+Fixed the remaining created-parent ownership race. Created-parent directories now receive a preallocated private transaction-stage path. Forward execution creates and opens the directory there, obtains ownership from that descriptor, and only then atomically publishes that same inode to the source with descriptor-relative no-replace rename. A source entry installed before publication is rejected and is never claimed or removed.
+
+### RED
+
+Added `TestCreatedParentReplacementBeforeOwnershipOpenIsNotClaimed` with a deterministic hook immediately after private `mkdirat` and before ownership acquisition. The initial implementation still created directly at the source pathname, so the replacement was opened and accepted; the focused test failed because `ExecuteTransaction` returned nil.
+
+Exact command and result:
+
+- `/Users/yangguoliang/.local/bin/go test ./session/workspace -run '^TestCreatedParentReplacementBeforeOwnershipOpenIsNotClaimed$' -count=1` — FAIL: `An error is expected but got nil.`
+
+### GREEN
+
+The created inode is opened no-follow under the bound transaction directory before publication. Publication uses descriptor-relative no-replace rename into the bound source parent, syncs both affected directories, and verifies the published binding still matches the opened descriptor. The regression installs an external non-empty source directory in the former mkdir/open gap, proves execution fails into `rolling-back` without durable ownership, and confirms the external marker remains.
+
+Exact commands and results:
+
+- `/Users/yangguoliang/.local/bin/go test ./session/workspace -run '^TestCreatedParentReplacementBeforeOwnershipOpenIsNotClaimed$' -count=1` — PASS
+- `/Users/yangguoliang/.local/bin/go test ./session/workspace -run '^(TestCreatedParent|TestForward|TestFinalValidation|TestOpenDescriptor|TestCommitted|TestApplyPreserves|TestApplyDirectory)' -count=1` — PASS
+- `/Users/yangguoliang/.local/bin/go test ./session/workspace -count=1` — PASS
+- `/Users/yangguoliang/.local/bin/go test ./... -count=1` — PASS
+- `git diff --check` — PASS
+
+### Concerns
+
+Created-parent stage paths are now required v2 WAL fields and remain as transaction materials when publication fails; their later removal belongs to Task 7. Reverse rollback and cleanup remain intentionally unimplemented here. The implementation relies on the existing cross-directory same-filesystem atomic no-replace preflight and platform primitive.

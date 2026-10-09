@@ -21,6 +21,7 @@ var transactionBeforeCommitHook func() error
 var transactionAfterCommitHook func()
 var transactionManifestWriteHook func(TransactionState) error
 var transactionAfterManifestRenameHook func(TransactionState) error
+var transactionAfterCreatedParentMkdirHook func(string)
 var transactionAfterCreatedParentOpenHook func(string)
 var replacementScanAfterRootReadHook func()
 
@@ -241,7 +242,7 @@ func publishCreatedParentBound(manifest *TransactionManifest, index int, roots *
 		if transactionBeforeFilesystemHook != nil {
 			transactionBeforeFilesystemHook("create-parent", entry.Path)
 		}
-		stat, err := mkdirRelative(roots.source, entry.Path, entry.Result.Mode)
+		stat, err := mkdirRelative(roots.source, entry.Path, roots.tx, entry.StagePath, entry.Result.Mode)
 		if err != nil {
 			return err
 		}

@@ -126,23 +126,34 @@ func renameRelativeNoReplace(fromRoot *os.File, fromRelative string, toRoot *os.
 	return errors.Join(fromParent.Sync(), toParent.Sync())
 }
 
-func mkdirRelative(root *os.File, relative string, mode os.FileMode) (unix.Stat_t, error) {
+func mkdirRelative(root *os.File, relative string, stageRoot *os.File, temporary string, mode os.FileMode) (unix.Stat_t, error) {
 	parent, leaf, err := openRelativeParent(root, relative)
 	if err != nil {
 		return unix.Stat_t{}, err
 	}
 	defer parent.Close()
-	if err := unix.Mkdirat(int(parent.Fd()), leaf, uint32(mode.Perm())); err != nil {
-		return unix.Stat_t{}, err
-	}
-	fd, err := unix.Openat(int(parent.Fd()), leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	temporaryParent, temporaryLeaf, err := openRelativeParent(stageRoot, temporary)
 	if err != nil {
 		return unix.Stat_t{}, err
 	}
-	created := os.NewFile(uintptr(fd), leaf)
+	defer temporaryParent.Close()
+	if err := unix.Mkdirat(int(temporaryParent.Fd()), temporaryLeaf, uint32(mode.Perm())); err != nil {
+		return unix.Stat_t{}, err
+	}
+	if transactionAfterCreatedParentMkdirHook != nil {
+		transactionAfterCreatedParentMkdirHook(relative)
+	}
+	fd, err := unix.Openat(int(temporaryParent.Fd()), temporaryLeaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return unix.Stat_t{}, err
+	}
+	created := os.NewFile(uintptr(fd), temporaryLeaf)
 	defer created.Close()
 	var opened unix.Stat_t
 	if err := unix.Fstat(fd, &opened); err != nil {
+		return unix.Stat_t{}, err
+	}
+	if err := platformRenameatNoReplaceBetween(int(temporaryParent.Fd()), temporaryLeaf, int(parent.Fd()), leaf); err != nil {
 		return unix.Stat_t{}, err
 	}
 	if transactionAfterCreatedParentOpenHook != nil {
@@ -161,7 +172,7 @@ func mkdirRelative(root *os.File, relative string, mode os.FileMode) (unix.Stat_
 	if err := verify(); err != nil {
 		return unix.Stat_t{}, err
 	}
-	if err := parent.Sync(); err != nil {
+	if err := errors.Join(temporaryParent.Sync(), parent.Sync()); err != nil {
 		return unix.Stat_t{}, err
 	}
 	if err := verify(); err != nil {

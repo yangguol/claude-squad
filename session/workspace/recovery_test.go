@@ -54,6 +54,7 @@ func validRecoveryEntry(path string, operation EntryOperation) TransactionEntry 
 		entry.CaptureName = filepath.ToSlash(filepath.Join(filepath.Dir(path), ".capture-"+filepath.Base(path)))
 		entry.Expected = recoveryIdentity(path)
 	case EntryOperationCreatedParent:
+		entry.StagePath = filepath.ToSlash(filepath.Join("stage-parent", path))
 		entry.RollbackCaptureName = filepath.ToSlash(filepath.Join(filepath.Dir(path), ".rollback-"+filepath.Base(path)))
 		entry.Result = &Entry{Path: path, Type: EntryType("directory"), Mode: 0o700}
 	}

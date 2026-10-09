@@ -527,8 +527,12 @@ func preallocateTransactionEntries(plan applyPlan) ([]TransactionEntry, error) {
 		if err != nil {
 			return nil, err
 		}
+		stagePath, err := allocatePrivateName("stage-parent")
+		if err != nil {
+			return nil, err
+		}
 		parentEntries = append(parentEntries, TransactionEntry{
-			Path: parent, Operation: EntryOperationCreatedParent, Phase: EntryPhasePending,
+			Path: parent, StagePath: stagePath, Operation: EntryOperationCreatedParent, Phase: EntryPhasePending,
 			CleanupPhase: CleanupPhasePending, RollbackCaptureName: rollbackName, Result: &result,
 		})
 	}
@@ -653,6 +657,9 @@ func stageTransactionResults(transactionDir string, entries []TransactionEntry) 
 			return fmt.Errorf("create transaction stage parent: %w", err)
 		}
 		createdRoots[filepath.Dir(stage)] = struct{}{}
+		if entry.Operation == EntryOperationCreatedParent {
+			continue
+		}
 		if entry.Result != nil && entry.Result.Type == EntrySymlink {
 			if err := applyFS.Symlink(entry.stageSymlinkTarget, stage); err != nil {
 				return fmt.Errorf("stage symlink %q: %w", entry.Path, err)

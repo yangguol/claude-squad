@@ -349,7 +349,7 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			sourceSide  bool
 			required    bool
 		}{
-			{"stage", entry.StagePath, transactionDir, false, entry.Operation == EntryOperationCreate || entry.Operation == EntryOperationUpdate},
+			{"stage", entry.StagePath, transactionDir, false, entry.Operation == EntryOperationCreate || entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationCreatedParent},
 			{"capture", entry.CaptureName, manifest.SourcePath, true, entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationDelete},
 			{"rollback capture", entry.RollbackCaptureName, manifest.SourcePath, true, entry.Operation == EntryOperationCreate || entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationCreatedParent},
 			{"quarantine", entry.QuarantinePath, transactionDir, false, entry.Operation == EntryOperationUpdate || entry.Operation == EntryOperationDelete},
@@ -366,7 +366,7 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			if field.sourceSide && filepath.Dir(filepath.Join(manifest.SourcePath, filepath.FromSlash(field.value))) != filepath.Dir(filepath.Join(manifest.SourcePath, filepath.FromSlash(entry.Path))) {
 				return fmt.Errorf("transaction entry %d %s is not a target sibling", index, field.name)
 			}
-			if !(field.sourceSide && manifestTargetParentWillBeReplaced(manifest, entry.Path)) {
+			if !(field.sourceSide && manifestTargetParentWillBeReplaced(manifest, entry.Path)) && !(entry.Operation == EntryOperationCreatedParent && field.name == "stage") {
 				if err := ensureReconstructiblePath(field.root, field.value, field.name); err != nil {
 					return fmt.Errorf("transaction entry %d: %w", index, err)
 				}
@@ -376,7 +376,7 @@ func ValidateManifest(projectPath, transactionDir string, manifest TransactionMa
 			if field.sourceSide {
 				namespace = &sourcePaths
 			}
-			if !(field.sourceSide && manifestTargetParentWillBeReplaced(manifest, entry.Path)) {
+			if !(field.sourceSide && manifestTargetParentWillBeReplaced(manifest, entry.Path)) && !(entry.Operation == EntryOperationCreatedParent && field.name == "stage") {
 				if err := addManifestNamespacePath(namespace, identity); err != nil {
 					return fmt.Errorf("transaction entry %d %s: %w", index, field.name, err)
 				}

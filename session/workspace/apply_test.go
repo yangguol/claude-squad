@@ -1553,7 +1553,28 @@ func TestFinalDirectoryScanRejectsReboundTopLevelChild(t *testing.T) {
 	require.Equal(t, TransactionRollingBack, readPersistedTransactionManifest(t, plan.TransactionDir).State)
 }
 
-func TestCreatedParentReplacementAfterMkdirIsNotClaimed(t *testing.T) {
+func TestCreatedParentReplacementBeforeOwnershipOpenIsNotClaimed(t *testing.T) {
+	_, plan, manifest := preparedForwardTransaction(t)
+	transactionAfterCreatedParentMkdirHook = func(path string) {
+		if path != "new" {
+			return
+		}
+		transactionAfterCreatedParentMkdirHook = nil
+		require.NoError(t, os.Mkdir(filepath.Join(manifest.SourcePath, path), 0o755))
+		writeApplyFile(t, manifest.SourcePath, path+"/external", "external", 0o600)
+	}
+	t.Cleanup(func() { transactionAfterCreatedParentMkdirHook = nil })
+
+	require.Error(t, ExecuteTransaction(&manifest, plan.TransactionDir))
+	persisted := readPersistedTransactionManifest(t, plan.TransactionDir)
+	require.Equal(t, TransactionRollingBack, persisted.State)
+	index := slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == "new" })
+	require.Zero(t, persisted.Entries[index].CreatedDevice)
+	require.Zero(t, persisted.Entries[index].CreatedInode)
+	require.Equal(t, "external", mustReadFile(t, filepath.Join(manifest.SourcePath, "new/external")))
+}
+
+func TestCreatedParentReplacementAfterOwnershipOpenIsNotClaimed(t *testing.T) {
 	_, plan, manifest := preparedForwardTransaction(t)
 	transactionAfterCreatedParentOpenHook = func(path string) {
 		if path != "new" {
