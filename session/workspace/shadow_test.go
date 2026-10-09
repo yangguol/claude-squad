@@ -150,6 +150,53 @@ func TestResetRejectsReferenceInsertedAfterEnumeration(t *testing.T) {
 	require.NotEqual(t, persisted, contents)
 }
 
+func TestResetPreflightAcceptsPublishedUpdateAndCreateRollback(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	fixture := newResetRecoveryFixtureWithCreate(t, "published")
+	updateIndex := slices.IndexFunc(fixture.manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "update" })
+	createIndex := slices.IndexFunc(fixture.manifest.Entries, func(entry TransactionEntry) bool { return entry.Path == "create" })
+	require.NotEqual(t, -1, updateIndex)
+	require.NotEqual(t, -1, createIndex)
+	for _, index := range []int{updateIndex, createIndex} {
+		entry := &fixture.manifest.Entries[index]
+		if entry.Operation == EntryOperationUpdate {
+			require.NoError(t, os.Rename(filepath.Join(fixture.manifest.SourcePath, entry.Path), filepath.Join(fixture.manifest.SourcePath, entry.CaptureName)))
+		}
+		require.NoError(t, os.Rename(filepath.Join(fixture.transactionDir, entry.StagePath), filepath.Join(fixture.manifest.SourcePath, entry.Path)))
+		entry.Phase = EntryPhasePublished
+	}
+	fixture.manifest.State = TransactionApplying
+	require.NoError(t, WriteManifestDurable(fixture.manifest, fixture.transactionDir))
+	manifestBefore := mustReadFile(t, filepath.Join(fixture.transactionDir, "manifest.json"))
+	sourceBefore := mustSnapshot(t, fixture.manifest.SourcePath)
+	transactionBefore := mustSnapshot(t, fixture.transactionDir)
+
+	preflightManifest := fixture.manifest
+	report, err := PreflightRecoverTransaction(&preflightManifest, fixture.transactionDir)
+	require.NoError(t, err)
+	require.Equal(t, RecoveryUnchanged, report.Disposition)
+	require.Empty(t, report.Issues)
+	require.Equal(t, manifestBefore, mustReadFile(t, filepath.Join(fixture.transactionDir, "manifest.json")))
+	require.Equal(t, sourceBefore, mustSnapshot(t, fixture.manifest.SourcePath))
+	require.Equal(t, transactionBefore, mustSnapshot(t, fixture.transactionDir))
+
+	cleanupProceeded := false
+	require.NoError(t, WithResetPreflight(func() error {
+		cleanupProceeded = true
+		persisted := readPersistedTransactionManifest(t, fixture.transactionDir)
+		require.Equal(t, TransactionRolledBack, persisted.State)
+		require.Equal(t, "before", mustReadFile(t, filepath.Join(fixture.manifest.SourcePath, "update")))
+		require.NoFileExists(t, filepath.Join(fixture.manifest.SourcePath, "create"))
+		for _, path := range []string{"update", "create"} {
+			entry := persisted.Entries[slices.IndexFunc(persisted.Entries, func(entry TransactionEntry) bool { return entry.Path == path })]
+			require.FileExists(t, filepath.Join(fixture.transactionDir, entry.StagePath))
+			require.NoFileExists(t, filepath.Join(fixture.manifest.SourcePath, entry.RollbackCaptureName))
+		}
+		return nil
+	}))
+	require.True(t, cleanupProceeded)
+}
+
 func TestResetPreflightsFilesystemRecoveryAcrossAllProjects(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	fixtures := []resetRecoveryFixture{newResetRecoveryFixture(t, "first"), newResetRecoveryFixture(t, "second")}
@@ -202,6 +249,16 @@ type resetRecoveryFixture struct {
 
 func newResetRecoveryFixture(t *testing.T, session string) resetRecoveryFixture {
 	t.Helper()
+	return newResetRecoveryFixtureWithCreates(t, session, map[string]applyEntry{})
+}
+
+func newResetRecoveryFixtureWithCreate(t *testing.T, session string) resetRecoveryFixture {
+	t.Helper()
+	return newResetRecoveryFixtureWithCreates(t, session, map[string]applyEntry{"create": {Type: EntryRegular, Mode: 0o644, Contents: []byte("created")}})
+}
+
+func newResetRecoveryFixtureWithCreates(t *testing.T, session string, creates map[string]applyEntry) resetRecoveryFixture {
+	t.Helper()
 	source := t.TempDir()
 	writeApplyFile(t, source, "update", "before", 0o644)
 	value, _, err := NewShadow(source, session)
@@ -218,7 +275,7 @@ func newResetRecoveryFixture(t *testing.T, session string) resetRecoveryFixture 
 		MergedTree:     strings.Repeat("a", 40),
 		OursSnapshot:   before,
 		Updates:        map[string]applyEntry{"update": {Type: EntryRegular, Mode: 0o644, Contents: []byte("after")}},
-		Creates:        map[string]applyEntry{},
+		Creates:        creates,
 	}
 	manifest, err := ws.prepareTransaction(plan, time.Unix(300, 0).UTC())
 	require.NoError(t, err)

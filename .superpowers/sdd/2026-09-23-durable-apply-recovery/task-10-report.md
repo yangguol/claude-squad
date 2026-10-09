@@ -177,3 +177,47 @@ passed
 ### Concerns
 
 None identified.
+
+## Fix Round 3
+
+### Status
+
+Implemented and verified.
+
+### RED
+
+Added `TestResetPreflightAcceptsPublishedUpdateAndCreateRollback`, which constructs one applying transaction with both a published update and a published create. The initial run failed with `RecoveryBlocked`: preflight simulated moving each published result to its rollback capture, but private retention then queried the absent real capture path and reported that the retained result changed.
+
+### Changes
+
+- Rollback reconciliation now records an explicit simulated rollback-capture location and the descriptor-bound identity observed at the real published target.
+- Later private-retention validation consumes that virtual observation during preflight; mutating rollback continues to validate the real rollback capture through the same reconciliation path.
+- The deterministic regression proves direct preflight passes without changing source, transaction tree, or manifest bytes; reset then performs real capture, restoration/removal, private retention, reaches `TransactionRolledBack`, and enters cleanup.
+- Existing restoration-occupancy and committed-cleanup conflict tests remain unchanged and passing, preserving global zero-mutation behavior when preflight rejects reset.
+
+### Verification
+
+```text
+$ go test . ./session/workspace -run '^TestReset|^TestRunReset' -count=1
+ok  claude-squad
+ok  claude-squad/session/workspace
+
+$ go test ./session/workspace -count=1
+ok  claude-squad/session/workspace
+
+$ go test . -count=1
+ok  claude-squad
+
+$ go test ./session -count=1
+ok  claude-squad/session
+
+$ go test ./... -count=1
+all packages passed
+
+$ git diff --check
+passed
+```
+
+### Concerns
+
+None identified.

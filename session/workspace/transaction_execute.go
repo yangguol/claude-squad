@@ -995,6 +995,17 @@ func reconcileRollbackEntryBound(manifest *TransactionManifest, index int, roots
 		}
 		return writeManifestBound(*manifest, roots.tx)
 	}
+	type simulatedLocation struct {
+		path     string
+		identity unix.Stat_t
+	}
+	var simulatedRollbackResult *simulatedLocation
+	observeRollbackResult := func() (unix.Stat_t, error) {
+		if simulatedRollbackResult != nil && simulatedRollbackResult.path == entry.RollbackCaptureName {
+			return simulatedRollbackResult.identity, nil
+		}
+		return validateIdentityStatBound(roots.source, entry.RollbackCaptureName, *entry.Result)
+	}
 	retainRollbackResult := func() *RecoveryIssue {
 		if entry.StagePath == "" {
 			return block("published result has no private retention path", []string{entry.Path}, []string{entry.RollbackCaptureName})
@@ -1002,7 +1013,7 @@ func reconcileRollbackEntryBound(manifest *TransactionManifest, index int, roots
 		if absent, err := absentAt(roots.tx, entry.StagePath); err != nil || !absent {
 			return block("private retention path is occupied", []string{entry.Path}, []string{entry.RollbackCaptureName, entry.StagePath})
 		}
-		observed, err := validateIdentityStatBound(roots.source, entry.RollbackCaptureName, *entry.Result)
+		observed, err := observeRollbackResult()
 		if err != nil {
 			return block("retained published result changed before private capture", []string{entry.Path}, []string{entry.RollbackCaptureName})
 		}
@@ -1061,6 +1072,7 @@ func reconcileRollbackEntryBound(manifest *TransactionManifest, index int, roots
 		}
 		if preflight {
 			simulatedCapture = true
+			simulatedRollbackResult = &simulatedLocation{path: entry.RollbackCaptureName, identity: observed}
 			state.TargetExists = false
 			state.TargetMatchesResult = false
 			state.RollbackExists = true
