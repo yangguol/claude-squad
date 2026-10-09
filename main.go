@@ -88,16 +88,13 @@ var (
 			if err != nil {
 				return fmt.Errorf("failed to initialize storage: %w", err)
 			}
-			return workspace.WithResetPreflight(func() error {
-				return resetAll(
-					func() error { return nil },
-					storage.DeleteAllInstances,
-					func() error { return tmux.CleanupSessions(cmd2.MakeExecutor()) },
-					git.CleanupWorktrees,
-					workspace.CleanupShadowProjects,
-					daemon.StopDaemon,
-				)
-			})
+			return runReset(
+				storage.DeleteAllInstances,
+				func() error { return tmux.CleanupSessions(cmd2.MakeExecutor()) },
+				git.CleanupWorktrees,
+				daemon.StopDaemon,
+			)
+
 		},
 	}
 
@@ -131,6 +128,16 @@ var (
 		},
 	}
 )
+
+func runReset(deleteStorage, cleanupTmux, cleanupWorktrees, stopDaemon func() error) error {
+	return workspace.WithReset(func(cleanupShadowProjects func() error) error {
+		return runResetSequence(deleteStorage, cleanupTmux, cleanupWorktrees, cleanupShadowProjects, stopDaemon)
+	})
+}
+
+func runResetSequence(deleteStorage, cleanupTmux, cleanupWorktrees, cleanupShadowProjects, stopDaemon func() error) error {
+	return resetAll(func() error { return nil }, deleteStorage, cleanupTmux, cleanupWorktrees, cleanupShadowProjects, stopDaemon)
+}
 
 func resetAll(validateReferences, deleteStorage, cleanupTmux, cleanupWorktrees, cleanupShadowProjects, stopDaemon func() error) error {
 	steps := []struct {

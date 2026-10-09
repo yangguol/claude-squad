@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -732,35 +733,42 @@ func ValidateStoredShadowReferences() error {
 	return err
 }
 
-var resetProjectLockedHook func(string)
+var (
+	resetProjectLockedHook    func(string)
+	resetAfterEnumerationHook func()
+	resetAfterValidationHook  func()
+)
 
 // WithResetPreflight validates stored references, locks every shadow project in
 // canonical path order, recovers safe transactions, and keeps the locks held
 // while run performs destructive reset cleanup.
-func WithResetPreflight(run func() error) (returnErr error) {
+func WithResetPreflight(run func() error) error {
+	return withResetPreflight(func(_ func() error) error { return run() })
+}
+
+// WithReset runs reset with a shadow cleanup function bound to the exact set of
+// projects validated under lock. Callers must use that function instead of
+// independently enumerating projects during the destructive sequence.
+func WithReset(run func(cleanupShadowProjects func() error) error) error {
+	return withResetPreflight(run)
+}
+
+func withResetPreflight(run func(func() error) error) (returnErr error) {
 	root, err := shadowRoot()
 	if err != nil {
 		return err
 	}
-	if _, err := storedShadowProjectReferences(root); err != nil {
+	references, err := storedShadowProjectReferences(root)
+	if err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(root)
+	projects, err := enumerateShadowProjects(root)
 	if err != nil {
-		return fmt.Errorf("read shadow project root: %w", err)
+		return err
 	}
-	projects := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Name() == ".locks" {
-			continue
-		}
-		projectPath := filepath.Join(root, entry.Name())
-		if err := validateShadowProjectCandidate(root, projectPath, entry); err != nil {
-			return err
-		}
-		projects = append(projects, projectPath)
+	if resetAfterEnumerationHook != nil {
+		resetAfterEnumerationHook()
 	}
-	sort.Strings(projects)
 
 	locks := make([]*ProjectLock, 0, len(projects))
 	defer func() {
@@ -778,6 +786,12 @@ func WithResetPreflight(run func() error) (returnErr error) {
 			resetProjectLockedHook(projectPath)
 		}
 	}
+	if err := validateResetSnapshot(root, references, projects); err != nil {
+		return err
+	}
+
+	// Classify every locked project without mutation before recovering any one
+	// project. This makes the reset decision global rather than project-ordered.
 	for _, projectPath := range projects {
 		metadata, err := readProjectMetadata(projectPath)
 		if err != nil {
@@ -786,21 +800,97 @@ func WithResetPreflight(run func() error) (returnErr error) {
 		if err := validateCleanupMetadata(metadata, filepath.Base(projectPath)); err != nil {
 			return err
 		}
+		discovered, err := classifyTransactions(projectPath)
+		if err != nil {
+			return fmt.Errorf("classify shadow project %q: %w", filepath.Base(projectPath), err)
+		}
+		if access := accessStateFromReport(classificationReport(discovered)); access.ReadOnly {
+			return fmt.Errorf("shadow project %q requires explicit recovery: %s", filepath.Base(projectPath), access.Message)
+		}
+	}
+	for _, projectPath := range projects {
 		report, err := recoverProjectLocked(projectPath, nil)
 		if err != nil {
 			return fmt.Errorf("recover shadow project %q: %w", filepath.Base(projectPath), err)
 		}
-		access := accessStateFromReport(report)
-		if access.ReadOnly {
+		if access := accessStateFromReport(report); access.ReadOnly {
 			return fmt.Errorf("shadow project %q requires explicit recovery: %s", filepath.Base(projectPath), access.Message)
 		}
 	}
-	return run()
+	if err := validateResetSnapshot(root, references, projects); err != nil {
+		return err
+	}
+	if resetAfterValidationHook != nil {
+		resetAfterValidationHook()
+	}
+	cleanup := func() error { return cleanupShadowProjects(root, projects) }
+	return run(cleanup)
+}
+
+func enumerateShadowProjects(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read shadow project root: %w", err)
+	}
+	projects := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name() == ".locks" {
+			continue
+		}
+		projectPath := filepath.Join(root, entry.Name())
+		if err := validateShadowProjectCandidate(root, projectPath, entry); err != nil {
+			return nil, err
+		}
+		projects = append(projects, projectPath)
+	}
+	sort.Strings(projects)
+	return projects, nil
+}
+
+func validateResetSnapshot(root string, references map[string]bool, projects []string) error {
+	currentReferences, err := storedShadowProjectReferences(root)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(references, currentReferences) {
+		return errors.New("persisted shadow references changed while locking")
+	}
+	currentProjects, err := enumerateShadowProjects(root)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(projects, currentProjects) {
+		return errors.New("shadow project set changed while locking")
+	}
+	return nil
 }
 
 // CleanupShadowProjects removes validated shadow projects that are not referenced
 // by persisted sessions. Invalid projects and incomplete apply transactions are
 // preserved and reported so reset cannot silently discard recoverable state.
+func cleanupShadowProjects(root string, projects []string) error {
+	current, err := enumerateShadowProjects(root)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(projects, current) {
+		return errors.New("shadow project set changed after validation")
+	}
+	for _, projectPath := range projects {
+		active, err := shadowProjectHasActiveSessions(projectPath)
+		if err != nil {
+			return fmt.Errorf("inspect shadow project %q active sessions: %w", filepath.Base(projectPath), err)
+		}
+		if active {
+			continue
+		}
+		if err := removeShadowProject(root, projectPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func CleanupShadowProjects() error {
 	root, err := shadowRoot()
 	if err != nil {

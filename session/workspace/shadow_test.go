@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"claude-squad/config"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,40 +15,46 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestResetHoldsProjectLockAcrossStorageAndShadowCleanup(t *testing.T) {
-	ws := lifecycleWorkspace(t)
-	projectPath := filepath.Dir(ws.data.RepoPath)
-	var callbacks int
-
-	err := WithResetPreflight(func() error {
-		for range 2 {
-			_, lockErr := AcquireProjectLock(projectPath, "reset probe")
-			var busy *OperationInProgressError
-			require.ErrorAs(t, lockErr, &busy)
-			callbacks++
-		}
-		return nil
-	})
+func TestResetLockContentionPreservesStorageProjectsAndTransactions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var projects []string
+	var manifests []string
+	for len(projects) < 2 {
+		source := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("old"), 0o644))
+		value, _, err := NewShadow(source, "contention")
+		require.NoError(t, err)
+		ws := value.(*shadowWorkspace)
+		project := filepath.Dir(ws.data.RepoPath)
+		transaction := filepath.Join(project, "transactions", "prepared")
+		require.NoError(t, os.MkdirAll(transaction, 0o700))
+		manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: "prepared", ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: TransactionPrepared, Entries: []TransactionEntry{}}
+		require.NoError(t, WriteManifestDurable(manifest, transaction))
+		projects = append(projects, project)
+		manifests = append(manifests, filepath.Join(transaction, "manifest.json"))
+	}
+	sort.Strings(projects)
+	statePath := filepath.Join(filepath.Dir(projects[0]), "..", config.StateFileName)
+	persisted := []byte(`{"instances":[]}`)
+	require.NoError(t, os.WriteFile(statePath, persisted, 0o600))
+	lock, err := AcquireProjectLock(projects[1], "concurrent operation")
 	require.NoError(t, err)
-	require.Equal(t, 2, callbacks)
-	lock, err := AcquireProjectLock(projectPath, "after reset")
-	require.NoError(t, err)
-	require.NoError(t, lock.Close())
-}
 
-func TestResetLockContentionPreservesStorageAndProjects(t *testing.T) {
-	ws := lifecycleWorkspace(t)
-	projectPath := filepath.Dir(ws.data.RepoPath)
-	lock, err := AcquireProjectLock(projectPath, "concurrent operation")
-	require.NoError(t, err)
-	defer lock.Close()
-	mutated := false
-
-	err = WithResetPreflight(func() error { mutated = true; return nil })
+	entered := false
+	err = WithResetPreflight(func() error { entered = true; return nil })
 	var busy *OperationInProgressError
 	require.ErrorAs(t, err, &busy)
-	require.False(t, mutated)
-	require.DirExists(t, projectPath)
+	require.False(t, entered)
+	contents, readErr := os.ReadFile(statePath)
+	require.NoError(t, readErr)
+	require.Equal(t, persisted, contents)
+	for _, path := range manifests {
+		require.Equal(t, TransactionPrepared, readPersistedTransactionManifest(t, filepath.Dir(path)).State)
+	}
+	require.NoError(t, lock.Close())
+	earlier, err := AcquireProjectLock(projects[0], "after failed reset")
+	require.NoError(t, err)
+	require.NoError(t, earlier.Close())
 }
 
 func TestResetPreservesRecoveryBlockedTransaction(t *testing.T) {
@@ -102,6 +109,88 @@ func TestResetRecoversOrdinaryPreCommitTransactionBeforeCleanup(t *testing.T) {
 		require.Equal(t, TransactionRolledBack, readPersistedTransactionManifest(t, transactionDir).State)
 		return nil
 	}))
+}
+
+func TestResetRejectsProjectInsertedAfterEnumerationWithoutDeletingIt(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	root := filepath.Dir(filepath.Dir(ws.data.RepoPath))
+	inserted := filepath.Join(root, strings.Repeat("f", 64))
+	resetAfterEnumerationHook = func() {
+		require.NoError(t, os.MkdirAll(inserted, 0o700))
+	}
+	t.Cleanup(func() { resetAfterEnumerationHook = nil })
+	entered := false
+
+	err := WithResetPreflight(func() error { entered = true; return nil })
+	require.ErrorContains(t, err, "changed while locking")
+	require.False(t, entered)
+	require.DirExists(t, inserted)
+}
+
+func TestResetRejectsReferenceInsertedAfterEnumeration(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	statePath := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(ws.data.RepoPath))), config.StateFileName)
+	persisted := []byte(`{"instances":[]}`)
+	require.NoError(t, os.WriteFile(statePath, persisted, 0o600))
+	resetAfterEnumerationHook = func() {
+		workspaceJSON, err := json.Marshal(ws.Serialize())
+		require.NoError(t, err)
+		contents := []byte(`{"instances":[{"title":"new","workspace":` + string(workspaceJSON) + `}]}`)
+		require.NoError(t, os.WriteFile(statePath, contents, 0o600))
+	}
+	t.Cleanup(func() { resetAfterEnumerationHook = nil })
+	entered := false
+
+	err := WithResetPreflight(func() error { entered = true; return nil })
+	require.ErrorContains(t, err, "persisted shadow references changed while locking")
+	require.False(t, entered)
+	contents, readErr := os.ReadFile(statePath)
+	require.NoError(t, readErr)
+	require.NotEqual(t, persisted, contents)
+}
+
+func TestResetMixedRecoverableAndBlockedProjectsMakesNoRecoveryMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	makeTransaction := func(state TransactionState, id string) (string, string) {
+		source := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("old"), 0o644))
+		value, _, err := NewShadow(source, id)
+		require.NoError(t, err)
+		ws := value.(*shadowWorkspace)
+		directory := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", id)
+		require.NoError(t, os.MkdirAll(directory, 0o700))
+		manifest := TransactionManifest{Version: CurrentTransactionVersion, TransactionID: id, ProjectID: ws.data.ProjectID, SessionID: ws.data.SessionID, SourcePath: ws.data.SourcePath, State: state, Entries: []TransactionEntry{}}
+		if state == TransactionRecoveryBlocked {
+			manifest.RecoveryIssues = []RecoveryIssue{{TransactionID: id, State: state, Message: "manual recovery required"}}
+		}
+		require.NoError(t, WriteManifestDurable(manifest, directory))
+		return directory, filepath.Dir(ws.data.RepoPath)
+	}
+	recoverable, _ := makeTransaction(TransactionPrepared, "recoverable")
+	blocked, _ := makeTransaction(TransactionRecoveryBlocked, "blocked")
+	before, err := os.ReadFile(filepath.Join(recoverable, "manifest.json"))
+	require.NoError(t, err)
+
+	err = WithResetPreflight(func() error { return os.ErrInvalid })
+	require.ErrorContains(t, err, "manual recovery required")
+	after, readErr := os.ReadFile(filepath.Join(recoverable, "manifest.json"))
+	require.NoError(t, readErr)
+	require.Equal(t, before, after)
+	require.Equal(t, TransactionRecoveryBlocked, readPersistedTransactionManifest(t, blocked).State)
+}
+
+func TestResetDoesNotCleanupProjectAppearingAfterFinalValidation(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	root := filepath.Dir(filepath.Dir(ws.data.RepoPath))
+	inserted := filepath.Join(root, strings.Repeat("e", 64))
+	resetAfterValidationHook = func() {
+		require.NoError(t, os.MkdirAll(inserted, 0o700))
+	}
+	t.Cleanup(func() { resetAfterValidationHook = nil })
+
+	err := WithReset(func(cleanup func() error) error { return cleanup() })
+	require.ErrorContains(t, err, "changed after validation")
+	require.DirExists(t, inserted)
 }
 
 func TestResetAcquiresMultipleProjectLocksInSortedOrder(t *testing.T) {

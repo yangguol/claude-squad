@@ -12,6 +12,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRunResetHoldsLocksAcrossEveryDestructiveStep(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o644))
+	ws, _, err := workspace.NewShadow(source, "reset-wiring")
+	require.NoError(t, err)
+	projectPath := filepath.Dir(ws.Serialize().Shadow.RepoPath)
+	var calls []string
+	step := func(name string) func() error {
+		return func() error {
+			_, lockErr := workspace.AcquireProjectLock(projectPath, name+" probe")
+			var busy *workspace.OperationInProgressError
+			require.ErrorAs(t, lockErr, &busy)
+			calls = append(calls, name)
+			return nil
+		}
+	}
+
+	require.NoError(t, workspace.WithReset(func(cleanupShadow func() error) error {
+		shadow := func() error {
+			_, lockErr := workspace.AcquireProjectLock(projectPath, "shadow probe")
+			var busy *workspace.OperationInProgressError
+			require.ErrorAs(t, lockErr, &busy)
+			calls = append(calls, "shadow")
+			return cleanupShadow()
+		}
+		return runResetSequence(step("storage"), step("tmux"), step("worktrees"), shadow, step("daemon"))
+	}))
+	require.Equal(t, []string{"storage", "tmux", "worktrees", "shadow", "daemon"}, calls)
+}
+
 func TestResetPreflightsShadowReferencesBeforeClearingStorage(t *testing.T) {
 	var calls []string
 	step := func(name string) func() error {

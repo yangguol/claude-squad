@@ -108,6 +108,40 @@ func RecoverProjectLocked(projectPath string, sessions map[string]*ShadowData, p
 	return publish(report, lease)
 }
 
+func classificationReport(discovered []DiscoveredTransaction) RecoveryReport {
+	report := RecoveryReport{Disposition: RecoveryUnchanged}
+	for _, transaction := range discovered {
+		message := ""
+		switch {
+		case transaction.Invalid != nil:
+			message = transaction.Invalid.Error()
+		case transaction.Legacy:
+			message = "legacy transaction requires explicit recovery"
+		case transaction.Orphan:
+			message = "orphan transaction requires explicit recovery"
+		case transaction.Manifest != nil && (transaction.Manifest.State == TransactionRecoveryBlocked || transaction.Manifest.State == TransactionCleanupBlocked):
+			message = "transaction requires explicit recovery"
+			if len(transaction.Manifest.RecoveryIssues) != 0 && transaction.Manifest.RecoveryIssues[0].Message != "" {
+				message = transaction.Manifest.RecoveryIssues[0].Message
+			}
+		}
+		if message == "" {
+			continue
+		}
+		report.Disposition = RecoveryBlocked
+		issue := RecoveryIssue{Message: message, RetainedPaths: []string{transaction.Directory}}
+		if transaction.Manifest != nil {
+			issue.TransactionID = transaction.Manifest.TransactionID
+			issue.State = transaction.Manifest.State
+		}
+		report.Issues = append(report.Issues, issue)
+		if transaction.Orphan {
+			report.Orphans = append(report.Orphans, transaction.Directory)
+		}
+	}
+	return report
+}
+
 func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (RecoveryReport, error) {
 	discovered, err := DiscoverTransactions(projectPath)
 	if err != nil {
@@ -233,6 +267,17 @@ type ObservedEntryState struct {
 // DiscoverTransactions classifies direct children of a validated transaction
 // root. Invalid and legacy manifests are retained unchanged.
 func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
+	return discoverTransactions(projectPath, true)
+}
+
+// classifyTransactions performs transaction discovery without quarantining or
+// deleting orphan material. Reset uses it to make a global admissibility
+// decision before any recovery mutation begins.
+func classifyTransactions(projectPath string) ([]DiscoveredTransaction, error) {
+	return discoverTransactions(projectPath, false)
+}
+
+func discoverTransactions(projectPath string, cleanupOrphans bool) ([]DiscoveredTransaction, error) {
 	if filepath.Clean(projectPath) != projectPath {
 		return nil, errors.New("project path is not canonical")
 	}
@@ -304,11 +349,13 @@ func DiscoverTransactions(projectPath string) ([]DiscoveredTransaction, error) {
 		manifestInfo, manifestErr := os.Lstat(manifestPath)
 		if errors.Is(manifestErr, os.ErrNotExist) {
 			discovered.Orphan = true
-			quarantineName, nameErr := randomProbeName(".orphan-")
-			if nameErr != nil {
-				discovered.Invalid = nameErr
-			} else if removeErr := removeOrphanAt(rootDirectory, entry.Name(), quarantineName); removeErr != nil {
-				discovered.Invalid = removeErr
+			if cleanupOrphans {
+				quarantineName, nameErr := randomProbeName(".orphan-")
+				if nameErr != nil {
+					discovered.Invalid = nameErr
+				} else if removeErr := removeOrphanAt(rootDirectory, entry.Name(), quarantineName); removeErr != nil {
+					discovered.Invalid = removeErr
+				}
 			}
 			result = append(result, discovered)
 			continue
