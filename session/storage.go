@@ -240,27 +240,35 @@ func (s *Storage) LoadInstances() ([]*Instance, error) {
 
 // DeleteInstance removes an instance from storage
 func (s *Storage) DeleteInstance(title string) error {
-	instances, err := s.LoadInstances()
-	if err != nil {
-		return fmt.Errorf("failed to load instances: %w", err)
+	var instances []json.RawMessage
+	if err := json.Unmarshal(s.state.GetInstances(), &instances); err != nil {
+		return fmt.Errorf("failed to unmarshal instances: %w", err)
 	}
 
 	found := false
-	newInstances := make([]*Instance, 0)
+	remaining := make([]json.RawMessage, 0, len(instances))
 	for _, instance := range instances {
-		data := instance.ToInstanceData()
-		if data.Title != title {
-			newInstances = append(newInstances, instance)
-		} else {
-			found = true
+		var identity struct {
+			Title string `json:"title"`
 		}
+		if err := json.Unmarshal(instance, &identity); err != nil {
+			return fmt.Errorf("failed to unmarshal instance: %w", err)
+		}
+		if identity.Title == title {
+			found = true
+			continue
+		}
+		remaining = append(remaining, instance)
 	}
-
 	if !found {
 		return fmt.Errorf("instance not found: %s", title)
 	}
 
-	return s.SaveInstances(newInstances)
+	updated, err := json.Marshal(remaining)
+	if err != nil {
+		return fmt.Errorf("failed to marshal instances: %w", err)
+	}
+	return s.state.SaveInstances(updated)
 }
 
 // UpdateInstance updates an existing instance in storage

@@ -51,6 +51,41 @@ func TestInstanceDataDirectoryWorkspaceRoundTrip(t *testing.T) {
 	require.Equal(t, filepath.Base(source), instance.DisplayWorkspace())
 }
 
+func TestDeleteInstanceDoesNotRestoreRemovedWorkspace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	source := filepath.Join(t.TempDir(), "source")
+	require.NoError(t, os.MkdirAll(source, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "file.txt"), []byte("content\n"), 0o644))
+
+	ws, branch, err := workspace.NewShadow(source, "removed-session")
+	require.NoError(t, err)
+	require.NoError(t, ws.Setup())
+	stored := ws.Serialize()
+	require.NoError(t, ws.Cleanup())
+
+	removed, err := json.Marshal(InstanceData{
+		Title: "removed-session", Path: source, Branch: branch, Status: Paused, Workspace: &stored,
+	})
+	require.NoError(t, err)
+	kept := json.RawMessage(`{
+		"title":"kept-session","path":"/kept/path","branch":"kept-branch","status":3,
+		"workspace":null,"future_field":{"must":"survive"}
+	}`)
+	records, err := json.Marshal([]json.RawMessage{removed, kept})
+	require.NoError(t, err)
+	state := &memoryInstanceStorage{instances: records}
+	storage, err := NewStorage(state)
+	require.NoError(t, err)
+
+	require.NoError(t, storage.DeleteInstance("removed-session"))
+	require.Equal(t, 1, state.saves)
+
+	var remaining []json.RawMessage
+	require.NoError(t, json.Unmarshal(state.instances, &remaining))
+	require.Len(t, remaining, 1)
+	require.JSONEq(t, string(kept), string(remaining[0]))
+}
+
 func TestFromInstanceDataReadOnlyShadowDoesNotRecreateWorktreeOrTmux(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	source := filepath.Join(t.TempDir(), "source")
