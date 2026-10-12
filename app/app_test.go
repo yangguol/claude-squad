@@ -598,6 +598,26 @@ func TestDirectoryHelpIncludesIsolationCaveat(t *testing.T) {
 	require.True(t, strings.Contains(content, "Shared dependency directories") && strings.Contains(content, "not isolated"))
 }
 
+func TestGeneralHelpShowsResumeOnlyForEligiblePausedSession(t *testing.T) {
+	makeInstance := func(status session.Status, capabilities workspace.Capabilities) *session.Instance {
+		instance, err := session.NewInstance(session.InstanceOptions{
+			Title: "resume-help", Path: t.TempDir(), Program: "echo",
+			Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: capabilities, displayName: "source"},
+		})
+		require.NoError(t, err)
+		instance.SetStatus(status)
+		return instance
+	}
+
+	running := helpTypeGeneral{instance: makeInstance(session.Running, workspace.Capabilities{Resume: true})}.toContent()
+	blocked := helpTypeGeneral{instance: makeInstance(session.Paused, workspace.Capabilities{})}.toContent()
+	resumable := helpTypeGeneral{instance: makeInstance(session.Paused, workspace.Capabilities{Resume: true})}.toContent()
+
+	require.NotContains(t, running, "Resume a paused session")
+	require.NotContains(t, blocked, "Resume a paused session")
+	require.Contains(t, resumable, "Resume a paused session")
+}
+
 func TestGeneralHelpDerivesPushAndApplyIndependently(t *testing.T) {
 	makeInstance := func(capabilities workspace.Capabilities) *session.Instance {
 		instance, err := session.NewInstance(session.InstanceOptions{

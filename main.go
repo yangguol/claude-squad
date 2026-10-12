@@ -27,7 +27,7 @@ var (
 	binName     string
 	rootCmd     = &cobra.Command{
 		Use:   "claude-squad",
-		Short: "Claude Squad - Manage multiple AI agents like Claude Code, Aider, Codex, and Amp.",
+		Short: "Manage isolated AI-agent sessions in Git repositories or ordinary directories.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			log.Initialize(daemonFlag)
@@ -78,7 +78,7 @@ var (
 
 	resetCmd = &cobra.Command{
 		Use:   "reset",
-		Short: "Reset all stored instances",
+		Short: "Safely reset stored sessions after global validation and recovery",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			log.Initialize(false)
 			defer log.Close()
@@ -124,7 +124,7 @@ var (
 		Short: "Print the version number",
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Printf("%s version %s\n", binName, version)
-			fmt.Printf("https://github.com/smtg-ai/claude-squad/releases/tag/v%s\n", version)
+			fmt.Printf("https://github.com/yangguol/claude-squad\n")
 		},
 	}
 )

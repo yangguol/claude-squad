@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"claude-squad/session"
+	"claude-squad/session/workspace"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -141,7 +142,7 @@ func (m *Menu) addInstanceOptions() {
 		actionGroup = append(actionGroup, keys.KeyResume)
 	} else if m.instance.Status != session.Paused && capabilities.Apply {
 		actionGroup = append(actionGroup, keys.KeyApply)
-	} else {
+	} else if m.instance.WorkspaceMode() == workspace.ModeGit {
 		actionGroup = append(actionGroup, keys.KeyCheckout)
 	}
 

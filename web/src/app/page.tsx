@@ -16,14 +16,14 @@ export default function Home() {
         <div className={styles.headerActions}>
           <a
             className={styles.headerButton}
-            href="https://github.com/smtg-ai/claude-squad"
+            href="https://github.com/yangguol/claude-squad"
             target="_blank"
             rel="noopener noreferrer"
           >
             GitHub
           </a>
           <a
-            href="https://github.com/smtg-ai/claude-squad#readme"
+            href="https://github.com/yangguol/claude-squad#readme"
             target="_blank"
             rel="noopener noreferrer"
             className={styles.headerButton}
@@ -54,23 +54,15 @@ export default function Home() {
 
         <div className={styles.installation}>
           <h2>Installation</h2>
-          <h3>Via Homebrew</h3>
+          <h3>Build this fork from source</h3>
           <div className={styles.codeBlockWrapper}>
             <pre className={styles.codeBlock}>
-              <code>brew install claude-squad</code>
+              <code>git clone https://github.com/yangguol/claude-squad.git &amp;&amp; cd claude-squad &amp;&amp; go build -o cs . &amp;&amp; mkdir -p ~/.local/bin &amp;&amp; install -m 0755 cs ~/.local/bin/cs</code>
             </pre>
-            <CopyButton textToCopy="brew install claude-squad" />
-          </div>
-          <br></br>
-          <h3>Via Shell Script</h3>
-          <div className={styles.codeBlockWrapper}>
-            <pre className={styles.codeBlock}>
-              <code>curl -fsSL https://raw.githubusercontent.com/smtg-ai/claude-squad/main/install.sh | bash</code>
-            </pre>
-            <CopyButton textToCopy="curl -fsSL https://raw.githubusercontent.com/smtg-ai/claude-squad/main/install.sh | bash" />
+            <CopyButton textToCopy="git clone https://github.com/yangguol/claude-squad.git && cd claude-squad && go build -o cs . && mkdir -p ~/.local/bin && install -m 0755 cs ~/.local/bin/cs" />
           </div>
           <p className={styles.prerequisites}>
-            Prerequisites: tmux, gh (GitHub CLI)
+            Prerequisites: Git, tmux, Go 1.23+ (toolchain 1.25.8); gh is optional for GitHub handoff
           </p>
         </div>
         
@@ -78,14 +70,16 @@ export default function Home() {
           <h2>Why use Claude Squad?</h2>
           <ul>
             <li>Supervise multiple agents in one UI</li>
-            <li>Isolate tasks in git workspaces</li>
-            <li>Review work before shipping</li>
+            <li>Isolate tasks in Git repositories or ordinary directories</li>
+            <li>Apply directory-session changes with three-way merge and crash recovery</li>
+            <li>Review work before it reaches your source directory</li>
+            <li>Ordinary-directory mode supports Darwin and Linux</li>
           </ul>
         </div>
       </main>
       <footer className={styles.footer}>
         <p className={styles.copyright}>
-          &copy; {new Date().getFullYear()} Claude Squad. Licensed under <a href="https://github.com/smtg-ai/claude-squad/blob/main/LICENSE.md" target="_blank" rel="noopener noreferrer">GNU AGPL v3.0</a>
+          &copy; {new Date().getFullYear()} Claude Squad. Licensed under <a href="https://github.com/yangguol/claude-squad/blob/main/LICENSE.md" target="_blank" rel="noopener noreferrer">GNU AGPL v3.0</a>
         </p>
       </footer>
     </div>

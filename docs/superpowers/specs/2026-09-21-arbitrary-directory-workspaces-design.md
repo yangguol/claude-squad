@@ -1,8 +1,10 @@
-# Arbitrary-Directory Isolated Workspaces Design
+# Arbitrary-Directory Isolated Workspaces — Implemented Architecture
+
+> **Status:** Implemented in this fork. Historical constraints below describe the upstream code before this change; architecture sections describe the resulting system.
 
 ## Summary
 
-Claude Squad currently refuses to start outside a Git repository and couples every session directly to `GitWorktree`. This change allows `cs` to start in any readable directory while preserving isolated agent workspaces, diffs, pause/resume, cleanup, and an explicit way to apply accepted changes.
+Before this change, Claude Squad refused to start outside a Git repository and coupled every session directly to `GitWorktree`. This implementation allows `cs` to start in any readable directory while preserving isolated agent workspaces, diffs, pause/resume, cleanup, and an explicit way to apply accepted changes.
 
 Git repositories retain their existing behavior. Non-Git directories use an internal shadow Git repository managed under Claude Squad's configuration directory. The source directory is not initialized as a Git repository and is not changed until the user explicitly applies a session.
 
@@ -28,9 +30,9 @@ The startup fallback logo also gains a small, low-contrast `ygl` mark at its low
 - Replacing Git as the diff and merge engine.
 - Automatically resolving genuine content conflicts.
 
-## Existing Constraints
+## Original Upstream Constraints
 
-The current implementation assumes Git at several layers:
+The pre-change implementation assumed Git at several layers:
 
 - `main.go` rejects a working directory when `git.IsGitRepo` is false.
 - `session.Instance` stores a concrete `*git.GitWorktree`.
@@ -45,7 +47,7 @@ The implementation must therefore introduce a workspace boundary rather than onl
 
 ### Workspace abstraction
 
-Introduce a `session/workspace` package with a mode-aware interface used by `session.Instance`. The final method names should follow existing conventions, but the interface must cover:
+The implemented `session/workspace` package provides a mode-aware interface used by `session.Instance`:
 
 ```go
 type Mode string
@@ -57,21 +59,24 @@ const (
 
 type Workspace interface {
     Mode() Mode
-    Setup() error
+    Capabilities() Capabilities
+    AccessState() AccessState
     WorkDir() string
     DisplayName() string
-    Diff() *git.DiffStats
-    DiffNumstat() *git.DiffStats
+    BranchName() string
+    Setup() error
     IsValid() (bool, error)
     IsDirty() (bool, error)
-    CommitChanges(message string) error
+    IsBranchCheckedOut() (bool, error)
+    Diff() *git.DiffStats
+    DiffNumstat() *git.DiffStats
+    CommitChanges(string) error
+    PushChanges(string, bool) error
+    Apply() (*ApplyResult, error)
+    AcknowledgeApply(string) error
     Remove() error
     Prune() error
     Cleanup() error
-    CanPush() bool
-    PushChanges(message string, open bool) error
-    CanApply() bool
-    Apply() (*ApplyResult, error)
     Serialize() Data
 }
 ```
@@ -171,9 +176,9 @@ Ordinary patterns exclude matching paths. `[shared]` entries are excluded and sy
 
 Because every directory-mode agent operates in a Git worktree, existing full-diff and numstat behavior remains available. The baseline commit is session-specific.
 
-Pause commits dirty work locally, detaches tmux, and removes the worktree while retaining the session branch. Resume recreates the worktree from that branch and restores or starts tmux. Kill removes tmux, the session worktree, and session branch. The shared shadow project is removed only when no stored or active session references it.
+Pause commits dirty work locally, detaches tmux, and removes the worktree while retaining the session branch. Resume recreates the worktree from that branch and restores or starts tmux. Kill removes tmux, the session worktree, and session branch. Project-level reset or cleanup may remove a shared shadow project only after proving that no stored or active session references it and no retained transaction blocks deletion.
 
-Restoration validates source metadata and all internal paths. If the source directory was moved or deleted, the session remains viewable/recoverable where possible but apply is disabled with a precise error.
+Restoration strictly validates source metadata and every internal path. If the source directory was moved or deleted and its stored identity cannot be validated, restoration fails with a precise error rather than publishing a session against an unverified source.
 
 ## Applying Changes to the Source Directory
 
@@ -247,7 +252,7 @@ Source-side temporary names are untrusted namespace entries even when randomly g
 
 Apply requires the source and shadow transaction root to be on the same filesystem so quarantine renames remain atomic. This is checked before source mutation. If they differ, Apply returns a precise unsupported-filesystem error while session creation, editing, and diff remain available.
 
-A successful apply pauses the session and records the applied source snapshot and time. It does not delete the session. Applying the same unchanged session again is a no-op. If the agent changes the session after resume, a subsequent apply performs a new three-way merge against the original session baseline and current source.
+After a successful source commit, the application records the applied source snapshot and time, persists the session, and attempts to pause it. A post-commit persistence or pause failure is reported but cannot roll back committed source changes. Applying the same unchanged session again is a no-op. If the agent changes the session after resume, a subsequent apply performs a new three-way merge against the original session baseline and current source.
 
 The source root itself and files outside it are never deleted or overwritten. Symlink traversal is rejected during apply. The concurrency guarantee covers source namespace replacement. Claude Squad cannot prevent another process from modifying an inode through a writable descriptor that was opened before its pathname was atomically captured. Apply validates published results immediately before the durable `committed` transition; a descriptor write detected by that boundary prevents commit and triggers rollback. Writes after the durable commit point are new external source modifications and are not prevented or rolled back.
 
@@ -319,7 +324,7 @@ Recovery is automatic and idempotent:
 - Original entries are restored only with atomic no-replace rename.
 - If an external writer has created content at a target needed for restoration, that content remains in place. The transaction becomes `recovery-blocked`, retains all recovery material, reports the conflict and retained paths, and requires manual resolution.
 - `committed` and `cleaning` transactions never roll back published results. They resume safe cleanup by atomically moving validated source-side temporary entries into transaction-private quarantine before deletion.
-- A cleanup identity mismatch or concurrent replacement becomes `cleanup-blocked`. The successful Apply remains committed, and all uncertain content is retained. Apply returns a successful result with a typed cleanup warning, and the application still saves the applied metadata and pauses the session while presenting the warning and retained paths.
+- A cleanup identity mismatch or concurrent replacement becomes `cleanup-blocked`. The successful Apply remains committed, all uncertain content is retained, and the workspace immediately becomes read-only. Apply returns a successful result with a typed cleanup warning; the application saves the applied metadata and attempts to pause the session while presenting the warning and retained paths. Any post-commit persistence or pause failure is reported without undoing the source commit.
 - Only durably `rolled-back` or `complete` transactions may remove their transaction metadata.
 
 Every recovery operation is re-entrant: another crash at any manifest transition or atomic rename must lead to the same safe rollback, cleanup, or blocked state on the next startup. A `recovery-blocked` project may restore persisted sessions only in read-only/viewable form; new sessions, Resume, and Apply are disabled until resolution. Reset must report and preserve `recovery-blocked` and `cleanup-blocked` transactions rather than silently deleting them.
@@ -388,4 +393,4 @@ From a temporary directory with no `.git`:
 
 ## Delivery Scope
 
-The initial implementation targets existing supported desktop platforms where Git and tmux are available. It adds no remote publishing for directory mode and no interactive conflict editor. Conflict resolution remains external: users adjust the source or agent worktree and retry Apply.
+Git mode remains available on platforms supported by the existing Git/tmux workflow. Directory mode currently requires Darwin or Linux because project locking and atomic Apply primitives fail closed elsewhere. It adds no remote publishing for directory mode and no interactive conflict editor. Conflict resolution remains external: users adjust the source or agent worktree and retry Apply.

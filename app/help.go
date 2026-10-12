@@ -46,7 +46,7 @@ func (h helpTypeGeneral) toContent() string {
 		keyStyle.Render("n") + descStyle.Render("         - Create a new session"),
 		keyStyle.Render("N") + descStyle.Render("         - Create a new session with a prompt"),
 		keyStyle.Render("D") + descStyle.Render("         - Kill (delete) the selected session"),
-		keyStyle.Render("↑/j, ↓/k") + descStyle.Render("  - Navigate between sessions"),
+		keyStyle.Render("↑/k, ↓/j") + descStyle.Render("  - Navigate between sessions"),
 		keyStyle.Render("J/K") + descStyle.Render("       - Reorder sessions"),
 		keyStyle.Render("↵/o") + descStyle.Render("       - Attach to the selected session"),
 		keyStyle.Render("ctrl-q") + descStyle.Render("    - Detach from session"),
@@ -59,11 +59,13 @@ func (h helpTypeGeneral) toContent() string {
 			lines = append(lines, keyStyle.Render("p")+descStyle.Render("         - Commit and push branch to github"))
 		}
 		if capabilities.Apply {
-			lines = append(lines, keyStyle.Render("c")+descStyle.Render("         - Apply changes to the source directory and pause"))
+			lines = append(lines, keyStyle.Render("c")+descStyle.Render("         - Apply changes to the source directory, then attempt to pause"))
 		} else if h.instance.WorkspaceMode() == workspace.ModeGit {
 			lines = append(lines, keyStyle.Render("c")+descStyle.Render("         - Checkout: commit changes and pause session"))
 		}
-		lines = append(lines, keyStyle.Render("r")+descStyle.Render("         - Resume a paused session"))
+		if h.instance.Status == session.Paused && capabilities.Resume {
+			lines = append(lines, keyStyle.Render("r")+descStyle.Render("         - Resume a paused session"))
+		}
 		if capabilities.Apply {
 			lines = append(lines, "", descStyle.Render("Shared dependency directories are linked to the source and are not isolated between sessions."))
 		}
@@ -89,7 +91,7 @@ func (h helpTypeInstanceStart) toContent() string {
 	}
 	if capabilities.Apply {
 		handoff = append(handoff,
-			keyStyle.Render("c")+descStyle.Render("     - Apply changes to the source directory and pause"),
+			keyStyle.Render("c")+descStyle.Render("     - Apply changes to the source directory, then attempt to pause"),
 			"",
 			descStyle.Render("Shared dependency directories are linked to the source and are not isolated between sessions."))
 	} else if h.instance.WorkspaceMode() == workspace.ModeGit {

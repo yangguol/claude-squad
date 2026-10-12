@@ -220,6 +220,19 @@ func (w *shadowWorkspace) Apply() (result *ApplyResult, returnErr error) {
 	w.data.LastAppliedTree = prepared.AppliedTree
 	w.data.LastAppliedAt = prepared.AppliedAt
 	w.data.LastAppliedTransactionID = prepared.TransactionID
+	if warning != nil {
+		message := "committed apply cleanup requires explicit recovery"
+		if len(prepared.RecoveryIssues) != 0 && prepared.RecoveryIssues[0].Message != "" {
+			message = prepared.RecoveryIssues[0].Message
+		}
+		w.access = AccessState{
+			ReadOnly:      true,
+			Disposition:   RecoveryUnchanged,
+			Message:       message,
+			Paths:         append([]string(nil), warning.Paths...),
+			RetainedPaths: append([]string(nil), warning.RetainedPaths...),
+		}
+	}
 	return &ApplyResult{Changed: plan.ChangedPaths(), TransactionID: prepared.TransactionID, Warning: warning}, nil
 }
 

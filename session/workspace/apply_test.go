@@ -482,6 +482,9 @@ func TestApplyCleanupBlockedReturnsSuccessWithTypedWarning(t *testing.T) {
 	require.Len(t, persisted.RecoveryIssues, 1)
 	require.Equal(t, result.Warning.Paths, persisted.RecoveryIssues[0].Paths)
 	require.Equal(t, result.Warning.RetainedPaths, persisted.RecoveryIssues[0].RetainedPaths)
+	require.True(t, workspace.AccessState().ReadOnly)
+	require.False(t, workspace.Capabilities().Apply)
+	require.False(t, workspace.Capabilities().Resume)
 }
 
 func TestAcknowledgeApplyRemovesOnlyCompleteTransaction(t *testing.T) {

@@ -77,3 +77,12 @@ func TestMenuDirectoryActionsFollowCapabilities(t *testing.T) {
 	require.NotContains(t, rendered, "push branch")
 	require.Contains(t, rendered, "c apply")
 }
+
+func TestMenuBlockedDirectoryOmitsCheckout(t *testing.T) {
+	instance := testInstanceWithWorkspace(t, workspace.ModeDirectory, workspace.Capabilities{}, "project", "internal-shadow-branch")
+	menu := NewMenu()
+	menu.SetInstance(instance)
+
+	require.NotContains(t, menu.options, keys.KeyCheckout)
+	require.NotContains(t, menu.String(), "checkout")
+}
