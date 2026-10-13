@@ -73,7 +73,7 @@ func validateGitData(data GitData) error {
 func (w *gitWorkspace) Mode() Mode { return ModeGit }
 
 func (w *gitWorkspace) Capabilities() Capabilities {
-	return Capabilities{BranchPicker: true, Push: true, Apply: false}
+	return Capabilities{BranchPicker: true, Push: true, Apply: false, Resume: true}
 }
 
 func (w *gitWorkspace) AccessState() AccessState { return AccessState{} }

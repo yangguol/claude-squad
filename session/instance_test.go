@@ -332,7 +332,11 @@ func TestInstanceWorkspacePauseResumeKillAndDiffDelegate(t *testing.T) {
 	require.Equal(t, 1, ws.cleanupCalls)
 
 	instance.Status = Running
-	require.Error(t, instance.Kill()) // tmux close fails, workspace still cleaned
+	missingSessionErr := exec.Command("false").Run()
+	instance.tmuxSession = tmux.NewTmuxSessionWithDeps(instance.Title, "", &nullPtyFactory{t: t}, cmd_test.MockCmdExec{
+		RunFunc: func(*exec.Cmd) error { return missingSessionErr },
+	})
+	require.NoError(t, instance.Kill()) // missing tmux session is already cleaned up
 	require.Equal(t, 2, ws.cleanupCalls)
 }
 
