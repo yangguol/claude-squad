@@ -119,3 +119,46 @@ func TestRestoreAttachesWhenSessionExists(t *testing.T) {
 	require.Len(t, ptyFactory.cmds, 1)
 	require.Contains(t, ptyFactory.cmds[0].String(), "attach-session")
 }
+
+func TestCloseSucceedsWhenSessionIsAlreadyGone(t *testing.T) {
+	missingErr := exec.Command("false").Run()
+	var commands []string
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			commands = append(commands, cmd2.ToString(cmd))
+			return missingErr
+		},
+	}
+
+	session := NewTmuxSessionWithDeps("gone", "program", NewMockPtyFactory(t), cmdExec)
+	require.NoError(t, session.Close())
+	require.Equal(t, []string{
+		"tmux kill-session -t claudesquad_gone",
+		"tmux has-session -t=claudesquad_gone",
+	}, commands)
+}
+
+func TestCloseReportsFailureWhenSessionExistenceCannotBeChecked(t *testing.T) {
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(*exec.Cmd) error { return fmt.Errorf("tmux executable unavailable") },
+	}
+
+	session := NewTmuxSessionWithDeps("unknown", "program", NewMockPtyFactory(t), cmdExec)
+	require.ErrorContains(t, session.Close(), "error checking tmux session")
+}
+
+func TestCloseReportsFailureWhenSessionStillExists(t *testing.T) {
+	calls := 0
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(*exec.Cmd) error {
+			calls++
+			if calls == 1 {
+				return fmt.Errorf("kill denied")
+			}
+			return nil
+		},
+	}
+
+	session := NewTmuxSessionWithDeps("alive", "program", NewMockPtyFactory(t), cmdExec)
+	require.ErrorContains(t, session.Close(), "error killing tmux session")
+}
