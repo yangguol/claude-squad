@@ -737,6 +737,17 @@ func TestApplyCleanupWarningRendersRetainedPaths(t *testing.T) {
 	require.Contains(t, rendered, "/source/.capture")
 }
 
+func TestResumeKeyIsIgnoredAfterInstanceAlreadyResumed(t *testing.T) {
+	h, instance, backend := newDirectoryHomeWithWorkspace(t)
+	backend.capabilities.Resume = true
+	instance.SetStatus(session.Running)
+
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+
+	require.Nil(t, cmd)
+	require.Equal(t, session.Running, instance.Status)
+}
+
 func TestBlockedSessionMenuDisablesApplyAndResume(t *testing.T) {
 	h, instance, backend := newDirectoryHomeWithWorkspace(t)
 	backend.capabilities = workspace.Capabilities{}
