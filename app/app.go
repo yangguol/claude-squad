@@ -835,7 +835,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, nil
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Status == session.Loading || !selected.Capabilities().Resume {
+		if selected == nil || !selected.Paused() || !selected.Capabilities().Resume {
 			return m, nil
 		}
 		if err := selected.Resume(); err != nil {

@@ -116,6 +116,10 @@ func fromInstanceDataWithLease(data InstanceData, recoveredAccess *workspace.Acc
 	} else if data.workspacePresent {
 		return nil, fmt.Errorf("restore workspace: workspace field must not be null")
 	} else if data.Worktree != nil {
+		branchName := data.Worktree.BranchName
+		if branchName == "" {
+			branchName = data.Branch
+		}
 		workspaceData = workspace.Data{
 			Version: workspace.CurrentVersion,
 			Mode:    workspace.ModeGit,
@@ -123,7 +127,7 @@ func fromInstanceDataWithLease(data InstanceData, recoveredAccess *workspace.Acc
 				RepoPath:         data.Worktree.RepoPath,
 				WorktreePath:     data.Worktree.WorktreePath,
 				SessionName:      data.Worktree.SessionName,
-				BranchName:       data.Worktree.BranchName,
+				BranchName:       branchName,
 				BaseCommitSHA:    data.Worktree.BaseCommitSHA,
 				IsExistingBranch: data.Worktree.IsExistingBranch,
 			},
