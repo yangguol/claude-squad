@@ -401,6 +401,19 @@ func TestLoadInstancesRestoresBlockedSessionsReadOnly(t *testing.T) {
 	require.False(t, instances[0].Capabilities().Resume)
 }
 
+func TestLegacyWorktreeRecordUsesTopLevelBranchWhenWorktreeBranchIsMissing(t *testing.T) {
+	legacy := `{
+		"title":"legacy","path":"/repo","branch":"yangguoliang/test2","status":3,
+		"worktree":{"repo_path":"/repo","worktree_path":"/worktree","session_name":"legacy","base_commit_sha":"base"}
+	}`
+	var data InstanceData
+	require.NoError(t, json.Unmarshal([]byte(legacy), &data))
+
+	instance, err := FromInstanceData(data)
+	require.NoError(t, err)
+	require.Equal(t, "yangguoliang/test2", instance.workspace.BranchName())
+}
+
 func TestLegacyWorktreeRecordRestoresAsGitWorkspace(t *testing.T) {
 	legacy := `{
 		"title":"legacy","path":"/repo","branch":"feature","status":3,
