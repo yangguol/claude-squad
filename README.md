@@ -1,19 +1,34 @@
 # Claude Squad — Isolated AI Agents for Any Directory
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/yangguol/claude-squad/actions/workflows/build.yml/badge.svg)](https://github.com/yangguol/claude-squad/actions/workflows/build.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE.md)
 
-Claude Squad is a terminal UI for running multiple AI coding agents in parallel. This fork preserves the original Git-worktree workflow and adds isolated sessions for ordinary directories that do not contain a Git repository.
+Run multiple isolated AI coding agents from **any directory** — no Git repository required.
 
-Each agent gets its own workspace. In a Git repository, Claude Squad uses a native Git worktree and branch. In any other directory, it creates an internal shadow Git project under `~/.claude-squad/`, without adding `.git` to the source directory. Agent changes remain isolated until you explicitly apply them.
+- **Keep agents isolated** — every agent works in its own private workspace.
+- **Keep your source clean** — ordinary directories never receive a `.git` directory.
+- **Apply changes safely** — review first, then merge with conflict detection and crash recovery.
 
 Supported agents include [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Aider](https://github.com/Aider-AI/aider), and other terminal programs.
 
-> This project is forked from [smtg-ai/claude-squad](https://github.com/smtg-ai/claude-squad). The arbitrary-directory workspace, transactional Apply, recovery, and related UI behavior described below are additions in this fork.
-
 ![Claude Squad Screenshot](assets/screenshot.png)
 
-## What this fork adds
+## Why this version?
+
+| Capability | Upstream Claude Squad | This project |
+|---|---:|---:|
+| Run agents in Git repositories | Yes | Yes |
+| Run agents in ordinary directories | No | Yes |
+| Keep ordinary directories free of `.git` | — | Yes |
+| Review and explicitly apply directory changes | — | Yes |
+| Three-way merge and conflict detection | — | Yes |
+| Crash-safe Apply and recovery | — | Yes |
+
+In a Git repository, Claude Squad uses a native Git worktree and branch. In an ordinary directory, it creates an internal shadow Git project under `~/.claude-squad/`. Agent changes remain isolated until you explicitly apply them.
+
+This project is an independent continuation of [smtg-ai/claude-squad](https://github.com/smtg-ai/claude-squad). It retains the upstream multi-agent TUI, tmux integration, Git branch workflow, diff preview, profiles, and auto-accept mode while adding:
 
 - **Run from any directory** — Git repositories and ordinary directories are detected automatically.
 - **One isolated workspace per agent** — ordinary directories use private shadow branches and worktrees.
@@ -26,13 +41,11 @@ Supported agents include [Claude Code](https://github.com/anthropics/claude-code
 - **Pause and resume** — worktrees can be removed and recreated while session branches are preserved.
 - **Capability-aware UI** — Git-only actions are hidden from directory sessions and blocked sessions are read-only.
 
-The original multi-agent TUI, tmux integration, Git branch workflow, diff preview, profiles, and auto-accept mode remain available.
-
 ## Requirements
 
 - [Git](https://git-scm.com/) — required for both Git and directory workspaces.
 - [tmux](https://github.com/tmux/tmux/wiki/Installing) — hosts each agent terminal.
-- [Go 1.23+](https://go.dev/doc/install) with the Go 1.25.8 toolchain available — required to build this fork from source.
+- [Go 1.23+](https://go.dev/doc/install) with the Go 1.25.8 toolchain available — required to build this project from source.
 - The agent command you want to run, such as `claude`, `codex`, `gemini`, or `aider`.
 - [GitHub CLI (`gh`)](https://cli.github.com/) — optional; needed for Git-mode GitHub push/open workflows.
 
@@ -48,7 +61,7 @@ Directory mode requires project locking and atomic filesystem operations current
 
 ## Installation
 
-Until this fork publishes its own release artifacts, build it from source:
+Until this project publishes its own release artifacts, build it from source:
 
 ```bash
 git clone https://github.com/yangguol/claude-squad.git
@@ -60,7 +73,7 @@ install -m 0755 cs ~/.local/bin/cs
 
 Ensure `~/.local/bin` is on your `PATH`.
 
-The upstream Homebrew formula installs the upstream release and may not contain this fork's arbitrary-directory features.
+The upstream Homebrew formula installs the upstream release and may not contain this project's arbitrary-directory features.
 
 ## Quick start
 
