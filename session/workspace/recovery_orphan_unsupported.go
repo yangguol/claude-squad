@@ -37,8 +37,9 @@ func openManifestComponentAt(*os.File, string) (*os.File, *manifestFileIdentity,
 func acknowledgeCompleteTransaction(string, string, string) error {
 	return unsupportedAtomicApplyError()
 }
-func removeCompleteTransaction(string, string) error { return unsupportedAtomicApplyError() }
-func removeOrphanAt(*os.File, string, string) error  { return unsupportedAtomicApplyError() }
+func removeCompleteTransaction(string, string) error    { return unsupportedAtomicApplyError() }
+func acknowledgeRetainedOrphans(string, []string) error { return unsupportedAtomicApplyError() }
+func removeOrphanAt(*os.File, string, string) error     { return unsupportedAtomicApplyError() }
 func platformVerifyCanonicalDirectoryPath(*os.File, string) error {
 	return unsupportedAtomicApplyError()
 }

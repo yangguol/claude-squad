@@ -22,10 +22,12 @@ type Capabilities struct {
 	Push         bool
 	Apply        bool
 	Resume       bool
+	Recover      bool
 }
 
 type AccessState struct {
 	ReadOnly      bool
+	Recoverable   bool
 	Disposition   RecoveryDisposition
 	Message       string
 	Paths         []string
@@ -112,6 +114,7 @@ type Workspace interface {
 	PushChanges(string, bool) error
 	Apply() (*ApplyResult, error)
 	AcknowledgeApply(string) error
+	Recover() error
 	Remove() error
 	Prune() error
 	Cleanup() error

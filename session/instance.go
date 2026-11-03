@@ -589,6 +589,22 @@ func (i *Instance) PreparePause() (paused bool, err error) {
 }
 
 // Resume recreates the worktree and restarts the tmux session
+func (i *Instance) RecoverAndResume() error {
+	if !i.started {
+		return fmt.Errorf("cannot recover instance that has not been started")
+	}
+	if i.Status != Paused {
+		return fmt.Errorf("can only recover paused instances")
+	}
+	if i.workspace == nil || !i.workspace.Capabilities().Recover {
+		return fmt.Errorf("instance does not have safely recoverable cleanup metadata")
+	}
+	if err := i.workspace.Recover(); err != nil {
+		return fmt.Errorf("failed to recover workspace: %w", err)
+	}
+	return i.Resume()
+}
+
 func (i *Instance) Resume() error {
 	if !i.started {
 		return fmt.Errorf("cannot resume instance that has not been started")

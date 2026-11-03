@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -609,6 +610,158 @@ func TestRestoreRetainedOrphanReadOnlyWithExactDeduplicatedPath(t *testing.T) {
 	require.Equal(t, []string{path}, restored.AccessState().RetainedPaths)
 	require.False(t, restored.Capabilities().Apply)
 	require.False(t, restored.Capabilities().Resume)
+	require.True(t, restored.Capabilities().Recover)
+}
+
+func TestRecoverCapabilityRejectsMalformedAndMixedStates(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		mixed bool
+	}{
+		{name: "malformed"},
+		{name: "mixed", mixed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ws := lifecycleWorkspace(t)
+			root := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+			if test.mixed {
+				path := filepath.Join(root, ".orphan-0123456789abcdef0123456789abcdef")
+				require.NoError(t, os.MkdirAll(path, 0o700))
+				require.NoError(t, os.WriteFile(filepath.Join(path, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+			}
+			malformed := filepath.Join(root, ".orphan-fedcba9876543210fedcba9876543210")
+			require.NoError(t, os.MkdirAll(malformed, 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(malformed, orphanCleanupMarker), []byte("forged"), 0o600))
+
+			restored, err := RestoreShadow(ws.Serialize())
+			require.NoError(t, err)
+			require.True(t, restored.AccessState().ReadOnly)
+			require.False(t, restored.Capabilities().Recover)
+		})
+	}
+}
+
+func TestRecoverRetainedOrphansClearsAccessState(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	root := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+	for _, name := range []string{
+		".orphan-0123456789abcdef0123456789abcdef",
+		".orphan-fedcba9876543210fedcba9876543210",
+	} {
+		path := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(path, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(path, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+	}
+
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.True(t, restored.Capabilities().Recover)
+	require.NoError(t, restored.Recover())
+	require.False(t, restored.AccessState().ReadOnly)
+	require.False(t, restored.Capabilities().Recover)
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func TestRecoverRetainedOrphansRejectsReplacementAfterValidation(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	root := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+	name := ".orphan-0123456789abcdef0123456789abcdef"
+	path := filepath.Join(root, name)
+	validated := path + "-validated"
+	require.NoError(t, os.MkdirAll(path, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(path, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	retainedOrphanAfterValidationHook = func(got string) {
+		if got != name {
+			return
+		}
+		retainedOrphanAfterValidationHook = nil
+		require.NoError(t, os.Rename(path, validated))
+		require.NoError(t, os.Mkdir(path, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(path, "replacement"), []byte("keep"), 0o600))
+	}
+	t.Cleanup(func() { retainedOrphanAfterValidationHook = nil })
+
+	require.Error(t, restored.Recover())
+	require.FileExists(t, filepath.Join(path, "replacement"))
+	require.FileExists(t, filepath.Join(validated, orphanCleanupMarker))
+}
+
+func TestRecoverRetainedOrphansRevalidatesAllBeforeDeletingAny(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	root := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+	first := filepath.Join(root, ".orphan-0123456789abcdef0123456789abcdef")
+	second := filepath.Join(root, ".orphan-fedcba9876543210fedcba9876543210")
+	for _, path := range []string{first, second} {
+		require.NoError(t, os.MkdirAll(path, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(path, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+	}
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	retainedOrphansBeforeDeletionHook = func() {
+		retainedOrphansBeforeDeletionHook = nil
+		require.NoError(t, os.WriteFile(filepath.Join(second, "unexpected"), []byte("keep"), 0o600))
+	}
+	t.Cleanup(func() { retainedOrphansBeforeDeletionHook = nil })
+
+	require.Error(t, restored.Recover())
+	require.FileExists(t, filepath.Join(first, orphanCleanupMarker))
+	require.FileExists(t, filepath.Join(second, "unexpected"))
+}
+
+func TestRecoverRetainedOrphansRefusesMixedStateWithoutMutation(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	root := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions")
+	valid := filepath.Join(root, ".orphan-0123456789abcdef0123456789abcdef")
+	malformed := filepath.Join(root, ".orphan-fedcba9876543210fedcba9876543210")
+	require.NoError(t, os.MkdirAll(valid, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(valid, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+	require.NoError(t, os.MkdirAll(malformed, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(malformed, orphanCleanupMarker), []byte("forged"), 0o600))
+
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.False(t, restored.Capabilities().Recover)
+	require.Error(t, restored.Recover())
+	require.DirExists(t, valid)
+	require.DirExists(t, malformed)
+}
+
+func TestRecoverRetainedOrphansClearsStaleCapabilityAfterPostDeletionFailure(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	path := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", ".orphan-0123456789abcdef0123456789abcdef")
+	require.NoError(t, os.MkdirAll(path, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(path, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+	require.True(t, restored.Capabilities().Recover)
+	recoverAfterAcknowledgementHook = func() error { return errors.New("post-deletion failure") }
+	t.Cleanup(func() { recoverAfterAcknowledgementHook = nil })
+
+	require.ErrorContains(t, restored.Recover(), "post-deletion failure")
+	require.NoDirExists(t, path)
+	require.False(t, restored.Capabilities().Recover)
+	require.True(t, restored.AccessState().ReadOnly)
+}
+
+func TestRecoverRetainedOrphansContendsOnProjectLock(t *testing.T) {
+	ws := lifecycleWorkspace(t)
+	path := filepath.Join(filepath.Dir(ws.data.RepoPath), "transactions", ".orphan-0123456789abcdef0123456789abcdef")
+	require.NoError(t, os.MkdirAll(path, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(path, orphanCleanupMarker), []byte(orphanCleanupContents), 0o600))
+	restored, err := RestoreShadow(ws.Serialize())
+	require.NoError(t, err)
+
+	lock, err := AcquireProjectLock(filepath.Dir(ws.data.RepoPath), "holder")
+	require.NoError(t, err)
+	defer lock.Close()
+	err = restored.Recover()
+	var busy *OperationInProgressError
+	require.ErrorAs(t, err, &busy)
+	require.DirExists(t, path)
 }
 
 func TestApplyAndResumeContendOnSameProjectLock(t *testing.T) {

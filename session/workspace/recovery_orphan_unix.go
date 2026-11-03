@@ -211,6 +211,10 @@ func validateRetainedOrphanMarkerAt(root *os.File, name string) error {
 		return fmt.Errorf("inspect retained orphan: %w", err)
 	}
 	defer directory.Close()
+	return validateRetainedOrphanDirectory(directory)
+}
+
+func validateRetainedOrphanDirectory(directory *os.File) error {
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
 		return err
@@ -237,6 +241,20 @@ func validateRetainedOrphanMarkerAt(root *os.File, name string) error {
 		return errors.New("retained orphan marker has invalid contents")
 	}
 	return nil
+}
+
+func validateRetainedOrphanAtIdentity(root *os.File, name string, expected unix.Stat_t) error {
+	directory, identity, err := openOrphanDirectoryAt(root, name)
+	if err != nil {
+		return err
+	}
+	if !sameOrphanIdentity(identity, expected) {
+		_ = directory.Close()
+		return errors.New("retained orphan changed after validation")
+	}
+	validateErr := validateRetainedOrphanDirectory(directory)
+	closeErr := directory.Close()
+	return errors.Join(validateErr, closeErr)
 }
 
 func writeOrphanCleanupMarker(directory *os.File) error {
@@ -344,6 +362,74 @@ func acknowledgeCompleteTransaction(projectPath, transactionDir, transactionID s
 	}
 	if err := unix.Unlinkat(int(root.Fd()), quarantine, unix.AT_REMOVEDIR); err != nil {
 		return err
+	}
+	return root.Sync()
+}
+
+func acknowledgeRetainedOrphans(projectPath string, names []string) error {
+	rootPath := filepath.Join(projectPath, "transactions")
+	root, err := platformOpenTrustedDirectory(rootPath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	type retained struct {
+		name      string
+		directory *os.File
+		identity  unix.Stat_t
+	}
+	validated := make([]retained, 0, len(names))
+	defer func() {
+		for _, item := range validated {
+			_ = item.directory.Close()
+		}
+	}()
+	for _, name := range names {
+		if !isRetainedOrphanName(name) {
+			return errors.New("invalid retained orphan quarantine name")
+		}
+		directory, identity, err := openOrphanDirectoryAt(root, name)
+		if err != nil {
+			return err
+		}
+		if err := validateRetainedOrphanAtIdentity(root, name, identity); err != nil {
+			_ = directory.Close()
+			return err
+		}
+		if retainedOrphanAfterValidationHook != nil {
+			retainedOrphanAfterValidationHook(name)
+		}
+		if err := verifyOrphanDirectoryEntry(root, name, identity); err != nil {
+			_ = directory.Close()
+			return err
+		}
+		validated = append(validated, retained{name: name, directory: directory, identity: identity})
+	}
+	if retainedOrphansBeforeDeletionHook != nil {
+		retainedOrphansBeforeDeletionHook()
+	}
+	for _, item := range validated {
+		if err := verifyOrphanDirectoryEntry(root, item.name, item.identity); err != nil {
+			return err
+		}
+		if err := validateRetainedOrphanAtIdentity(root, item.name, item.identity); err != nil {
+			return err
+		}
+	}
+	for _, item := range validated {
+		if err := removeOrphanDirectoryContents(item.directory); err != nil {
+			return err
+		}
+		if err := item.directory.Close(); err != nil {
+			return err
+		}
+		if err := verifyOrphanDirectoryEntry(root, item.name, item.identity); err != nil {
+			return err
+		}
+		if err := unix.Unlinkat(int(root.Fd()), item.name, unix.AT_REMOVEDIR); err != nil {
+			return err
+		}
 	}
 	return root.Sync()
 }

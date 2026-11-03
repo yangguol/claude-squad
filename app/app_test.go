@@ -445,6 +445,8 @@ type appTestWorkspace struct {
 	applyCalls   int
 	access       workspace.AccessState
 	acknowledged []string
+	recoverCalls int
+	recoverErr   error
 }
 
 func (w *appTestWorkspace) Mode() workspace.Mode                 { return w.mode }
@@ -471,6 +473,15 @@ func (w *appTestWorkspace) Apply() (*workspace.ApplyResult, error) {
 func (w *appTestWorkspace) AcknowledgeApply(transactionID string) error {
 	w.acknowledged = append(w.acknowledged, transactionID)
 	return nil
+}
+func (w *appTestWorkspace) Recover() error {
+	w.recoverCalls++
+	if w.recoverErr == nil {
+		w.capabilities.Recover = false
+		w.capabilities.Resume = true
+		w.access = workspace.AccessState{}
+	}
+	return w.recoverErr
 }
 func (w *appTestWorkspace) Remove() error             { return nil }
 func (w *appTestWorkspace) Prune() error              { return nil }
@@ -735,6 +746,63 @@ func TestApplyCleanupWarningRendersRetainedPaths(t *testing.T) {
 	require.Contains(t, rendered, "tx-warning")
 	require.Contains(t, rendered, "/shadow/transactions/tx-warning")
 	require.Contains(t, rendered, "/source/.capture")
+}
+
+func TestRecoverAndResumePromptsThenRunsAsynchronously(t *testing.T) {
+	h, instance, backend := newDirectoryHomeWithWorkspace(t)
+	backend.capabilities = workspace.Capabilities{Recover: true}
+	backend.access = workspace.AccessState{ReadOnly: true, Recoverable: true, Message: "retained cleanup metadata"}
+	instance.SetStatus(session.Paused)
+	recoverCalls := 0
+	h.recoverInstance = func(got *session.Instance) error {
+		require.Same(t, instance, got)
+		recoverCalls++
+		got.SetStatus(session.Running)
+		return nil
+	}
+	saveCalls := 0
+	h.saveInstances = func([]*session.Instance) error {
+		saveCalls++
+		return nil
+	}
+
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	require.Nil(t, cmd)
+	require.Equal(t, stateConfirm, h.state)
+	require.Contains(t, h.confirmationOverlay.Render(), "previous cleanup was incomplete")
+	require.Contains(t, h.confirmationOverlay.Render(), "safe retained metadata")
+	require.Equal(t, 0, recoverCalls)
+
+	_, cmd = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(recoverResumeResultMsg)
+	require.True(t, ok)
+	require.NoError(t, msg.err)
+	require.Equal(t, 1, recoverCalls)
+
+	_, refresh := h.Update(msg)
+	require.NotNil(t, refresh)
+	require.Equal(t, 1, saveCalls)
+	require.Equal(t, session.Running, instance.Status)
+	require.False(t, h.actionPending(instance))
+}
+
+func TestRecoverAndResumeErrorIsSurfaced(t *testing.T) {
+	h, instance, backend := newDirectoryHomeWithWorkspace(t)
+	backend.capabilities = workspace.Capabilities{Recover: true}
+	backend.access = workspace.AccessState{ReadOnly: true, Recoverable: true}
+	instance.SetStatus(session.Paused)
+	h.recoverInstance = func(*session.Instance) error { return fmt.Errorf("recovery failed") }
+
+	_, _ = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	msg := cmd().(recoverResumeResultMsg)
+	_, hideErr := h.Update(msg)
+
+	require.NotNil(t, hideErr)
+	require.Contains(t, h.errBox.String(), "recovery failed")
+	require.Equal(t, session.Paused, instance.Status)
+	require.False(t, h.actionPending(instance))
 }
 
 func TestResumeKeyIsIgnoredAfterInstanceAlreadyResumed(t *testing.T) {

@@ -62,12 +62,26 @@ func (p *PreviewPane) UpdateContent(instance *session.Instance) error {
 		p.setFallbackState("Setting up workspace...")
 		return nil
 	case instance.Status == session.Paused:
+		access := instance.AccessState()
+		capabilities := instance.Capabilities()
+		if access.ReadOnly && !access.Recoverable {
+			details := []string{access.Message}
+			details = append(details, access.Paths...)
+			details = append(details, access.RetainedPaths...)
+			p.setFallbackState(lipgloss.JoinVertical(lipgloss.Center, details...))
+			return nil
+		}
+
 		detail := fmt.Sprintf("The instance can be checked out at '%s' (copied to your clipboard)", instance.Branch)
 		if instance.WorkspaceMode() == workspace.ModeDirectory {
-			detail = fmt.Sprintf("Directory workspace for '%s'. Press 'r' to continue editing.", instance.DisplayWorkspace())
+			detail = fmt.Sprintf("Directory workspace for '%s'.", instance.DisplayWorkspace())
+		}
+		title := "Session is paused."
+		if capabilities.Resume || capabilities.Recover {
+			title += " Press 'r' to resume."
 		}
 		p.setFallbackState(lipgloss.JoinVertical(lipgloss.Center,
-			"Session is paused. Press 'r' to resume.",
+			title,
 			"",
 			lipgloss.NewStyle().
 				Foreground(lipgloss.AdaptiveColor{Light: "#FFD700", Dark: "#FFD700"}).

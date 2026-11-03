@@ -13,13 +13,14 @@ import (
 type capabilityWorkspace struct {
 	mode         workspace.Mode
 	capabilities workspace.Capabilities
+	access       workspace.AccessState
 	displayName  string
 	branchName   string
 }
 
 func (w *capabilityWorkspace) Mode() workspace.Mode                 { return w.mode }
 func (w *capabilityWorkspace) Capabilities() workspace.Capabilities { return w.capabilities }
-func (w *capabilityWorkspace) AccessState() workspace.AccessState   { return workspace.AccessState{} }
+func (w *capabilityWorkspace) AccessState() workspace.AccessState   { return w.access }
 func (w *capabilityWorkspace) WorkDir() string                      { return "/internal/worktree" }
 func (w *capabilityWorkspace) DisplayName() string                  { return w.displayName }
 func (w *capabilityWorkspace) BranchName() string                   { return w.branchName }
@@ -35,18 +36,23 @@ func (w *capabilityWorkspace) Apply() (*workspace.ApplyResult, error) {
 	return &workspace.ApplyResult{}, nil
 }
 func (w *capabilityWorkspace) AcknowledgeApply(string) error { return nil }
+func (w *capabilityWorkspace) Recover() error                { return nil }
 func (w *capabilityWorkspace) Remove() error                 { return nil }
 func (w *capabilityWorkspace) Prune() error                  { return nil }
 func (w *capabilityWorkspace) Cleanup() error                { return nil }
 func (w *capabilityWorkspace) Serialize() workspace.Data     { return workspace.Data{Mode: w.mode} }
 
 func testInstanceWithWorkspace(t *testing.T, mode workspace.Mode, capabilities workspace.Capabilities, displayName, branchName string) *session.Instance {
+	return testInstanceWithAccessState(t, mode, capabilities, workspace.AccessState{}, displayName, branchName)
+}
+
+func testInstanceWithAccessState(t *testing.T, mode workspace.Mode, capabilities workspace.Capabilities, access workspace.AccessState, displayName, branchName string) *session.Instance {
 	t.Helper()
 	instance, err := session.NewInstance(session.InstanceOptions{
 		Title:     "test",
 		Path:      t.TempDir(),
 		Program:   "echo",
-		Workspace: &capabilityWorkspace{mode: mode, capabilities: capabilities, displayName: displayName, branchName: branchName},
+		Workspace: &capabilityWorkspace{mode: mode, capabilities: capabilities, access: access, displayName: displayName, branchName: branchName},
 	})
 	require.NoError(t, err)
 	instance.Branch = branchName
@@ -75,7 +81,7 @@ func TestMenuDirectoryActionsFollowCapabilities(t *testing.T) {
 	require.Contains(t, menu.options, keys.KeyApply)
 	rendered := menu.String()
 	require.NotContains(t, rendered, "push branch")
-	require.Contains(t, rendered, "c apply")
+	require.Contains(t, rendered, "c apply & pause")
 }
 
 func TestMenuBlockedDirectoryOmitsCheckout(t *testing.T) {
@@ -85,4 +91,55 @@ func TestMenuBlockedDirectoryOmitsCheckout(t *testing.T) {
 
 	require.NotContains(t, menu.options, keys.KeyCheckout)
 	require.NotContains(t, menu.String(), "checkout")
+}
+
+func TestMenuRecoverableDirectoryShowsResume(t *testing.T) {
+	instance := testInstanceWithAccessState(t, workspace.ModeDirectory, workspace.Capabilities{Recover: true}, workspace.AccessState{ReadOnly: true, Recoverable: true}, "project", "internal-shadow-branch")
+	instance.SetStatus(session.Paused)
+	menu := NewMenu()
+	menu.SetInstance(instance)
+
+	require.Contains(t, menu.options, keys.KeyRecover)
+	require.NotContains(t, menu.options, keys.KeyResume)
+	require.Contains(t, menu.String(), "r resume")
+	require.NotContains(t, menu.String(), "recover")
+}
+
+func TestMenuBlockedDirectoryOmitsRecover(t *testing.T) {
+	instance := testInstanceWithAccessState(t, workspace.ModeDirectory, workspace.Capabilities{}, workspace.AccessState{ReadOnly: true, Message: "cleanup metadata is malformed"}, "project", "internal-shadow-branch")
+	instance.SetStatus(session.Paused)
+	menu := NewMenu()
+	menu.SetInstance(instance)
+
+	require.NotContains(t, menu.options, keys.KeyResume)
+	require.NotContains(t, menu.options, keys.KeyRecover)
+	require.NotContains(t, menu.String(), "r resume")
+}
+
+func TestPreviewRecoverableDirectoryShowsResume(t *testing.T) {
+	instance := testInstanceWithAccessState(t, workspace.ModeDirectory, workspace.Capabilities{Recover: true}, workspace.AccessState{ReadOnly: true, Recoverable: true}, "project", "internal-shadow-branch")
+	instance.SetStatus(session.Paused)
+	pane := NewPreviewPane()
+
+	require.NoError(t, pane.UpdateContent(instance))
+	require.Contains(t, pane.previewState.fallbackMessage, "Press 'r' to resume")
+	require.NotContains(t, pane.previewState.fallbackMessage, "recover")
+}
+
+func TestPreviewBlockedDirectoryShowsDiagnostics(t *testing.T) {
+	instance := testInstanceWithAccessState(t, workspace.ModeDirectory, workspace.Capabilities{}, workspace.AccessState{
+		ReadOnly:      true,
+		Message:       "cleanup metadata is malformed",
+		Paths:         []string{"transactions/bad"},
+		RetainedPaths: []string{"transactions/.orphan-deadbeef"},
+	}, "project", "internal-shadow-branch")
+	instance.SetStatus(session.Paused)
+	pane := NewPreviewPane()
+
+	require.NoError(t, pane.UpdateContent(instance))
+	message := pane.previewState.fallbackMessage
+	require.Contains(t, message, "cleanup metadata is malformed")
+	require.Contains(t, message, "transactions/bad")
+	require.Contains(t, message, "transactions/.orphan-deadbeef")
+	require.NotContains(t, message, "Press 'r'")
 }

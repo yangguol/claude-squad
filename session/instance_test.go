@@ -6,6 +6,7 @@ import (
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
 	"claude-squad/session/workspace"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -100,6 +101,8 @@ type fakeWorkspace struct {
 	pruneCalls    int
 	serializeData workspace.Data
 	accessState   workspace.AccessState
+	recoverErr    error
+	recoverCalls  int
 }
 
 func (w *fakeWorkspace) record(event string) {
@@ -123,10 +126,19 @@ func (w *fakeWorkspace) CommitChanges(string) error             { w.commitCalls+
 func (w *fakeWorkspace) PushChanges(string, bool) error         { return nil }
 func (w *fakeWorkspace) Apply() (*workspace.ApplyResult, error) { return &workspace.ApplyResult{}, nil }
 func (w *fakeWorkspace) AcknowledgeApply(string) error          { return nil }
-func (w *fakeWorkspace) Remove() error                          { w.removeCalls++; w.record("remove"); return w.removeErr }
-func (w *fakeWorkspace) Prune() error                           { w.pruneCalls++; w.record("prune"); return w.pruneErr }
-func (w *fakeWorkspace) Cleanup() error                         { w.cleanupCalls++; w.record("cleanup"); return w.cleanupErr }
-func (w *fakeWorkspace) Serialize() workspace.Data              { return w.serializeData }
+func (w *fakeWorkspace) Recover() error {
+	w.recoverCalls++
+	w.record("recover")
+	if w.recoverErr == nil {
+		w.capabilities.Recover = false
+		w.capabilities.Resume = true
+	}
+	return w.recoverErr
+}
+func (w *fakeWorkspace) Remove() error             { w.removeCalls++; w.record("remove"); return w.removeErr }
+func (w *fakeWorkspace) Prune() error              { w.pruneCalls++; w.record("prune"); return w.pruneErr }
+func (w *fakeWorkspace) Cleanup() error            { w.cleanupCalls++; w.record("cleanup"); return w.cleanupErr }
+func (w *fakeWorkspace) Serialize() workspace.Data { return w.serializeData }
 
 func TestReadOnlyRestoreDoesNotStartTmuxOrRecreateWorktree(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -258,6 +270,80 @@ type failingPtyFactory struct{}
 
 func (*failingPtyFactory) Start(*exec.Cmd) (*os.File, error) { return nil, fmt.Errorf("pty failed") }
 func (*failingPtyFactory) Close()                            {}
+
+func TestRecoverAndResumeRecoversBeforeResume(t *testing.T) {
+	events := []string{}
+	ws := &fakeWorkspace{
+		mode:         workspace.ModeDirectory,
+		capabilities: workspace.Capabilities{Recover: true},
+		workDir:      t.TempDir(),
+		valid:        true,
+		events:       &events,
+	}
+	instance, err := NewInstance(InstanceOptions{Title: "recover-resume", Path: t.TempDir(), Program: "claude", Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Paused
+	pty := &recordingPtyFactory{t: t, events: &events}
+	hasSessionCalls := 0
+	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps(instance.Title, instance.Program, pty, cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			if strings.Contains(cmd.String(), "has-session") {
+				hasSessionCalls++
+				if hasSessionCalls <= 2 {
+					return fmt.Errorf("missing")
+				}
+			}
+			return nil
+		},
+		OutputFunc: func(*exec.Cmd) ([]byte, error) { return nil, nil },
+	}))
+
+	require.NoError(t, instance.RecoverAndResume())
+	require.Equal(t, 1, ws.recoverCalls)
+	require.Equal(t, Running, instance.Status)
+	require.Equal(t, "recover", events[0])
+}
+
+func TestRecoverAndResumeRejectsInvalidLifecycleBeforeRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		started bool
+		status  Status
+	}{
+		{name: "not started", status: Paused},
+		{name: "not paused", started: true, status: Running},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ws := &fakeWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Recover: true}}
+			instance, err := NewInstance(InstanceOptions{Title: "invalid-lifecycle", Path: t.TempDir(), Program: "claude", Workspace: ws})
+			require.NoError(t, err)
+			instance.started = test.started
+			instance.Status = test.status
+
+			require.Error(t, instance.RecoverAndResume())
+			require.Zero(t, ws.recoverCalls)
+		})
+	}
+}
+
+func TestRecoverAndResumeStopsWhenRecoveryFails(t *testing.T) {
+	ws := &fakeWorkspace{
+		mode:         workspace.ModeDirectory,
+		capabilities: workspace.Capabilities{Recover: true},
+		workDir:      t.TempDir(),
+		valid:        true,
+		recoverErr:   errors.New("recovery failed"),
+	}
+	instance, err := NewInstance(InstanceOptions{Title: "recover-fails", Path: t.TempDir(), Program: "claude", Workspace: ws})
+	require.NoError(t, err)
+	instance.started = true
+	instance.Status = Paused
+
+	require.ErrorContains(t, instance.RecoverAndResume(), "recovery failed")
+	require.Equal(t, Paused, instance.Status)
+	require.Zero(t, ws.setupCalls)
+}
 
 func TestResumePreservesPreexistingValidWorkspaceWhenTmuxStartFails(t *testing.T) {
 	ws := &fakeWorkspace{mode: workspace.ModeDirectory, workDir: t.TempDir(), valid: true}

@@ -34,6 +34,7 @@ type shadowWorkspace struct {
 }
 
 var lifecycleAccessStatePublishedHook func()
+var recoverAfterAcknowledgementHook func() error
 
 func NewShadow(source, sessionName string) (result Workspace, branchName string, returnErr error) {
 	canonical, err := resolveDirectory(source)
@@ -189,7 +190,7 @@ func restoreShadow(data Data, recoveredAccess *AccessState) (result Workspace, r
 func (w *shadowWorkspace) Mode() Mode { return ModeDirectory }
 
 func (w *shadowWorkspace) Capabilities() Capabilities {
-	return Capabilities{Apply: !w.access.ReadOnly, Resume: !w.access.ReadOnly}
+	return Capabilities{Apply: !w.access.ReadOnly, Resume: !w.access.ReadOnly, Recover: w.access.Recoverable}
 }
 
 func (w *shadowWorkspace) AccessState() AccessState {
@@ -202,6 +203,52 @@ func (w *shadowWorkspace) AccessState() AccessState {
 func (w *shadowWorkspace) WorkDir() string     { return w.data.WorktreePath }
 func (w *shadowWorkspace) DisplayName() string { return filepath.Base(w.data.SourcePath) }
 func (w *shadowWorkspace) BranchName() string  { return w.data.BranchName }
+
+func (w *shadowWorkspace) Recover() (returnErr error) {
+	projectPath := filepath.Dir(w.data.RepoPath)
+	lock, err := AcquireProjectLock(projectPath, "recover session")
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, lock.Close()) }()
+
+	discovered, err := classifyTransactions(projectPath)
+	if err != nil {
+		return err
+	}
+	access := accessStateFromReport(classificationReport(discovered))
+	if !access.Recoverable {
+		return errors.New("workspace does not have safely recoverable cleanup metadata")
+	}
+	names := make([]string, 0, len(discovered))
+	for _, transaction := range discovered {
+		if transaction.Recoverable {
+			names = append(names, filepath.Base(transaction.Directory))
+		}
+	}
+	if err := acknowledgeRetainedOrphans(projectPath, names); err != nil {
+		return err
+	}
+	defer func() {
+		if returnErr != nil {
+			w.access = AccessState{
+				ReadOnly: true,
+				Message:  fmt.Sprintf("workspace recovery failed after cleanup: %v", returnErr),
+			}
+		}
+	}()
+	if recoverAfterAcknowledgementHook != nil {
+		if err := recoverAfterAcknowledgementHook(); err != nil {
+			return err
+		}
+	}
+	report, err := recoverProjectLocked(projectPath, map[string]*ShadowData{w.data.SessionID: &w.data})
+	if err != nil {
+		return err
+	}
+	w.access = accessStateFromReport(report)
+	return nil
+}
 
 func (w *shadowWorkspace) Setup() (returnErr error) {
 	projectPath := filepath.Dir(w.data.RepoPath)

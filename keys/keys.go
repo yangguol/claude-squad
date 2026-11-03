@@ -23,6 +23,7 @@ const (
 	KeyCheckout
 	KeyApply
 	KeyResume
+	KeyRecover
 	KeyPrompt // New key for entering a prompt
 	KeyHelp   // Key for showing help screen
 
@@ -110,13 +111,17 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	),
 	KeyApply: key.NewBinding(
 		key.WithKeys("c"),
-		key.WithHelp("c", "apply"),
+		key.WithHelp("c", "apply & pause"),
 	),
 	KeyTab: key.NewBinding(
 		key.WithKeys("tab"),
 		key.WithHelp("tab", "switch tab"),
 	),
 	KeyResume: key.NewBinding(
+		key.WithKeys("r"),
+		key.WithHelp("r", "resume"),
+	),
+	KeyRecover: key.NewBinding(
 		key.WithKeys("r"),
 		key.WithHelp("r", "resume"),
 	),

@@ -140,6 +140,8 @@ func (m *Menu) addInstanceOptions() {
 	}
 	if m.instance.Status == session.Paused && capabilities.Resume {
 		actionGroup = append(actionGroup, keys.KeyResume)
+	} else if m.instance.Status == session.Paused && capabilities.Recover {
+		actionGroup = append(actionGroup, keys.KeyRecover)
 	} else if m.instance.Status != session.Paused && capabilities.Apply {
 		actionGroup = append(actionGroup, keys.KeyApply)
 	} else if m.instance.WorkspaceMode() == workspace.ModeGit {

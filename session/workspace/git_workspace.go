@@ -112,6 +112,8 @@ func (w *gitWorkspace) Apply() (*ApplyResult, error) {
 
 func (w *gitWorkspace) AcknowledgeApply(string) error { return nil }
 
+func (w *gitWorkspace) Recover() error { return &ErrUnsupported{Operation: "recover"} }
+
 func (w *gitWorkspace) Remove() error { return w.worktree.Remove() }
 
 func (w *gitWorkspace) Prune() error { return w.worktree.Prune() }

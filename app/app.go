@@ -41,8 +41,9 @@ type state int
 type actionKind string
 
 const (
-	actionApply actionKind = "apply"
-	actionKill  actionKind = "kill"
+	actionApply   actionKind = "apply"
+	actionKill    actionKind = "kill"
+	actionRecover actionKind = "recover"
 )
 
 const (
@@ -119,6 +120,7 @@ type home struct {
 	// Backend hooks are replaceable by tests. They must not mutate home, list, UI, or storage.
 	applyInstance   func(*session.Instance) (*workspace.ApplyResult, error)
 	pauseInstance   func(*session.Instance) (bool, error)
+	recoverInstance func(*session.Instance) error
 	killInstance    func(*session.Instance) error
 	saveInstances   func([]*session.Instance) error
 	deleteInstance  func(string) error
@@ -352,6 +354,18 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleApplyResult(msg)
 	case applyPausedMsg:
 		return m, m.handleApplyPaused(msg)
+	case recoverResumeResultMsg:
+		m.finishAction(msg.instance, actionRecover)
+		if msg.err != nil {
+			return m, m.handleError(msg.err)
+		}
+		if !m.list.ContainsInstance(msg.instance) {
+			return m, nil
+		}
+		if err := m.saveCurrentInstances(); err != nil {
+			return m, m.handleError(err)
+		}
+		return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -427,6 +441,12 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 		selected := m.list.GetSelectedInstance()
 		if selected != nil && selected.Capabilities().Apply {
 			name = keys.KeyApply
+		}
+	}
+	if name == keys.KeyResume {
+		selected := m.list.GetSelectedInstance()
+		if selected != nil && selected.Capabilities().Recover {
+			name = keys.KeyRecover
 		}
 	}
 
@@ -667,6 +687,12 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
+	if name == keys.KeyResume {
+		selected := m.list.GetSelectedInstance()
+		if selected != nil && selected.Capabilities().Recover {
+			name = keys.KeyRecover
+		}
+	}
 
 	switch name {
 	case keys.KeyHelp:
@@ -842,6 +868,20 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, m.handleError(err)
 		}
 		return m, tea.WindowSize()
+	case keys.KeyRecover:
+		selected := m.list.GetSelectedInstance()
+		if selected == nil || !selected.Paused() || !selected.Capabilities().Recover || m.actionPending(selected) {
+			return m, nil
+		}
+		recoverInstance := m.recoverInstance
+		if recoverInstance == nil {
+			recoverInstance = (*session.Instance).RecoverAndResume
+		}
+		recoverAction := func() tea.Msg {
+			return recoverResumeResultMsg{instance: selected, err: recoverInstance(selected)}
+		}
+		message := "The previous cleanup was incomplete. Clear safe retained metadata and resume this session?"
+		return m, m.confirmTargetAction(message, selected, actionRecover, recoverAction)
 	case keys.KeyEnter:
 		if m.list.NumInstances() == 0 {
 			return m, nil
@@ -940,6 +980,11 @@ type applyPausedMsg struct {
 	result   *workspace.ApplyResult
 	paused   bool
 	pauseErr error
+}
+
+type recoverResumeResultMsg struct {
+	instance *session.Instance
+	err      error
 }
 
 type applyFinalMsg struct {

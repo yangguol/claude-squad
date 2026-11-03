@@ -17,11 +17,12 @@ import (
 // DiscoveredTransaction is a transaction directory classified without
 // interpreting invalid or legacy bytes as the current WAL format.
 type DiscoveredTransaction struct {
-	Directory string
-	Manifest  *TransactionManifest
-	Legacy    bool
-	Orphan    bool
-	Invalid   error
+	Directory   string
+	Manifest    *TransactionManifest
+	Legacy      bool
+	Orphan      bool
+	Recoverable bool
+	Invalid     error
 }
 
 // RecoveryDisposition summarizes whether recovery completed or retained a
@@ -73,6 +74,7 @@ type RecoveryIssue struct {
 	Paths         []string
 	RetainedPaths []string
 	Informational bool
+	Recoverable   bool
 }
 
 type RecoveryReport struct {
@@ -129,7 +131,7 @@ func classificationReport(discovered []DiscoveredTransaction) RecoveryReport {
 			continue
 		}
 		report.Disposition = RecoveryBlocked
-		issue := RecoveryIssue{Message: message, RetainedPaths: []string{transaction.Directory}}
+		issue := RecoveryIssue{Message: message, RetainedPaths: []string{transaction.Directory}, Recoverable: transaction.Recoverable}
 		if transaction.Manifest != nil {
 			issue.TransactionID = transaction.Manifest.TransactionID
 			issue.State = transaction.Manifest.State
@@ -187,7 +189,7 @@ func recoverProjectLocked(projectPath string, sessions map[string]*ShadowData) (
 				message = "legacy transaction requires explicit recovery"
 			}
 			report.Disposition = RecoveryBlocked
-			report.Issues = append(report.Issues, RecoveryIssue{Message: message, RetainedPaths: []string{transaction.Directory}})
+			report.Issues = append(report.Issues, RecoveryIssue{Message: message, RetainedPaths: []string{transaction.Directory}, Recoverable: transaction.Recoverable})
 			if transaction.Orphan {
 				report.Orphans = append(report.Orphans, transaction.Directory)
 			}
@@ -255,10 +257,14 @@ func accessStateFromReport(report RecoveryReport) AccessState {
 			*destination = append(*destination, path)
 		}
 	}
+	recoverable := true
+	blocking := 0
 	for _, issue := range report.Issues {
 		if issue.Informational {
 			continue
 		}
+		blocking++
+		recoverable = recoverable && issue.Recoverable
 		state.ReadOnly = true
 		if state.Message == "" {
 			state.Message = issue.Message
@@ -266,6 +272,7 @@ func accessStateFromReport(report RecoveryReport) AccessState {
 		appendUnique(&state.Paths, pathSeen, issue.Paths...)
 		appendUnique(&state.RetainedPaths, retainedSeen, issue.RetainedPaths...)
 	}
+	state.Recoverable = blocking > 0 && recoverable
 	if len(report.Orphans) != 0 {
 		state.ReadOnly = true
 		appendUnique(&state.RetainedPaths, retainedSeen, report.Orphans...)
@@ -353,6 +360,7 @@ func discoverTransactions(projectPath string, cleanupOrphans bool) ([]Discovered
 			} else if markerErr := validateRetainedOrphanMarkerAt(rootDirectory, entry.Name()); markerErr != nil {
 				discovered.Invalid = markerErr
 			} else {
+				discovered.Recoverable = true
 				discovered.Invalid = errors.New("retained orphan cleanup tombstone requires explicit recovery")
 			}
 			result = append(result, discovered)
@@ -1158,6 +1166,8 @@ func readStableRegularFile(path string, expected os.FileInfo) ([]byte, error) {
 
 var orphanBeforeQuarantineHook func()
 var orphanAfterQuarantineHook func(string)
+var retainedOrphanAfterValidationHook func(string)
+var retainedOrphansBeforeDeletionHook func()
 
 func removeOrphanTransaction(projectPath, transactionDir string) error {
 	root := filepath.Join(filepath.Clean(projectPath), "transactions")
