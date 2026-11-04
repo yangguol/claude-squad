@@ -561,6 +561,7 @@ func TestDirectoryApplyConfirmationAndResultMessages(t *testing.T) {
 
 			_, cmd = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 			require.NotNil(t, cmd)
+			require.Contains(t, h.View(), "Apply in progress")
 			msg, ok := cmd().(applyResultMsg)
 			require.True(t, ok)
 			require.Equal(t, tc.result, msg.result)
@@ -588,6 +589,56 @@ func TestDirectoryApplyConfirmationAndResultMessages(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDirectoryKillWhileApplyPendingShowsStatus(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	h.pendingActions = map[*session.Instance]actionKind{instance: actionApply}
+
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
+
+	require.Nil(t, cmd)
+	require.Equal(t, stateHelp, h.state)
+	require.Contains(t, h.textOverlay.Render(), "Apply in progress")
+	require.Contains(t, h.textOverlay.Render(), "cannot be deleted")
+}
+
+func TestDirectoryApplyStatusRemainsVisibleAfterSelectionChanges(t *testing.T) {
+	h, applying := newDirectoryHome(t)
+	other, err := session.NewInstance(session.InstanceOptions{
+		Title: "other", Path: t.TempDir(), Program: "echo",
+		Workspace: &appTestWorkspace{mode: workspace.ModeDirectory, capabilities: workspace.Capabilities{Apply: true}, displayName: "other-source"},
+	})
+	require.NoError(t, err)
+	other.SetStatus(session.Ready)
+	h.list.AddInstance(other)()
+	h.pendingActions = map[*session.Instance]actionKind{applying: actionApply}
+	h.list.SetSelectedInstance(1)
+
+	require.Contains(t, h.View(), "Apply in progress")
+}
+
+func TestDirectoryApplyPanicReturnsErrorAndClearsPendingAction(t *testing.T) {
+	h, instance := newDirectoryHome(t)
+	h.applyInstance = func(*session.Instance) (*workspace.ApplyResult, error) {
+		panic("apply panic")
+	}
+
+	_, cmd := h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	require.Nil(t, cmd)
+	_, cmd = h.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.NotNil(t, cmd)
+
+	msg, ok := cmd().(applyResultMsg)
+	require.True(t, ok)
+	require.ErrorContains(t, msg.err, "source changes may already have been applied")
+	require.True(t, h.actionPending(instance))
+
+	_, followup := h.Update(msg)
+	require.Nil(t, followup)
+	require.False(t, h.actionPending(instance))
+	require.Equal(t, stateHelp, h.state)
+	require.Contains(t, h.textOverlay.Render(), "Apply Failed")
 }
 
 func TestConfirmActionPropagatesReturnedMessage(t *testing.T) {

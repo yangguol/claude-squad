@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -768,7 +769,19 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		return m, m.instanceChanged()
 	case keys.KeyKill:
 		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Status == session.Loading || m.actionPending(selected) {
+		if selected == nil || selected.Status == session.Loading {
+			return m, nil
+		}
+		if kind, pending := m.pendingActions[selected]; pending {
+			if kind == actionApply {
+				m.textOverlay = overlay.NewTextOverlay(lipgloss.JoinVertical(
+					lipgloss.Left,
+					titleStyle.Render("Apply in progress"),
+					"",
+					"This session cannot be deleted until Apply finishes.",
+				))
+				m.state = stateHelp
+			}
 			return m, nil
 		}
 
@@ -826,7 +839,16 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			if apply == nil {
 				apply = (*session.Instance).Apply
 			}
-			applyAction := func() tea.Msg {
+			applyAction := func() (msg tea.Msg) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						log.ErrorLog.Printf("apply panicked: %v\n%s", recovered, debug.Stack())
+						msg = applyResultMsg{
+							instance: selected,
+							err:      fmt.Errorf("apply failed unexpectedly; source changes may already have been applied"),
+						}
+					}
+				}()
 				result, err := apply(selected)
 				return applyResultMsg{instance: selected, result: result, err: err}
 			}
@@ -1322,12 +1344,15 @@ func (m *home) View() string {
 	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.tabbedWindow.String())
 	listAndPreview := lipgloss.JoinHorizontal(lipgloss.Top, listWithPadding, previewWithPadding)
 
-	mainView := lipgloss.JoinVertical(
-		lipgloss.Center,
-		listAndPreview,
-		m.menu.String(),
-		m.errBox.String(),
-	)
+	sections := []string{listAndPreview, m.menu.String()}
+	for _, kind := range m.pendingActions {
+		if kind == actionApply {
+			sections = append(sections, "Apply in progress — this session cannot be deleted until Apply finishes.")
+			break
+		}
+	}
+	sections = append(sections, m.errBox.String())
+	mainView := lipgloss.JoinVertical(lipgloss.Center, sections...)
 
 	if m.state == statePrompt {
 		if m.textInputOverlay == nil {
