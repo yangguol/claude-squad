@@ -50,6 +50,12 @@ func Scan(source string, policy Policy) (Snapshot, error) {
 		if name == source {
 			return nil
 		}
+		if directoryEntry.Name() == ".git" {
+			if directoryEntry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 
 		relative, err := filepath.Rel(source, name)
 		if err != nil {

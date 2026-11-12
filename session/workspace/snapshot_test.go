@@ -80,6 +80,28 @@ func TestScanRecordsFilesModesAndSymlinksWithoutTraversal(t *testing.T) {
 	require.Empty(t, snapshot.Entries["external-link"].ContentHash)
 }
 
+func TestScanExcludesNestedGitMetadata(t *testing.T) {
+	source := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(source, "TradingAgents", ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "TradingAgents", "agent.py"), []byte("print('ok')\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "TradingAgents", ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644))
+
+	snapshot, err := Scan(source, Policy{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"TradingAgents/agent.py"}, snapshot.SortedPaths())
+}
+
+func TestScanExcludesNestedGitMetadataFile(t *testing.T) {
+	source := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(source, "linked"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "linked", "main.go"), []byte("package main\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(source, "linked", ".git"), []byte("gitdir: ../metadata\n"), 0o644))
+
+	snapshot, err := Scan(source, Policy{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"linked/main.go"}, snapshot.SortedPaths())
+}
+
 func TestScanExcludesAllNonIncludedClassifications(t *testing.T) {
 	source := t.TempDir()
 	for _, directory := range []string{"ignored", "shared", "generated"} {
